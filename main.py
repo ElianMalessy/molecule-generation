@@ -1,5 +1,7 @@
 import os
 import random
+import argparse
+from dataclasses import dataclass
 import numpy as np
 import torch
 from torch_geometric.datasets import ZINC
@@ -8,25 +10,46 @@ from torch_geometric.utils import to_dense_batch, to_dense_adj
 from tqdm import tqdm
 
 from models.vae import MolecularGraphVAE, vae_loss
+from moses_dataset import MosesPyGDataset
 
-BATCH_SIZE = 128
-EPOCHS = 50
-LR = 1e-3
-MAX_ATOMS = 38
-SEED = 42
+@dataclass
+class Config:
+    dataset: str = 'ZINC'
+    batch_size: int = 128
+    epochs: int = 100
+    lr: float = 1e-3
+    max_atoms: int = 38
+    seed: int = 42
+    num_node_features: int = 29
+    num_edge_features: int = 5
+    latent_dim: int = 64
+    kl_weight: float = 0.1
 
-# ZINC: 28 atom types (0-27) + 1 for padding (0) = 29. We shift all atom types by +1 so 0 can represent "no atom" for padding purposes.
-NUM_NODE_FEATURES = 29 
-# ZINC bonds: single, double, triple, aromatic (0-3) + 1 for no bond (0) = 5. We shift all bond types by +1 so 0 can represent "no bond" for padding purposes. This is important for the loss function to ignore non-existent edges.
-NUM_EDGE_FEATURES = 5  
+def parse_args() -> Config:
+    parser = argparse.ArgumentParser(description="Train Molecular Graph VAE")
+    parser.add_argument('--dataset', type=str, default='ZINC', choices=['ZINC', 'MOSES'], 
+                        help="Dataset to train on ('ZINC' or 'MOSES'). Default: ZINC")
+    parser.add_argument('--batch_size', type=int, default=128, help="Batch size for training. Default: 128")
+    parser.add_argument('--epochs', type=int, default=100, help="Number of training epochs. Default: 100")
+    parser.add_argument('--lr', type=float, default=1e-3, help="Learning rate. Default: 1e-3")
+    parser.add_argument('--max_atoms', type=int, default=38, help="Maximum number of atoms per molecule. Default: 38")
+    parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility. Default: 42")
+    parser.add_argument('--num_node_features', type=int, default=29, help="Number of node features. Default: 29")
+    parser.add_argument('--num_edge_features', type=int, default=5, help="Number of edge features. Default: 5")
+    parser.add_argument('--latent_dim', type=int, default=64, help="Dimension of the latent space. Default: 64")
+    parser.add_argument('--kl_weight', type=float, default=0.1, help="Weight of the KL divergence loss. Default: 0.1")
+    
+    args = parser.parse_args()
+    return Config(**vars(args))
 
-def set_seed(seed):
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-
-def prepare_batch(data, device):
+def prepare_batch(data, device, max_atoms):
     data = data.to(device)
     
     # Shift labels by +1 so 0 is reserved for padding / no bond
@@ -34,22 +57,22 @@ def prepare_batch(data, device):
     edge_attr_in = data.edge_attr.squeeze(-1) + 1
     
     # Dense Targets
-    target_nodes, _ = to_dense_batch(x_in, data.batch, max_num_nodes=MAX_ATOMS)
-    target_edges = to_dense_adj(data.edge_index, data.batch, edge_attr=edge_attr_in, max_num_nodes=MAX_ATOMS)
+    target_nodes, _ = to_dense_batch(x_in, data.batch, max_num_nodes=max_atoms)
+    target_edges = to_dense_adj(data.edge_index, data.batch, edge_attr=edge_attr_in, max_num_nodes=max_atoms)
     target_edges = target_edges.squeeze(-1).long()
     
     return x_in, data.edge_index, edge_attr_in, data.batch, target_nodes, target_edges
 
-def train_epoch(model, optimizer, loader, kl_weight, device):
+def train_epoch(model, optimizer, loader, config, device):
     model.train()
     total_loss, total_recon, total_kl = 0, 0, 0
     
     for data in tqdm(loader, desc="Training", leave=False):
         optimizer.zero_grad()
-        x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = prepare_batch(data, device)
+        x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = prepare_batch(data, device, config.max_atoms)
         
         node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-        loss, recon, kl = vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight)
+        loss, recon, kl = vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, config.kl_weight)
         
         loss.backward()
         optimizer.step()
@@ -62,14 +85,14 @@ def train_epoch(model, optimizer, loader, kl_weight, device):
     return total_loss/n, total_recon/n, total_kl/n
 
 @torch.no_grad()
-def val_epoch(model, loader, kl_weight, device):
+def val_epoch(model, loader, config, device):
     model.eval()
     total_loss, total_recon, total_kl = 0, 0, 0
     
     for data in tqdm(loader, desc="Validation", leave=False):
-        x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = prepare_batch(data, device)
+        x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = prepare_batch(data, device, config.max_atoms)
         node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-        loss, recon, kl = vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight)
+        loss, recon, kl = vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, config.kl_weight)
         
         total_loss += loss.item() * data.num_graphs
         total_recon += recon.item() * data.num_graphs
@@ -78,36 +101,40 @@ def val_epoch(model, loader, kl_weight, device):
     n = len(loader.dataset)
     return total_loss/n, total_recon/n, total_kl/n
 
-
-def train():
+def train(config: Config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    train_dataset = ZINC(root='data/ZINC', subset=False, split='train')
-    val_dataset = ZINC(root='data/ZINC', subset=False, split='val')
+    print(f"Loading {config.dataset} dataset...")
+    if config.dataset == 'ZINC':
+        train_dataset = ZINC(root='data/ZINC', subset=False, split='train')
+        val_dataset = ZINC(root='data/ZINC', subset=False, split='val')
+    else:
+        train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=config.max_atoms)
+        val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=config.max_atoms)
 
     train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
+        train_dataset, batch_size=config.batch_size, shuffle=True, 
         num_workers=4, pin_memory=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE, shuffle=False, 
+        val_dataset, batch_size=config.batch_size, shuffle=False, 
         num_workers=4, pin_memory=True
     )
 
     model = MolecularGraphVAE(
-        num_node_features=NUM_NODE_FEATURES, 
-        num_edge_features=NUM_EDGE_FEATURES, 
-        latent_dim=64, 
-        max_atoms=MAX_ATOMS
+        num_node_features=config.num_node_features, 
+        num_edge_features=config.num_edge_features, 
+        latent_dim=config.latent_dim, 
+        max_atoms=config.max_atoms
     ).to(device)
 
-    kl_weight = 0.1
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     best_val_loss = float('inf')
 
-    for epoch in range(1, EPOCHS + 1):
-        train_l, train_r, train_kl = train_epoch(model, optimizer, train_loader, kl_weight, device)
-        val_l, val_r, val_kl = val_epoch(model, val_loader, kl_weight, device)
+    print(f"Starting training on {device}...")
+    for epoch in range(1, config.epochs + 1):
+        train_l, train_r, train_kl = train_epoch(model, optimizer, train_loader, config, device)
+        val_l, val_r, val_kl = val_epoch(model, val_loader, config, device)
         
         print(f"Epoch {epoch:03d}")
         print(f"Train Loss: {train_l:.4f} | Recon: {train_r:.4f} | KL: {train_kl:.4f}")
@@ -120,5 +147,7 @@ def train():
         print("-" * 50)
 
 if __name__ == "__main__":
-    set_seed(SEED)
+    config = parse_args()
+    set_seed(config.seed)
     os.makedirs('checkpoints', exist_ok=True)
+    train(config)

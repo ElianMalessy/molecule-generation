@@ -1,3 +1,6 @@
 data/
 checkpoints/
 *.sh
+__pycache__
+*.pyc
+*.slurm

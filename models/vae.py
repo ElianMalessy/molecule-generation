@@ -90,8 +90,7 @@ class MolecularGraphVAE(torch_nn.Module):
 
 
 def vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight=0.1):
-    # Cross entropy for reconstruction because we are predicting discrete categories for both nodes and edges
-    # 1. Node Loss (Ignore empty nodes with index 0, do not reward the model for predicting empty slots because that takes up most of the matrix)
+    # 1. Node Loss 
     recon_loss_nodes = F.cross_entropy(
         node_logits.reshape(-1, node_logits.size(-1)), 
         target_nodes.reshape(-1), 
@@ -99,26 +98,24 @@ def vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, k
         reduction='mean'
     )
     
-    
     _, N = target_nodes.shape
 
-    # Create mask for valid node pairs (1 if both nodes are valid, 0 if either is padding)
-    # We only care about a bond if both atoms in the pair actually exist.
+    # Create mask for valid node pairs
     valid_mask = (target_nodes > 0).float() 
-    valid_pair_mask = valid_mask.unsqueeze(2) * valid_mask.unsqueeze(1) # (B, N, N)
+    valid_pair_mask = valid_mask.unsqueeze(2) * valid_mask.unsqueeze(1) 
     
-    # Get upper triangular indices (offset=1 ignores self-loops)
+    # Get upper triangular indices 
     triu_idx = torch.triu_indices(N, N, offset=1)
     
     # Extract upper triangular elements
-    edge_logits_triu = edge_logits[:, triu_idx[0], triu_idx[1], :] # (B, num_pairs, num_edge_features)
-    target_edges_triu = target_edges[:, triu_idx[0], triu_idx[1]].clone() # (B, num_pairs)
+    edge_logits_triu = edge_logits[:, triu_idx[0], triu_idx[1], :] 
+    target_edges_triu = target_edges[:, triu_idx[0], triu_idx[1]].clone() 
     valid_pair_mask_triu = valid_pair_mask[:, triu_idx[0], triu_idx[1]]
     
-    # Map padded pairs to -1 (not 0 because 0 is a valid "no bond" class)
+    # Map padded pairs to -1 
     target_edges_triu[valid_pair_mask_triu == 0] = -1
     
-    # 2. Edge Loss (Upper-triangular & masked padding, ignore pairs where either node is padding)
+    # 2. Edge Loss 
     recon_loss_edges = F.cross_entropy(
         edge_logits_triu.reshape(-1, edge_logits_triu.size(-1)), 
         target_edges_triu.reshape(-1), 
