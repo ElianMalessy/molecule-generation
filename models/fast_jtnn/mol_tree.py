@@ -1,130 +1,113 @@
+from typing import List, Optional, Tuple
+
 import rdkit
 import rdkit.Chem as Chem
-from models.fast_jtnn.chemutils import get_clique_mol, tree_decomp, get_mol, get_smiles, set_atommap, enum_assemble, decode_stereo
-from models.fast_jtnn.vocab import *
 
-class MolTreeNode(object):
-    def __init__(self, smiles, clique=[]):
-        self.smiles = smiles
-        self.mol = get_mol(self.smiles)
+from models.fast_jtnn.chemutils import (
+    get_clique_mol, tree_decomp, get_mol, 
+    get_smiles, set_atommap, enum_assemble
+)
 
-        self.clique = [x for x in clique] #copy
-        self.neighbors = []
+
+class MolTreeNode:
+    """
+    Node for the Junction Tree representing a molecular clique.
+    """
+    def __init__(self, smiles: str, clique: Optional[List[int]] = None):
+        self.smiles: str = smiles
+        self.mol: Chem.Mol = get_mol(self.smiles)
+
+        # Avoid mutable default arguments; safely copy the clique
+        self.clique: List[int] = list(clique) if clique is not None else []
+        self.neighbors: List['MolTreeNode'] = []
         
-    def add_neighbor(self, nei_node):
+        # Attributes populated later by the MolTree or assembly process
+        self.is_leaf: bool = False
+        self.nid: int = 0
+        self.idx: int = 0
+        self.label: str = ""
+        self.cands: List[str] = []
+
+    def add_neighbor(self, nei_node: 'MolTreeNode') -> None:
         self.neighbors.append(nei_node)
 
-    def recover(self, original_mol):
-        clique = []
-        clique.extend(self.clique)
+    def recover(self, original_mol: Chem.Mol) -> str:
+        """
+        Recovers the label of the tree node by masking the appropriate atoms.
+        """
+        clique_atoms = list(self.clique)
+        
         if not self.is_leaf:
             for cidx in self.clique:
                 original_mol.GetAtomWithIdx(cidx).SetAtomMapNum(self.nid)
 
         for nei_node in self.neighbors:
-            clique.extend(nei_node.clique)
-            if nei_node.is_leaf: #Leaf node, no need to mark 
+            clique_atoms.extend(nei_node.clique)
+            if nei_node.is_leaf:  # Leaf node, no need to mark
                 continue
+            
             for cidx in nei_node.clique:
-                #allow singleton node override the atom mapping
+                # Allow singleton node to override the atom mapping
                 if cidx not in self.clique or len(nei_node.clique) == 1:
                     atom = original_mol.GetAtomWithIdx(cidx)
                     atom.SetAtomMapNum(nei_node.nid)
 
-        clique = list(set(clique))
-        label_mol = get_clique_mol(original_mol, clique)
-        self.label = Chem.MolToSmiles(Chem.MolFromSmiles(get_smiles(label_mol)))
+        clique_atoms = list(set(clique_atoms))
+        label_mol = get_clique_mol(original_mol, clique_atoms)
+        
+        # Parse the sub-molecule smiles and ensure it's valid to fix typing errors
+        parsed_mol = Chem.MolFromSmiles(get_smiles(label_mol))
+        if parsed_mol is None:
+            raise ValueError(f"Failed to parse SMILES for clique molecule.")
+            
+        self.label = Chem.MolToSmiles(parsed_mol)
 
-        for cidx in clique:
+        # Reset atom mappings for the original molecule
+        for cidx in clique_atoms:
             original_mol.GetAtomWithIdx(cidx).SetAtomMapNum(0)
 
         return self.label
     
-    def assemble(self):
-        neighbors = [nei for nei in self.neighbors if nei.mol.GetNumAtoms() > 1]
-        neighbors = sorted(neighbors, key=lambda x:x.mol.GetNumAtoms(), reverse=True)
+    def assemble(self) -> None:
+        """
+        Enumerates possible attachments of neighboring cliques.
+        """
+        # Separate neighbors into singletons and complex rings/fragments
+        complex_neighbors = sorted(
+            [nei for nei in self.neighbors if nei.mol.GetNumAtoms() > 1], 
+            key=lambda x: x.mol.GetNumAtoms(), 
+            reverse=True
+        )
         singletons = [nei for nei in self.neighbors if nei.mol.GetNumAtoms() == 1]
-        neighbors = singletons + neighbors
+        
+        # Evaluate singletons first
+        ordered_neighbors = singletons + complex_neighbors
 
-        cands,aroma = enum_assemble(self, neighbors)
-        new_cands = [cand for i,cand in enumerate(cands) if aroma[i] >= 0]
-        if len(new_cands) > 0: cands = new_cands
+        cands, aroma = enum_assemble(self, ordered_neighbors)
+        
+        # Filter candidates by aroma score
+        valid_cands = [cand for cand, arom in zip(cands, aroma) if arom >= 0]
 
-        if len(cands) > 0:
-            self.cands, _ = zip(*cands)
-            self.cands = list(self.cands)
+        if valid_cands:
+            # Unzip to extract just the SMILES strings (index 0 of the tuple)
+            self.cands = list(list(zip(*valid_cands))[0])
         else:
             self.cands = []
 
-class MolTree(object):
 
-    def __init__(self, smiles):
-        self.smiles = smiles
-        self.mol = get_mol(smiles)
-
-        #Stereo Generation (currently disabled)
-        #mol = Chem.MolFromSmiles(smiles)
-        #self.smiles3D = Chem.MolToSmiles(mol, isomericSmiles=True)
-        #self.smiles2D = Chem.MolToSmiles(mol)
-        #self.stereo_cands = decode_stereo(self.smiles2D)
+class MolTree:
+    """
+    Junction Tree representation of a molecule.
+    """
+    def __init__(self, smiles: str):
+        self.smiles: str = smiles
+        self.mol: Chem.Mol = get_mol(smiles)
 
         cliques, edges = tree_decomp(self.mol)
-        self.nodes = []
+        self.nodes: List[MolTreeNode] = []
         root = 0
-        for i,c in enumerate(cliques):
+        
+        # Build nodes
+        for i, c in enumerate(cliques):
             cmol = get_clique_mol(self.mol, c)
             node = MolTreeNode(get_smiles(cmol), c)
-            self.nodes.append(node)
-            if min(c) == 0: root = i
-
-        for x,y in edges:
-            self.nodes[x].add_neighbor(self.nodes[y])
-            self.nodes[y].add_neighbor(self.nodes[x])
-        
-        if root > 0:
-            self.nodes[0],self.nodes[root] = self.nodes[root],self.nodes[0]
-
-        for i,node in enumerate(self.nodes):
-            node.nid = i + 1
-            if len(node.neighbors) > 1: #Leaf node mol is not marked
-                set_atommap(node.mol, node.nid)
-            node.is_leaf = (len(node.neighbors) == 1)
-
-    def size(self):
-        return len(self.nodes)
-
-    def recover(self):
-        for node in self.nodes:
-            node.recover(self.mol)
-
-    def assemble(self):
-        for node in self.nodes:
-            node.assemble()
-
-def dfs(node, fa_idx):
-    max_depth = 0
-    for child in node.neighbors:
-        if child.idx == fa_idx: continue
-        max_depth = max(max_depth, dfs(child, node.idx))
-    return max_depth + 1
-
-if __name__ == "__main__":
-    import sys
-    lg = rdkit.RDLogger.logger() 
-    lg.setLevel(rdkit.RDLogger.CRITICAL)
-
-    cset = set()
-    for line in sys.stdin:
-        smiles = line.split()[0]
-#JI
-        m = Chem.MolFromSmiles(smiles)
-        smiles = Chem.MolToSmiles(m,isomericSmiles=False)
-
-        mol = MolTree(smiles)
-
-        for c in mol.nodes:
-            cset.add(c.smiles)
-
-    for x in cset:
-        print (x)
-

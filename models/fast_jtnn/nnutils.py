@@ -1,83 +1,65 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Variable
+from torch import Tensor
+from torch.nn.utils.rnn import pad_sequence
+from typing import List, Tuple
 
-def create_var(tensor, requires_grad=None):
-    if requires_grad is None:
-        return Variable(tensor).cuda()
-    else:
-        return Variable(tensor, requires_grad=requires_grad).cuda()
-
-def index_select_ND(source, dim, index):
+def index_select_ND(source: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
     index_size = index.size()
     suffix_dim = source.size()[1:]
     final_size = index_size + suffix_dim
     target = source.index_select(dim, index.view(-1))
     return target.view(final_size)
 
-#New function proposed by Kevin to resolve "Cuda out of memory" errors
-def index_select_sum(source, dim, index):
+def index_select_sum(source: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
     """
-    Combine index_select and sum operations in a loop to avoid (some of) the CUDA out-of-memory errors
-    we get when calling index_select_ND in the assembly phase.
+    Modern PyTorch handles memory fragmentation much better.
+    This replaces the slow Python `for` loop with highly optimized native tensor indexing.
     """
-    index_size = index.size()
-    n_nei = index_size[1] #number of neighbors
-    suffix_dim = source.size()[1]
-    ssum = torch.zeros(index_size[0], suffix_dim).cuda()
-    for i in range(n_nei):
-        ssum += source.index_select(dim, index[:,i])
-    return ssum
+    # source[index] gives [N, max_neighbors, hidden_size]
+    # sum(dim=1) reduces it to [N, hidden_size]
+    return source[index].sum(dim=1)
 
-def avg_pool(all_vecs, scope, dim):
-    size = create_var(torch.Tensor([le for _,le in scope]))
+def avg_pool(all_vecs: torch.Tensor, scope: list, dim: int) -> torch.Tensor:
+    size = torch.tensor([le for _, le in scope], dtype=torch.float32, device=all_vecs.device)
     return all_vecs.sum(dim=dim) / size.unsqueeze(-1)
 
-def stack_pad_tensor(tensor_list):
-    max_len = max([t.size(0) for t in tensor_list])
-    for i,tensor in enumerate(tensor_list):
-        pad_len = max_len - tensor.size(0)
-        tensor_list[i] = F.pad( tensor, (0,0,0,pad_len) )
-    return torch.stack(tensor_list, dim=0)
+def stack_pad_tensor(tensor_list: List[Tensor]) -> Tensor:
+    """Pads a list of 2D tensors to the maximum length and stacks them."""
+    # Replaces the manual F.pad loop with PyTorch's native C++ padding function
+    return pad_sequence(tensor_list, batch_first=True)
 
-#3D padded tensor to 2D matrix, with padded zeros removed
-def flatten_tensor(tensor, scope):
-    assert tensor.size(0) == len(scope)
-    tlist = []
-    for i,tup in enumerate(scope):
-        le = tup[1]
-        tlist.append( tensor[i, 0:le] )
-    return torch.cat(tlist, dim=0)
+def flatten_tensor(tensor: Tensor, scope: List[Tuple[int, int]]) -> Tensor:
+    """Converts a 3D padded tensor to a 2D matrix, removing padded zeros."""
+    # List comprehension replaces the manual for-loop with append
+    return torch.cat([tensor[i, :le] for i, (_, le) in enumerate(scope)], dim=0)
 
-#2D matrix to 3D padded tensor
-def inflate_tensor(tensor, scope): 
-    max_len = max([le for _,le in scope])
-    batch_vecs = []
-    for st,le in scope:
-        cur_vecs = tensor[st : st + le]
-        cur_vecs = F.pad( cur_vecs, (0,0,0,max_len-le) )
-        batch_vecs.append( cur_vecs )
+def inflate_tensor(tensor: Tensor, scope: List[Tuple[int, int]]) -> Tensor:
+    """Converts a 2D matrix back to a 3D padded tensor."""
+    # Extract variable-length slices based on scope
+    slices = [tensor[st : st + le] for st, le in scope]
+    # pad_sequence handles max length calculation and zero-padding natively
+    return pad_sequence(slices, batch_first=True)
 
-    return torch.stack(batch_vecs, dim=0)
-
-def GRU(x, h_nei, W_z, W_r, U_r, W_h):
-    hidden_size = x.size()[-1]
+def GRU(x: Tensor, h_nei: Tensor, W_z: nn.Module, W_r: nn.Module, U_r: nn.Module, W_h: nn.Module) -> Tensor:
+    """Custom Graph GRU cell implementation."""
+    hidden_size = x.size(-1)
     sum_h = h_nei.sum(dim=1)
-    z_input = torch.cat([x,sum_h], dim=1)
+    
+    # Compute update gate z
+    z_input = torch.cat([x, sum_h], dim=1)
     z = torch.sigmoid(W_z(z_input))
-#JI z = F.sigmoid(W_z(z_input))
-
-    r_1 = W_r(x).view(-1,1,hidden_size)
+    
+    # Compute reset gate r
+    r_1 = W_r(x).view(-1, 1, hidden_size)
     r_2 = U_r(h_nei)
     r = torch.sigmoid(r_1 + r_2)
-#JI r = F.sigmoid(r_1 + r_2)
     
+    # Compute candidate hidden state pre_h
     gated_h = r * h_nei
     sum_gated_h = gated_h.sum(dim=1)
-    h_input = torch.cat([x,sum_gated_h], dim=1)
+    h_input = torch.cat([x, sum_gated_h], dim=1)
     pre_h = torch.tanh(W_h(h_input))
-#JI pre_h = F.tanh(W_h(h_input))
-    new_h = (1.0 - z) * sum_h + z * pre_h
-    return new_h
-
+    
+    # Update state
+    return (1.0 - z) * sum_h + z * pre_h
