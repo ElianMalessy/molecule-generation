@@ -2,7 +2,6 @@ import torch
 from molecule_benchmarks import Benchmarker, SmilesDataset
 
 import os
-import math
 import random
 import logging
 import argparse
@@ -85,7 +84,7 @@ def train_epoch_jtvae(model, optimizer, loader, config, global_step):
         out = model(batch, beta)
         loss, kl_div = out[0], out[1]
 
-        # JTVAE losses (word/topo) are sums, so we normalize by the batch size
+        # JTVAE losses are sums, so we normalize by the batch size
         loss = loss / len(batch)
             
         loss.backward()
@@ -95,7 +94,7 @@ def train_epoch_jtvae(model, optimizer, loader, config, global_step):
         
         batch_size = len(batch)
         total_loss += loss.item() * batch_size
-        total_kl += kl_div.item() * batch_size if isinstance(kl_div, torch.Tensor) else kl_div * batch_size
+        total_kl += kl_div.item() * batch_size
         
     n = len(loader.dataset)
     return total_loss/n, 0.0, total_kl/n, global_step
@@ -111,7 +110,7 @@ def val_epoch_jtvae(model, loader, config, global_step):
             
         batch_size = len(batch)
         total_loss += loss.item() * batch_size
-        total_kl += kl_div.item() * batch_size if isinstance(kl_div, torch.Tensor) else kl_div * batch_size
+        total_kl += kl_div.item() * batch_size
         
     n = len(loader.dataset)
     return total_loss/n, 0.0, total_kl/n
