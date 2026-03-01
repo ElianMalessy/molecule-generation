@@ -1,18 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fast_jtnn.mol_tree import Vocab, MolTree
-from fast_jtnn.nnutils import create_var, flatten_tensor, avg_pool
-from fast_jtnn.jtnn_enc import JTNNEncoder
-from fast_jtnn.jtnn_dec import JTNNDecoder
-from fast_jtnn.mpn import MPN
-from fast_jtnn.jtmpn import JTMPN
-from fast_jtnn.datautils import tensorize
+from models.fast_jtnn.mol_tree import MolTree
+from models.fast_jtnn.nnutils import create_var
+from models.fast_jtnn.jtnn_enc import JTNNEncoder
+from models.fast_jtnn.jtnn_dec import JTNNDecoder
+from models.fast_jtnn.mpn import MPN
+from models.fast_jtnn.jtmpn import JTMPN
+from models.fast_jtnn.datautils import tensorize
 
-from fast_jtnn.chemutils import enum_assemble, set_atommap, copy_edit_mol, attach_mols
-import rdkit
+from models.fast_jtnn.chemutils import enum_assemble, set_atommap, copy_edit_mol, attach_mols
 import rdkit.Chem as Chem
-import copy, math
+import copy
 
 class JTNNVAE(nn.Module):
 
@@ -109,7 +108,7 @@ class JTNNVAE(nn.Module):
 
                 label = create_var(torch.LongTensor([label]))
                 all_loss.append( self.assm_loss(cur_score.view(1,-1), label) )
-        all_loss = sum(all_loss) / len(mol_batch)
+        all_loss = sum(all_loss) 
         return all_loss, acc * 1.0 / cnt
 
     def decode(self, x_tree_vecs, x_mol_vecs, prob_decode):

@@ -1,96 +1,76 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
-from fast_jtnn.mol_tree import MolTree
-from fast_jtnn.jtnn_enc import JTNNEncoder
-from fast_jtnn.mpn import MPN
-from fast_jtnn.jtmpn import JTMPN
+from torch.utils.data import Dataset, IterableDataset
+from models.fast_jtnn.jtnn_enc import JTNNEncoder
+from models.fast_jtnn.mpn import MPN
+from models.fast_jtnn.jtmpn import JTMPN
 import pickle
 import os, random
 
-from torch.utils.data.distributed import DistributedSampler
-
-class PairTreeFolder(object):
-
-    def __init__(self, data_folder, vocab, batch_size, num_workers=4, shuffle=True, y_assm=True, replicate=None):
+class PairTreeFolder(IterableDataset):
+    def __init__(self, data_folder, vocab, batch_size, shuffle=True, y_assm=True, replicate=None):
         self.data_folder = data_folder
         self.data_files = [fn for fn in os.listdir(data_folder)]
         self.batch_size = batch_size
         self.vocab = vocab
-        self.num_workers = num_workers
         self.y_assm = y_assm
         self.shuffle = shuffle
-
-        if replicate is not None: #expand is int
+        if replicate is not None:
             self.data_files = self.data_files * replicate
 
     def __iter__(self):
-        for fn in self.data_files:
-            fn = os.path.join(self.data_folder, fn)
-            with open(fn, 'rb') as f:
+        files = self.data_files.copy()
+        if self.shuffle:
+            random.shuffle(files)
+            
+        for fn in files:
+            fn_path = os.path.join(self.data_folder, fn)
+            with open(fn_path, 'rb') as f:
                 data = pickle.load(f)
 
             if self.shuffle: 
-                random.shuffle(data) #shuffle data before batch
+                random.shuffle(data)
 
             batches = [data[i : i + self.batch_size] for i in range(0, len(data), self.batch_size)]
-            if len(batches[-1]) < self.batch_size:
+            if len(batches) > 0 and len(batches[-1]) < self.batch_size:
                 batches.pop()
 
-            dataset = PairTreeDataset(batches, self.vocab, self.y_assm)
-            dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=self.num_workers, collate_fn=lambda x:x[0])
+            for batch in batches:
+                batch0, batch1 = zip(*batch)
+                yield tensorize(batch0, self.vocab, assm=False), tensorize(batch1, self.vocab, assm=self.y_assm)
 
-            for b in dataloader:
-                yield b
-
-            del data, batches, dataset, dataloader
-
-class MolTreeFolder(object):
-
-    def __init__(self, data_folder, vocab, batch_size, num_workers=4, shuffle=True, mult_gpus=False, assm=True, replicate=None):
+class MolTreeFolder(IterableDataset):
+    def __init__(self, data_folder, vocab, batch_size, shuffle=True, assm=True, replicate=None):
         self.data_folder = data_folder
         self.data_files = [fn for fn in os.listdir(data_folder)]
-
-        random.shuffle(self.data_files)
-
         self.batch_size = batch_size
         self.vocab = vocab
-        self.num_workers = num_workers
         self.shuffle = shuffle
         self.assm = assm
 
-        self.mult_gpus = mult_gpus
-
-        if replicate is not None: #expand is int
+        if replicate is not None:
             self.data_files = self.data_files * replicate
 
     def __iter__(self):
-        for fn in self.data_files:
-            fn = os.path.join(self.data_folder, fn)
-            with open(fn, 'rb') as f:
+        files = self.data_files.copy()
+        if self.shuffle:
+            random.shuffle(files)
+            
+        for fn in files:
+            fn_path = os.path.join(self.data_folder, fn)
+            with open(fn_path, 'rb') as f:
                 data = pickle.load(f)
+                
             if self.shuffle: 
-                random.shuffle(data) #shuffle data before batch
+                random.shuffle(data)
 
             batches = [data[i : i + self.batch_size] for i in range(0, len(data), self.batch_size)]
-            
-            if len(batches[-1]) < self.batch_size:
+            if len(batches) > 0 and len(batches[-1]) < self.batch_size:
                 batches.pop()
 
-            dataset = MolTreeDataset(batches, self.vocab, self.assm)
-            
-            if self.mult_gpus == True:
-                #For DDP, sampler must be set to DistributedSampler to ensure that each rank gets a different mini batch of molecules
-                dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=self.num_workers, collate_fn=lambda x:x[0], sampler=DistributedSampler(dataset))
-            else:
-                dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=self.num_workers, collate_fn=lambda x:x[0])
-            
-            for b in dataloader:
-                yield b
-
-            del data, batches, dataset, dataloader
+            for batch in batches:
+                yield tensorize(batch, self.vocab, assm=self.assm)
 
 class PairTreeDataset(Dataset):
-
     def __init__(self, data, vocab, y_assm):
         self.data = data
         self.vocab = vocab
@@ -104,7 +84,6 @@ class PairTreeDataset(Dataset):
         return tensorize(batch0, self.vocab, assm=False), tensorize(batch1, self.vocab, assm=self.y_assm)
 
 class MolTreeDataset(Dataset):
-
     def __init__(self, data, vocab, assm=True):
         self.data = data
         self.vocab = vocab
@@ -130,7 +109,6 @@ def tensorize(tree_batch, vocab, assm=True):
     batch_idx = []
     for i,mol_tree in enumerate(tree_batch):
         for node in mol_tree.nodes:
-            #Leaf node's attachment is determined by neighboring node's attachment
             if node.is_leaf or len(node.cands) == 1: continue
             cands.extend( [(cand, mol_tree.nodes, node) for cand in node.cands] )
             batch_idx.extend([i] * len(node.cands))

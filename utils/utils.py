@@ -1,6 +1,7 @@
-from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.datasets import ZINC
+from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch_geometric.transforms import BaseTransform
 
 import os
 import pandas as pd
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 
 from moses_dataset import MosesPyGDataset
-from models.fast_jtnn import JTNNVAE, Vocab, MolTreeDataset, MolTree
+from models.fast_jtnn import Vocab, MolTreeDataset, MolTree
 
 @dataclass
 class Config:
@@ -28,20 +29,28 @@ class Config:
     num_samples: int = 10000
     
 
-# ==========================================
-# MODULARIZED LOADERS
-# ==========================================
+class NormalizeZINCBonds(BaseTransform):
+    """
+    ZINC bonds are naturally 1, 2, 3, 4. 
+    We shift them to 0, 1, 2, 3 to match MOSES and 0-indexing standards.
+    """
+    def forward(self, data):
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            data.edge_attr = data.edge_attr - 1
+        return data
+
 def get_dataloaders(config: Config, logger):
     """Returns train_loader, val_loader, and dataset-specific metadata."""
     if config.model == 'GVAE':
         if config.dataset == 'ZINC':
-            train_dataset = ZINC(root='data/ZINC', subset=False, split='train')
-            val_dataset = ZINC(root='data/ZINC', subset=False, split='val')
-            num_node_features, num_edge_features = 28, 4 # Standard ZINC
+            transform = NormalizeZINCBonds()
+            train_dataset = ZINC(root='data/ZINC', subset=False, split='train', pre_transform=transform)
+            val_dataset = ZINC(root='data/ZINC', subset=False, split='val', pre_transform=transform)
+            num_node_features, num_edge_features = 28, 4
         else:
             train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=config.max_atoms)
             val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=config.max_atoms)
-            num_node_features, num_edge_features = 8, 4 # Standard MOSES from custom loader
+            num_node_features, num_edge_features = 9, 5
 
         train_loader = PyGDataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4)
         val_loader = PyGDataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4)

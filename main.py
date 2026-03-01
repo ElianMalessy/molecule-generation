@@ -2,6 +2,7 @@ import torch
 from molecule_benchmarks import Benchmarker, SmilesDataset
 
 import os
+import math
 import random
 import logging
 import argparse
@@ -11,10 +12,13 @@ from tqdm import tqdm
 from models.gvae import GraphVAE, gvae_loss, gvae_prepare_batch
 from models.fast_jtnn import JTNNVAE
 from utils.utils import Config, get_dataloaders, get_smiles_list
+from utils.constants import MOSES_ATOM_DECODER, ZINC_ATOM_DECODER, ZINC_CHARGE_DECODER
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+from rdkit import RDLogger
+RDLogger.DisableLog('rdApp.*')
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Train Molecular Graph VAE")
@@ -55,13 +59,15 @@ def train_epoch_gvae(model, optimizer, loader, config, global_step, device):
     return total_loss/n, total_recon/n, total_kl/n, global_step
 
 @torch.no_grad()
-def val_epoch_gvae(model, loader, config, device):
+def val_epoch_gvae(model, loader, config, global_step, device):
     model.eval()
     total_loss, total_recon, total_kl = 0, 0, 0
     for data in tqdm(loader, desc="Validation GVAE", leave=False):
         x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = gvae_prepare_batch(data, device, config.max_atoms)
         node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-        loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, config.kl_weight)
+
+        beta = min(config.kl_weight, global_step / config.kl_anneal_steps)
+        loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, beta)
         
         total_loss += loss.item() * data.num_graphs
         total_recon += recon.item() * data.num_graphs
@@ -76,14 +82,14 @@ def train_epoch_jtvae(model, optimizer, loader, config, global_step):
     for batch in tqdm(loader, desc="Training JTVAE", leave=False):
         optimizer.zero_grad()
         beta = min(config.kl_weight, global_step / config.kl_anneal_steps)
-        try:
-            loss, kl_div, wacc, tacc, sacc = model(batch, beta)
-        except ValueError:
-            out = model(batch, beta)
-            loss, kl_div = out[0], out[1] if len(out) > 1 else torch.tensor(0.0)
+        out = model(batch, beta)
+        loss, kl_div = out[0], out[1]
+
+        # JTVAE losses (word/topo) are sums, so we normalize by the batch size
+        loss = loss / len(batch)
             
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 50)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         global_step += 1
         
@@ -95,15 +101,13 @@ def train_epoch_jtvae(model, optimizer, loader, config, global_step):
     return total_loss/n, 0.0, total_kl/n, global_step
 
 @torch.no_grad()
-def val_epoch_jtvae(model, loader, config, device):
+def val_epoch_jtvae(model, loader, config, global_step):
     model.eval()
     total_loss, total_kl = 0, 0
     for batch in tqdm(loader, desc="Validation JTVAE", leave=False):
-        try:
-            loss, kl_div, _, _, _ = model(batch, config.kl_weight)
-        except ValueError:
-            out = model(batch, config.kl_weight)
-            loss, kl_div = out[0], out[1] if len(out) > 1 else torch.tensor(0.0)
+        kl_weight = min(config.kl_weight, global_step / config.kl_anneal_steps)
+        out = model(batch, kl_weight)
+        loss, kl_div = out[0], out[1]
             
         batch_size = len(batch)
         total_loss += loss.item() * batch_size
@@ -122,28 +126,30 @@ def evaluate_model(model, config, device, metadata):
         if config.model == 'GVAE':
             # Inverse mapping from model's internal node indices back to original atom types for both datasets
             if config.dataset == 'MOSES':
-                atom_decoder = {0: 6, 1: 7, 2: 8, 3: 9, 4: 16, 5: 17, 6: 35, 7: 1}
+                atom_decoder = MOSES_ATOM_DECODER
+                charge_decoder = None  # MOSES does not have charge prediction
             else:
-                atom_decoder = {0: 6, 1: 7, 2: 8, 3: 9, 4: 15, 5: 16, 6: 17, 7: 35, 8: 53}
+                atom_decoder = ZINC_ATOM_DECODER
+                charge_decoder = ZINC_CHARGE_DECODER
 
             z = torch.randn(config.num_samples, config.latent_dim).to(device)
-            generated_smiles = model.sample_smiles(z, metadata['num_nodes'], metadata['num_edges'], atom_decoder)
+            generated_smiles = model.sample_smiles(z, metadata['num_nodes'], metadata['num_edges'], atom_decoder, charge_decoder)
             
         elif config.model == 'JTVAE':
-            # Fast JTNN expects batched generation logic
-            for _ in tqdm(range(max(1, config.num_samples // config.batch_size)), desc="Sampling JTVAE"):
-                z_tree = torch.randn(config.batch_size, config.latent_dim // 2).to(device)
-                z_mol = torch.randn(config.batch_size, config.latent_dim // 2).to(device)
-                smiles_batch = model.decode(z_tree, z_mol, prob_decode=False)
+            # JTVAE requires 1-by-1 decoding due to recursive DFS assembly
+            for _ in tqdm(range(config.num_samples), desc="Sampling JTVAE"):
+                # latent_size in JTNNVAE is latent_dim // 2
+                z_tree = torch.randn(1, model.latent_size).to(device)
+                z_mol = torch.randn(1, model.latent_size).to(device)
                 
-                if smiles_batch is None:
+                # This calls the method you provided, satisfying the batch_size=1 assert
+                try:
+                    smiles = model.decode(z_tree, z_mol, prob_decode=False)
+                    if smiles:
+                        generated_smiles.append(smiles)
+                except Exception as e:
+                    # Catch rare RDKit assembly errors
                     continue
-                
-                # If it successfully decoded but only returned a single string, wrap it in a list
-                if isinstance(smiles_batch, str):
-                    smiles_batch = [smiles_batch]
-                    
-                generated_smiles.extend(smiles_batch)
 
     # Filter out invalid smiles (Nones or empty) before passing to benchmarker
     valid_smiles = [s for s in generated_smiles if s]
@@ -218,10 +224,10 @@ def train(config: Config):
     for epoch in range(1, config.epochs + 1):
         if config.model == 'GVAE':
             train_l, train_r, train_kl, global_step = train_epoch_gvae(model, optimizer, train_loader, config, global_step, device)
-            val_l, val_r, val_kl = val_epoch_gvae(model, val_loader, config, device)
+            val_l, val_r, val_kl = val_epoch_gvae(model, val_loader, config, global_step, device)
         else:
             train_l, train_r, train_kl, global_step = train_epoch_jtvae(model, optimizer, train_loader, config, global_step)
-            val_l, val_r, val_kl = val_epoch_jtvae(model, val_loader, config, device)
+            val_l, val_r, val_kl = val_epoch_jtvae(model, val_loader, config, global_step)
             
         scheduler.step()       
 
@@ -234,7 +240,7 @@ def train(config: Config):
             logger.info("New best model saved.")
         else:
             counter += 1
-            if counter >= config.patience:
+            if epoch >= 30 and counter >= config.patience:
                 logger.info(f"Early stopping triggered at epoch {epoch}")
                 break
 

@@ -1,10 +1,9 @@
 import rdkit
 import rdkit.Chem as Chem
-from fast_jtnn.chemutils import get_clique_mol, tree_decomp, get_mol, get_smiles, set_atommap, enum_assemble, decode_stereo
-from fast_jtnn.vocab import *
+from models.fast_jtnn.chemutils import get_clique_mol, tree_decomp, get_mol, get_smiles, set_atommap, enum_assemble, decode_stereo
+from models.fast_jtnn.vocab import *
 
 class MolTreeNode(object):
-
     def __init__(self, smiles, clique=[]):
         self.smiles = smiles
         self.mol = get_mol(self.smiles)

@@ -91,17 +91,13 @@ class GraphVAE(torch_nn.Module):
         node_logits, edge_logits = self.decode(z)
         return node_logits, edge_logits, mu, logvar
 
-    def sample_smiles(self, z, atom_decoder_dict=None):
+    def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None):
         """
         Decodes a latent vector z into a list of SMILES strings.
         Requires an atom_decoder_dict (e.g., {0: 6, 1: 7, ...}) mapping indices back to Atomic Numbers.
         """
-        if atom_decoder_dict is None:
-            # Fallback to ZINC mapping if none provided
-            atom_decoder_dict = {0: 6, 1: 7, 2: 8, 3: 9, 4: 15, 5: 16, 6: 17, 7: 35, 8: 53} 
-            
         node_logits, edge_logits = self.decode(z)
-        
+
         # Argmax to get discrete graph
         # Shape: (Batch, Max_Atoms)
         node_preds = torch.argmax(node_logits, dim=-1).cpu().numpy() 
@@ -118,8 +114,24 @@ class GraphVAE(torch_nn.Module):
             node_idx_map = {}
             for j, atom_idx in enumerate(nodes):
                 if atom_idx == 0: continue # 0 is padding/empty
-                atomic_num = atom_decoder_dict.get(atom_idx - 1, 6) # Shift back by -1 due to prep
-                idx = mol.AddAtom(Chem.Atom(atomic_num))
+                
+                # Shift back by -1 due to prep
+                original_class = atom_idx - 1 
+                
+                # Get atomic number (fallback to Carbon)
+                atomic_num = atom_decoder_dict.get(original_class, 6) 
+                
+                # Create the RDKit atom
+                rd_atom = Chem.Atom(atomic_num)
+                
+                # Apply formal charge if the class has one (default to 0)
+                if charge_decoder is not None:
+                    formal_charge = charge_decoder.get(original_class, 0)
+                    if formal_charge != 0:
+                        rd_atom.SetFormalCharge(formal_charge)
+                
+                # Add to molecule
+                idx = mol.AddAtom(rd_atom)
                 node_idx_map[j] = idx
                 
             # 2. Add edges
@@ -133,14 +145,13 @@ class GraphVAE(torch_nn.Module):
                             bt = self._get_rdkit_bond(bond_type_idx)
                             mol.AddBond(node_idx_map[j], node_idx_map[k], bt)
             
-            # Convert to SMILES
             try:
-                Chem.SanitizeMol(mol)
+                Chem.SanitizeMol(mol, catchErrors=True) 
                 smiles = Chem.MolToSmiles(mol)
                 smiles_list.append(smiles)
             except:
-                smiles_list.append(None) # Invalid molecule
-                
+                smiles_list.append(None)
+                    
         return smiles_list
 
     def _get_rdkit_bond(self, bond_idx):
@@ -150,44 +161,42 @@ class GraphVAE(torch_nn.Module):
         return mapping.get(bond_idx, Chem.BondType.SINGLE)
 
 
-def gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight=0.1):
-    # 1. Node Loss 
-    recon_loss_nodes = F.cross_entropy(
+def gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight):
+    batch_size, N = target_nodes.shape
+
+    # 1. Node Loss (Per Graph Sum)
+    node_ce = F.cross_entropy(
         node_logits.reshape(-1, node_logits.size(-1)), 
         target_nodes.reshape(-1), 
         ignore_index=0,
-        reduction='mean'
-    )
+        reduction='none' # CRITICAL: Do not mean yet
+    ).view(batch_size, N)
+    recon_loss_nodes = node_ce.sum(dim=1).mean() # Sum over nodes, mean over batch
     
-    _, N = target_nodes.shape
-
-    # Create mask for valid node pairs
+    # 2. Edge Loss Setup
     valid_mask = (target_nodes > 0).float() 
     valid_pair_mask = valid_mask.unsqueeze(2) * valid_mask.unsqueeze(1) 
     
-    # Get upper triangular indices 
     triu_idx = torch.triu_indices(N, N, offset=1)
-    
-    # Extract upper triangular elements
     edge_logits_triu = edge_logits[:, triu_idx[0], triu_idx[1], :] 
     target_edges_triu = target_edges[:, triu_idx[0], triu_idx[1]].clone() 
     valid_pair_mask_triu = valid_pair_mask[:, triu_idx[0], triu_idx[1]]
     
-    # Map padded pairs to -1 
-    target_edges_triu[valid_pair_mask_triu == 0] = -1
-    
-    # 2. Edge Loss 
-    recon_loss_edges = F.cross_entropy(
+    target_edges_triu[valid_pair_mask_triu == 0] = 0
+
+    # 3. Edge Loss (Per Graph Sum)
+    edge_ce = F.cross_entropy(
         edge_logits_triu.reshape(-1, edge_logits_triu.size(-1)), 
         target_edges_triu.reshape(-1), 
-        ignore_index=-1,
-        reduction='mean'
-    )
+        reduction='none'
+    ).view(batch_size, -1)
+    recon_loss_edges = edge_ce.sum(dim=1).mean() # Sum over edges, mean over batch
     
     recon_loss = recon_loss_nodes + recon_loss_edges
     
+    # KL Divergence 
     kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-    kl_div = torch.mean(kl_div)
+    kl_div = kl_div.mean() # Mean over batch
     
     total_loss = recon_loss + (kl_weight * kl_div)
     

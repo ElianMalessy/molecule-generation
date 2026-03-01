@@ -1,10 +1,11 @@
+import logging
 import rdkit
 import rdkit.Chem as Chem
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree
 from collections import defaultdict
 from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
-from fast_jtnn.vocab import Vocab
+from models.fast_jtnn.vocab import Vocab
 
 MST_MAX_WEIGHT = 100 
 MAX_NCAND = 2000
@@ -15,10 +16,11 @@ def set_atommap(mol, num=0):
 
 def get_mol(smiles):
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None: 
-        return None
-    Chem.Kekulize(mol)
-#JI Chem.Kekulize(mol, clearAromaticFlags=True)
+    if mol is None: return None
+    try:
+        Chem.Kekulize(mol)
+    except Exception:
+        return None # Prevents C++ level crash if un-kekulizable
     return mol
 
 def get_smiles(mol):
@@ -45,6 +47,7 @@ def sanitize(mol):
         smiles = get_smiles(mol)
         mol = get_mol(smiles)
     except Exception as e:
+        # Don't log.warning here to avoid console spam during vocab gen
         return None
     return mol
 
@@ -55,27 +58,19 @@ def copy_atom(atom):
     return new_atom
 
 def copy_edit_mol(mol):
-    new_mol = Chem.RWMol(Chem.MolFromSmiles(''))
-    for atom in mol.GetAtoms():
-        new_atom = copy_atom(atom)
-        new_mol.AddAtom(new_atom)
-    for bond in mol.GetBonds():
-        a1 = bond.GetBeginAtom().GetIdx()
-        a2 = bond.GetEndAtom().GetIdx()
-        bt = bond.GetBondType()
-        new_mol.AddBond(a1, a2, bt)
-    return new_mol
+    # Replaced redundant manual loop with RDKit's optimized C++ copy
+    return Chem.RWMol(mol)
 
 def get_clique_mol(mol, atoms):
     smiles = Chem.MolFragmentToSmiles(mol, atoms, kekuleSmiles=True)
     new_mol = Chem.MolFromSmiles(smiles, sanitize=False)
     new_mol = copy_edit_mol(new_mol).GetMol()
-    new_mol = sanitize(new_mol) #We assume this is not None
+    new_mol = sanitize(new_mol) 
     return new_mol
 
 def tree_decomp(mol):
     n_atoms = mol.GetNumAtoms()
-    if n_atoms == 1: #special case
+    if n_atoms == 1: 
         return [[0]], []
 
     cliques = []
@@ -93,7 +88,6 @@ def tree_decomp(mol):
         for atom in cliques[i]:
             nei_list[atom].append(i)
     
-    #Merge Rings with intersection > 2 atoms
     for i in range(len(cliques)):
         if len(cliques[i]) <= 2: continue
         for atom in cliques[i]:
@@ -111,7 +105,6 @@ def tree_decomp(mol):
         for atom in cliques[i]:
             nei_list[atom].append(i)
     
-    #Build edges and add singleton cliques
     edges = defaultdict(int)
     for atom in range(n_atoms):
         if len(nei_list[atom]) <= 1: 
@@ -119,12 +112,12 @@ def tree_decomp(mol):
         cnei = nei_list[atom]
         bonds = [c for c in cnei if len(cliques[c]) == 2]
         rings = [c for c in cnei if len(cliques[c]) > 4]
-        if len(bonds) > 2 or (len(bonds) == 2 and len(cnei) > 2): #In general, if len(cnei) >= 3, a singleton should be added, but 1 bond + 2 ring is currently not dealt with.
+        if len(bonds) > 2 or (len(bonds) == 2 and len(cnei) > 2): 
             cliques.append([atom])
             c2 = len(cliques) - 1
             for c1 in cnei:
                 edges[(c1,c2)] = 1
-        elif len(rings) > 2: #Multiple (n>2) complex rings
+        elif len(rings) > 2: 
             cliques.append([atom])
             c2 = len(cliques) - 1
             for c1 in cnei:
@@ -135,14 +128,12 @@ def tree_decomp(mol):
                     c1,c2 = cnei[i],cnei[j]
                     inter = set(cliques[c1]) & set(cliques[c2])
                     if edges[(c1,c2)] < len(inter):
-                        edges[(c1,c2)] = len(inter) #cnei[i] < cnei[j] by construction
+                        edges[(c1,c2)] = len(inter) 
 
-#JI edges = [u + (MST_MAX_WEIGHT-v,) for u,v in edges.iteritems()]
     edges = [u + (MST_MAX_WEIGHT-v,) for u,v in edges.items()]
     if len(edges) == 0:
         return cliques, edges
 
-    #Compute Maximum Spanning Tree
     row,col,data = zip(*edges)
     n_clique = len(cliques)
     clique_graph = csr_matrix( (data,(row,col)), shape=(n_clique,n_clique) )
@@ -154,7 +145,6 @@ def tree_decomp(mol):
 def atom_equal(a1, a2):
     return a1.GetSymbol() == a2.GetSymbol() and a1.GetFormalCharge() == a2.GetFormalCharge()
 
-#Bond type not considered because all aromatic (so SINGLE matches DOUBLE)
 def ring_bond_equal(b1, b2, reverse=False):
     b1 = (b1.GetBeginAtom(), b1.GetEndAtom())
     if reverse:
@@ -183,7 +173,7 @@ def attach_mols(ctr_mol, neighbors, prev_nodes, nei_amap):
                 a2 = amap[bond.GetEndAtom().GetIdx()]
                 if ctr_mol.GetBondBetweenAtoms(a1, a2) is None:
                     ctr_mol.AddBond(a1, a2, bond.GetBondType())
-                elif nei_id in prev_nids: #father node overrides
+                elif nei_id in prev_nids: 
                     ctr_mol.RemoveBond(a1, a2)
                     ctr_mol.AddBond(a1, a2, bond.GetBondType())
     return ctr_mol
@@ -198,7 +188,6 @@ def local_attach(ctr_mol, neighbors, prev_nodes, amap_list):
     ctr_mol = attach_mols(ctr_mol, neighbors, prev_nodes, nei_amap)
     return ctr_mol.GetMol()
 
-#This version records idx mapping between ctr_mol and nei_mol
 def enum_attach(ctr_mol, nei_node, amap, singletons):
     nei_mol,nei_idx = nei_node.mol,nei_node.nid
     att_confs = []
@@ -206,21 +195,20 @@ def enum_attach(ctr_mol, nei_node, amap, singletons):
     ctr_atoms = [atom for atom in ctr_mol.GetAtoms() if atom.GetIdx() not in black_list]
     ctr_bonds = [bond for bond in ctr_mol.GetBonds()]
 
-    if nei_mol.GetNumBonds() == 0: #neighbor singleton
+    if nei_mol.GetNumBonds() == 0: 
         nei_atom = nei_mol.GetAtomWithIdx(0)
         used_list = [atom_idx for _,atom_idx,_ in amap]
         for atom in ctr_atoms:
             if atom_equal(atom, nei_atom) and atom.GetIdx() not in used_list:
                 new_amap = amap + [(nei_idx, atom.GetIdx(), 0)]
                 att_confs.append( new_amap )
-   
-    elif nei_mol.GetNumBonds() == 1: #neighbor is a bond
+    
+    elif nei_mol.GetNumBonds() == 1: 
         bond = nei_mol.GetBondWithIdx(0)
         bond_val = int(bond.GetBondTypeAsDouble())
         b1,b2 = bond.GetBeginAtom(), bond.GetEndAtom()
 
         for atom in ctr_atoms: 
-            #Optimize if atom is carbon (other atoms may change valence)
             if atom.GetAtomicNum() == 6 and atom.GetTotalNumHs() < bond_val:
                 continue
             if atom_equal(atom, b1):
@@ -230,17 +218,14 @@ def enum_attach(ctr_mol, nei_node, amap, singletons):
                 new_amap = amap + [(nei_idx, atom.GetIdx(), b2.GetIdx())]
                 att_confs.append( new_amap )
     else: 
-        #intersection is an atom
         for a1 in ctr_atoms:
             for a2 in nei_mol.GetAtoms():
                 if atom_equal(a1, a2):
-                    #Optimize if atom is carbon (other atoms may change valence)
                     if a1.GetAtomicNum() == 6 and a1.GetTotalNumHs() + a2.GetTotalNumHs() < 4:
                         continue
                     new_amap = amap + [(nei_idx, a1.GetIdx(), a2.GetIdx())]
                     att_confs.append( new_amap )
 
-        #intersection is an bond
         if ctr_mol.GetNumBonds() > 1:
             for b1 in ctr_bonds:
                 for b2 in nei_mol.GetBonds():
@@ -253,7 +238,6 @@ def enum_attach(ctr_mol, nei_node, amap, singletons):
                         att_confs.append( new_amap )
     return att_confs
 
-#Try rings first: Speed-Up 
 def enum_assemble(node, neighbors, prev_nodes=[], prev_amap=[]):
     all_attach_confs = []
     singletons = [nei_node.nid for nei_node in neighbors + prev_nodes if nei_node.mol.GetNumAtoms() == 1]
@@ -309,7 +293,7 @@ def check_singleton(cand_mol, ctr_node, nei_nodes):
 
     n_leaf2_atoms = 0
     for atom in cand_mol.GetAtoms():
-        nei_leaf_atoms = [a for a in atom.GetNeighbors() if not a.IsInRing()] #a.GetDegree() == 1]
+        nei_leaf_atoms = [a for a in atom.GetNeighbors() if not a.IsInRing()] 
         if len(nei_leaf_atoms) > 1: 
             n_leaf2_atoms += 1
 
@@ -317,13 +301,13 @@ def check_singleton(cand_mol, ctr_node, nei_nodes):
 
 def check_aroma(cand_mol, ctr_node, nei_nodes):
     rings = [node for node in nei_nodes + [ctr_node] if node.mol.GetNumAtoms() >= 3]
-    if len(rings) < 2: return 0 #Only multi-ring system needs to be checked
+    if len(rings) < 2: return 0 
 
     get_nid = lambda x: 0 if x.is_leaf else x.nid
     benzynes = [get_nid(node) for node in nei_nodes + [ctr_node] if node.smiles in Vocab.benzynes] 
     penzynes = [get_nid(node) for node in nei_nodes + [ctr_node] if node.smiles in Vocab.penzynes] 
     if len(benzynes) + len(penzynes) == 0: 
-        return 0 #No specific aromatic rings
+        return 0 
 
     n_aroma_atoms = 0
     for atom in cand_mol.GetAtoms():
@@ -335,7 +319,6 @@ def check_aroma(cand_mol, ctr_node, nei_nodes):
     else:
         return -0.001 
 
-#Only used for debugging purpose
 def dfs_assemble(cur_mol, global_amap, fa_amap, cur_node, fa_node):
     fa_nid = fa_node.nid if fa_node is not None else -1
     prev_nodes = [fa_node] if fa_node is not None else []
@@ -358,74 +341,7 @@ def dfs_assemble(cur_mol, global_amap, fa_amap, cur_node, fa_node):
             continue
         global_amap[nei_id][nei_atom] = global_amap[cur_node.nid][ctr_atom]
     
-    cur_mol = attach_mols(cur_mol, children, [], global_amap) #father is already attached
+    cur_mol = attach_mols(cur_mol, children, [], global_amap)
     for nei_node in children:
         if not nei_node.is_leaf:
             dfs_assemble(cur_mol, global_amap, label_amap, nei_node, cur_node)
-
-if __name__ == "__main__":
-    import sys
-    from mol_tree import MolTree
-    lg = rdkit.RDLogger.logger() 
-    lg.setLevel(rdkit.RDLogger.CRITICAL)
-    
-    smiles = ["O=C1[C@@H]2C=C[C@@H](C=CC2)C1(c1ccccc1)c1ccccc1","O=C([O-])CC[C@@]12CCCC[C@]1(O)OC(=O)CC2", "ON=C1C[C@H]2CC3(C[C@@H](C1)c1ccccc12)OCCO3", "C[C@H]1CC(=O)[C@H]2[C@@]3(O)C(=O)c4cccc(O)c4[C@@H]4O[C@@]43[C@@H](O)C[C@]2(O)C1", 'Cc1cc(NC(=O)CSc2nnc3c4ccccc4n(C)c3n2)ccc1Br', 'CC(C)(C)c1ccc(C(=O)N[C@H]2CCN3CCCc4cccc2c43)cc1', "O=c1c2ccc3c(=O)n(-c4nccs4)c(=O)c4ccc(c(=O)n1-c1nccs1)c2c34", "O=C(N1CCc2c(F)ccc(F)c2C1)C1(O)Cc2ccccc2C1"]
-
-    def tree_test():
-        for s in sys.stdin:
-            s = s.split()[0]
-            tree = MolTree(s)
-            print ('-------------------------------------------')
-            print (s)
-            for node in tree.nodes:
-                print (node.smiles, [x.smiles for x in node.neighbors])
-
-    def decode_test():
-        wrong = 0
-        for tot,s in enumerate(sys.stdin):
-            s = s.split()[0]
-            tree = MolTree(s)
-            tree.recover()
-
-            cur_mol = copy_edit_mol(tree.nodes[0].mol)
-            global_amap = [{}] + [{} for node in tree.nodes]
-            global_amap[1] = {atom.GetIdx():atom.GetIdx() for atom in cur_mol.GetAtoms()}
-
-            dfs_assemble(cur_mol, global_amap, [], tree.nodes[0], None)
-
-            cur_mol = cur_mol.GetMol()
-            cur_mol = Chem.MolFromSmiles(Chem.MolToSmiles(cur_mol))
-            set_atommap(cur_mol)
-            dec_smiles = Chem.MolToSmiles(cur_mol)
-
-            gold_smiles = Chem.MolToSmiles(Chem.MolFromSmiles(s))
-            if gold_smiles != dec_smiles:
-                print (gold_smiles, dec_smiles)
-                wrong += 1
-            print (wrong, tot + 1)
-
-    def enum_test():
-        for s in sys.stdin:
-            s = s.split()[0]
-            tree = MolTree(s)
-            tree.recover()
-            tree.assemble()
-            for node in tree.nodes:
-                if node.label not in node.cands:
-                    print (tree.smiles)
-                    print (node.smiles, [x.smiles for x in node.neighbors])
-                    print (node.label, len(node.cands))
-
-    def count():
-        cnt,n = 0,0
-        for s in sys.stdin:
-            s = s.split()[0]
-            tree = MolTree(s)
-            tree.recover()
-            tree.assemble()
-            for node in tree.nodes:
-                cnt += len(node.cands)
-            n += len(tree.nodes)
-            #print cnt * 1.0 / n
-    
-    count()

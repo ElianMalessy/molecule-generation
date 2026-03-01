@@ -1,11 +1,8 @@
 import torch, sys
 import torch.nn as nn
 import torch.nn.functional as F
-from fast_jtnn.nnutils import create_var, index_select_ND, index_select_sum
-from fast_jtnn.chemutils import get_mol
+from models.fast_jtnn.nnutils import create_var, index_select_sum
 import rdkit.Chem as Chem
-
-#from scalene import scalene_profiler
 
 ELEM_LIST = ["C", "N", "O", "S", "F", "Si", "P", "Cl", "Br", "Mg", "Na", "Ca", "Fe", "Al", "I", "B", "K", "Se", "Zn", "H", "Cu", "Mn", "unknown",]
 
@@ -17,7 +14,6 @@ def onek_encoding_unk(x, allowable_set):
     if x not in allowable_set:
         x = allowable_set[-1]
     return [x == s for s in allowable_set]
-#JI return map(lambda s: x == s, allowable_set)
 
 def atom_features(atom):
     return torch.Tensor(onek_encoding_unk(atom.GetSymbol(), ELEM_LIST) 
@@ -41,11 +37,7 @@ class JTMPN(nn.Module):
         self.W_o = nn.Linear(ATOM_FDIM + hidden_size, hidden_size)
     
     def forward(self, fatoms, fbonds, agraph, bgraph, scope, tree_message): 
-        #tree_message[0] == vec(0)
-
-        #fatoms = create_var(fatoms) #STB - Refactoring to reduce Cuda memory errors
         fbonds = create_var(fbonds)
-        #agraph = create_var(agraph) #STB - Refactoring to reduce Cuda memory errors
         bgraph = create_var(bgraph)
 
         binput = self.W_i(fbonds)
@@ -53,41 +45,10 @@ class JTMPN(nn.Module):
 
         for i in range(self.depth - 1):
             message = torch.cat([tree_message,graph_message], dim=0) 
-            #nei_message = index_select_ND(message, 0, bgraph)
-            #nei_message = nei_message.sum(dim=1) #assuming tree_message[0] == vec(0)
-            #New function proposed by Kevin to resolve "Cuda out of memory" errors
-            nei_message = index_select_sum(message, 0, bgraph) #####
+            nei_message = index_select_sum(message, 0, bgraph) 
             nei_message = self.W_h(nei_message)
-            graph_message = F.relu(binput + nei_message) #####
+            graph_message = F.relu(binput + nei_message) 
 
-        """ #STB - Refactoring to reduce Cuda memory errors
-        message = torch.cat([tree_message,graph_message], dim=0)
-        #nei_message = index_select_ND(message, 0, agraph)
-        #nei_message = nei_message.sum(dim=1)
-        #New function proposed by Kevin to resolve "Cuda out of memory" errors
-        nei_message = index_select_sum(message, 0, agraph)
-        ainput = torch.cat([fatoms, nei_message], dim=1)
-        atom_hiddens = F.relu(self.W_o(ainput))
-        
-        mol_vecs = []
-        for st,le in scope:
-            mol_vec = atom_hiddens.narrow(0, st, le).sum(dim=0) / le
-            mol_vecs.append(mol_vec)
-
-        mol_vecs = torch.stack(mol_vecs, dim=0)
-
-        #STB - GPU Profiler
-        #scalene_profiler.stop()
-        """ #STB - Refactoring to reduce Cuda memory errors
-
-        mol_vecs = self.recombine(tree_message, scope, graph_message, fatoms, agraph)
-
-        del agraph, fatoms, fbonds, tree_message, scope, graph_message, bgraph, message, nei_message, 
-
-        return mol_vecs
-    
-    def recombine(self, tree_message, scope, graph_message, fatoms, agraph): #STB - Refactoring to reduce Cuda memory errors
-        
         fatoms = create_var(fatoms)
         agraph = create_var(agraph)
 
@@ -103,7 +64,6 @@ class JTMPN(nn.Module):
             mol_vecs.append(mol_vec)
 
         mol_vecs = torch.stack(mol_vecs, dim=0)
-
         return mol_vecs
 
     @staticmethod
@@ -111,13 +71,12 @@ class JTMPN(nn.Module):
         fatoms,fbonds = [],[] 
         in_bonds,all_bonds = [],[] 
         total_atoms = 0
-        total_mess = len(mess_dict) + 1 #must include vec(0) padding
+        total_mess = len(mess_dict) + 1 
         scope = []
 
         for smiles,all_nodes,ctr_node in cand_batch:
             mol = Chem.MolFromSmiles(smiles)
-            Chem.Kekulize(mol) #The original jtnn version kekulizes. Need to revisit why it is necessary
-#JI         Chem.Kekulize(mol, clearAromaticFlags=True) 
+            Chem.Kekulize(mol)
             n_atoms = mol.GetNumAtoms()
             ctr_bid = ctr_node.idx
 
@@ -130,14 +89,13 @@ class JTMPN(nn.Module):
                 a2 = bond.GetEndAtom()
                 x = a1.GetIdx() + total_atoms
                 y = a2.GetIdx() + total_atoms
-                #Here x_nid,y_nid could be 0
                 x_nid,y_nid = a1.GetAtomMapNum(),a2.GetAtomMapNum()
                 x_bid = all_nodes[x_nid - 1].idx if x_nid > 0 else -1
                 y_bid = all_nodes[y_nid - 1].idx if y_nid > 0 else -1
 
                 bfeature = bond_features(bond)
 
-                b = total_mess + len(all_bonds)  #bond idx offseted by total_mess
+                b = total_mess + len(all_bonds)  
                 all_bonds.append((x,y))
                 fbonds.append( torch.cat([fatoms[x], bfeature], 0) )
                 in_bonds[y].append(b)
@@ -170,9 +128,8 @@ class JTMPN(nn.Module):
 
         for b1 in range(total_bonds):
             x,y = all_bonds[b1]
-            for i,b2 in enumerate(in_bonds[x]): #b2 is offseted by total_mess
+            for i,b2 in enumerate(in_bonds[x]): 
                 if b2 < total_mess or all_bonds[b2-total_mess][0] != y:
                     bgraph[b1,i] = b2
 
         return (fatoms, fbonds, agraph, bgraph, scope)
-

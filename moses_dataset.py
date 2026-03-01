@@ -42,7 +42,10 @@ class MosesPyGDataset(InMemoryDataset):
             mol = Chem.MolFromSmiles(smiles)
             if mol is None or mol.GetNumAtoms() > self.max_atoms:
                 continue
-                
+
+            # Kekulize to get explicit single/double bond types, and clear aromatic flags to avoid confusion
+            Chem.Kekulize(mol, clearAromaticFlags=True)
+
             xs = [[atom_map.get(atom.GetAtomicNum(), 0)] for atom in mol.GetAtoms()]
             x = torch.tensor(xs, dtype=torch.long)
             
