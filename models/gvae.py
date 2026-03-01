@@ -2,10 +2,13 @@ import torch
 import torch.nn as torch_nn
 import torch.nn.functional as F
 from torch_geometric.nn import GINEConv, global_add_pool
+from torch_geometric.utils import to_dense_batch, to_dense_adj
 
-class MolecularGraphVAE(torch_nn.Module):
+from rdkit import Chem
+
+class GraphVAE(torch_nn.Module):
     def __init__(self, num_node_features, num_edge_features, latent_dim=64, max_atoms=38):
-        super(MolecularGraphVAE, self).__init__()
+        super(GraphVAE, self).__init__()
         
         self.max_atoms = max_atoms
         self.latent_dim = latent_dim
@@ -88,8 +91,66 @@ class MolecularGraphVAE(torch_nn.Module):
         node_logits, edge_logits = self.decode(z)
         return node_logits, edge_logits, mu, logvar
 
+    def sample_smiles(self, z, atom_decoder_dict=None):
+        """
+        Decodes a latent vector z into a list of SMILES strings.
+        Requires an atom_decoder_dict (e.g., {0: 6, 1: 7, ...}) mapping indices back to Atomic Numbers.
+        """
+        if atom_decoder_dict is None:
+            # Fallback to ZINC mapping if none provided
+            atom_decoder_dict = {0: 6, 1: 7, 2: 8, 3: 9, 4: 15, 5: 16, 6: 17, 7: 35, 8: 53} 
+            
+        node_logits, edge_logits = self.decode(z)
+        
+        # Argmax to get discrete graph
+        # Shape: (Batch, Max_Atoms)
+        node_preds = torch.argmax(node_logits, dim=-1).cpu().numpy() 
+        # Shape: (Batch, Max_Atoms, Max_Atoms)
+        edge_preds = torch.argmax(edge_logits, dim=-1).cpu().numpy() 
 
-def vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight=0.1):
+        smiles_list = []
+        for i in range(z.size(0)):
+            mol = Chem.RWMol()
+            nodes = node_preds[i]
+            adj = edge_preds[i]
+            
+            # 1. Add valid atoms
+            node_idx_map = {}
+            for j, atom_idx in enumerate(nodes):
+                if atom_idx == 0: continue # 0 is padding/empty
+                atomic_num = atom_decoder_dict.get(atom_idx - 1, 6) # Shift back by -1 due to prep
+                idx = mol.AddAtom(Chem.Atom(atomic_num))
+                node_idx_map[j] = idx
+                
+            # 2. Add edges
+            for j in range(self.max_atoms):
+                for k in range(j + 1, self.max_atoms):
+                    bond_type_idx = adj[j, k]
+                    if bond_type_idx == 0: continue # No bond
+                    if j in node_idx_map and k in node_idx_map:
+                        # Prevent RDKit C++ crash if bond already exists
+                        if not mol.GetBondBetweenAtoms(node_idx_map[j], node_idx_map[k]):
+                            bt = self._get_rdkit_bond(bond_type_idx)
+                            mol.AddBond(node_idx_map[j], node_idx_map[k], bt)
+            
+            # Convert to SMILES
+            try:
+                Chem.SanitizeMol(mol)
+                smiles = Chem.MolToSmiles(mol)
+                smiles_list.append(smiles)
+            except:
+                smiles_list.append(None) # Invalid molecule
+                
+        return smiles_list
+
+    def _get_rdkit_bond(self, bond_idx):
+        # Maps edge_attr back to RDKit bond types
+        mapping = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 
+                   3: Chem.BondType.TRIPLE, 4: Chem.BondType.AROMATIC}
+        return mapping.get(bond_idx, Chem.BondType.SINGLE)
+
+
+def gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight=0.1):
     # 1. Node Loss 
     recon_loss_nodes = F.cross_entropy(
         node_logits.reshape(-1, node_logits.size(-1)), 
@@ -131,3 +192,18 @@ def vae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, k
     total_loss = recon_loss + (kl_weight * kl_div)
     
     return total_loss, recon_loss, kl_div
+
+
+def gvae_prepare_batch(data, device, max_atoms):
+    data = data.to(device)
+    
+    # Shift labels by +1 so 0 is reserved for padding / no bond
+    x_in = data.x.squeeze(-1) + 1
+    edge_attr_in = data.edge_attr.squeeze(-1) + 1
+    
+    # Dense Targets
+    target_nodes, _ = to_dense_batch(x_in, data.batch, max_num_nodes=max_atoms)
+    target_edges = to_dense_adj(data.edge_index, data.batch, edge_attr=edge_attr_in, max_num_nodes=max_atoms)
+    target_edges = target_edges.squeeze(-1).long()
+    
+    return x_in, data.edge_index, edge_attr_in, data.batch, target_nodes, target_edges
