@@ -92,7 +92,17 @@ def build_frattvae_dataset(
     if os.path.exists(cache_path):
         logger.info(f"Loading cached FRATTVAE dataset from {cache_path}")
         with open(cache_path, 'rb') as f:
-            return pickle.load(f)
+            result = pickle.load(f)
+        # Migrate old float32 position caches to int8 to reduce RAM by 4x.
+        # Positions are binary (0/1) so int8 is lossless.
+        ds = result['dataset']
+        if ds.positions and ds.positions[0].dtype != torch.int8:
+            logger.info("Converting positions to int8 (one-time migration)...")
+            ds.positions = [p.to(torch.int8) for p in ds.positions]
+            with open(cache_path, 'wb') as f:
+                pickle.dump(result, f)
+            logger.info("Cache updated with int8 positions.")
+        return result
 
     logger.info(f"Preprocessing {len(smiles_list)} molecules for FRATTVAE ({split_name})...")
 
@@ -153,9 +163,12 @@ def build_frattvae_dataset(
     # tree.py logs individual depth/width overflows at DEBUG level
     frag_indices_list, _, positions_list = zip(*tree_features)
 
-    # Convert to tensors
+    # Convert to tensors. Store positions as int8 (values are binary 0/1) to reduce
+    # memory by 4x — critical for large datasets like MOSES (1.58M mols × 512 pos dims).
+    positions_list_i8 = [p.to(torch.int8) if isinstance(p, torch.Tensor) else torch.tensor(p, dtype=torch.int8)
+                         for p in positions_list]
     prop = torch.zeros(len(frag_indices_list), 1)   # placeholder; no property prediction
-    dataset = ListDataset(list(frag_indices_list), list(positions_list), prop)
+    dataset = ListDataset(list(frag_indices_list), list(positions_list_i8), prop)
 
     result = {
         'dataset': dataset,

@@ -26,8 +26,10 @@ def parse_args() -> Config:
     parser.add_argument('--model', type=str, default='GVAE', choices=['GVAE', 'FRATTVAE'])
     parser.add_argument('--dataset', type=str, default='ZINC', choices=['ZINC', 'MOSES'])
     parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--fratt_batch_size', type=int, default=2048, help='FRATTVAE batch size (paper: 2048)')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--fratt_lr', type=float, default=1e-4, help='FRATTVAE learning rate (paper: 1e-4)')
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--num_samples', type=int, default=10000)
@@ -113,7 +115,7 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
     for frag_indices, positions, _ in tqdm(loader, desc="Train FRATTVAE", leave=False):
         B, L = frag_indices.shape
         features      = frag_ecfps[frag_indices.flatten()].reshape(B, L, -1).to(device)
-        positions     = positions.to(device)
+        positions     = positions.to(device=device, dtype=torch.float32)
         target        = torch.cat([frag_indices, torch.zeros(B, 1)], dim=1).flatten().long().to(device)
         idx_with_root = torch.cat([torch.full((B, 1), -1), frag_indices], dim=1).to(device)
 
@@ -127,6 +129,12 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
         kl_loss    = batched_kl_divergence(mu_f, lv_f)
         label_loss = criterion(output.float().view(-1, num_tokens), target)
         loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
+
+        if not torch.isfinite(loss):
+            logger.warning(f"Non-finite loss ({loss.item():.4g}) at step {global_step} — skipping batch.")
+            optimizer.zero_grad()
+            global_step += 1
+            continue
 
         optimizer.zero_grad()
         loss.backward()
@@ -152,7 +160,7 @@ def val_epoch_frattvae(model, loader, config, global_step, device, frag_ecfps, f
     for frag_indices, positions, _ in tqdm(loader, desc="Val FRATTVAE", leave=False):
         B, L = frag_indices.shape
         features      = frag_ecfps[frag_indices.flatten()].reshape(B, L, -1).to(device)
-        positions     = positions.to(device)
+        positions     = positions.to(device=device, dtype=torch.float32)
         target        = torch.cat([frag_indices, torch.zeros(B, 1)], dim=1).flatten().long().to(device)
         idx_with_root = torch.cat([torch.full((B, 1), -1), frag_indices], dim=1).to(device)
 
@@ -337,8 +345,16 @@ def train(config: Config):
         logger.info("Compiling model with torch.compile mode='reduce-overhead'...")
         model = torch.compile(model, mode='reduce-overhead', dynamic=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    if config.model == 'FRATTVAE':
+        # Match paper: Adam with eps=1e-3 (larger eps stabilises adaptive denominator)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.fratt_lr, eps=1e-3)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    if config.model == 'FRATTVAE':
+        # Paper uses constant lr throughout — no scheduler
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
     frag_ecfps = metadata.get('frag_ecfps')
     freq_label = metadata.get('freq_label')

@@ -16,6 +16,7 @@ class Config:
     model: str = 'GVAE'
     dataset: str = 'ZINC'
     batch_size: int = 128
+    fratt_batch_size: int = 2048        # FRATTVAE batch size (paper: 2048, A100 can handle it)
     epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -27,6 +28,7 @@ class Config:
     fratt_latent_dim: int = 256     # FRATTVAE latent dim (paper: d_latent=256)
     kl_weight: float = 1.0
     kl_anneal_steps: int = 40000
+    fratt_lr: float = 1e-4          # FRATTVAE learning rate (paper: 1e-4)
     num_samples: int = 10000
     num_workers: int = 4
 
@@ -100,14 +102,14 @@ def get_dataloaders(config: Config, logger):
 
         train_loader = TorchDataLoader(
             train_data['dataset'],
-            batch_size=config.batch_size,
+            batch_size=config.fratt_batch_size,
             shuffle=True,
             num_workers=config.num_workers,
             collate_fn=collate_pad_fn,
         )
         val_loader = TorchDataLoader(
             val_data['dataset'],
-            batch_size=config.batch_size,
+            batch_size=config.fratt_batch_size,
             shuffle=False,
             num_workers=config.num_workers,
             collate_fn=collate_pad_fn,
