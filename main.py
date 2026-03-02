@@ -138,7 +138,15 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        # Guard against NaN/inf gradients (e.g. from compiled backward CUDA graph shape mismatches).
+        # clip_grad_norm_ returns the total grad norm — if NaN, skip the step to prevent
+        # Adam moment corruption, which would permanently poison all future updates.
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        if not torch.isfinite(grad_norm):
+            logger.warning(f"Non-finite grad norm at step {global_step} — skipping optimizer step.")
+            optimizer.zero_grad()
+            global_step += 1
+            continue
         optimizer.step()
         global_step += 1
 
@@ -337,13 +345,12 @@ def train(config: Config):
     amp_dtype = torch.bfloat16 if device.type == 'cuda' else None
     logger.info(f"AMP: {'bfloat16' if amp_dtype else 'disabled (CPU)'}")
 
-    if device.type == 'cuda' and config.model == 'FRATTVAE':
-        # FRATTVAE operates on fixed-shape padded tensors — torch.compile is effective.
-        # GVAE has variable-size molecular graphs that cause graph breaks inside PyG's
-        # global_mean_pool (int(index.max()) forces a CPU sync dynamo can't trace through),
-        # so compilation is skipped for GVAE.
-        logger.info("Compiling model with torch.compile mode='reduce-overhead'...")
-        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
+    if device.type == 'cuda' and config.model == 'GVAE':
+        # torch.compile is skipped for FRATTVAE: each batch has a different max sequence
+        # length after padding (variable-length fragment trees), causing shape changes
+        # that are incompatible with CUDA-graph-based reduce-overhead mode → silent NaN.
+        # GVAE also skipped: global_mean_pool forces a CPU sync dynamo can't trace.
+        pass  # compile disabled for both models
 
     if config.model == 'FRATTVAE':
         # Match paper: Adam with eps=1e-3 (larger eps stabilises adaptive denominator)
