@@ -188,7 +188,7 @@ def evaluate_model(model, config, device, metadata, val_loader=None):
             for data in val_loader:
                 x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = gvae_prepare_batch(data, device, config.max_atoms)
                 _, _, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-                z = mu
+                z = mu  # Use mean (no noise) for reconstruction eval
                 recon_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
 
                 for i, smi in enumerate(recon_smiles):
@@ -307,6 +307,7 @@ def train(config: Config):
             d_ff=config.fratt_d_ff,
             num_layers=config.fratt_layers,
             nhead=config.fratt_nhead,
+            n_jobs=max(1, (os.cpu_count() or 1) - 2),
         ).to(device)
 
     amp_dtype = torch.bfloat16 if device.type == 'cuda' else None

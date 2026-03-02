@@ -22,25 +22,22 @@ class TreePositionalEncoding(nn.Module):
         self.params = nn.Parameter(torch.randn(self.d_params), requires_grad=True)
         self.fc = nn.Linear(self.d_params * self.depth * self.width, d_model)
 
-        self.tree_weights = None
-
     def forward(self, positions: torch.Tensor):
         """positions: shape= (Batch_size, Length, depth * width)"""
-        if self.training | (self.tree_weights is None):
-            self._update_weights()
-        treeified = positions.unsqueeze(-1) * self.tree_weights.to(positions.device)  # (B, L, depth*width, d_param)
-        treeified = treeified.flatten(start_dim=2)                                     # (B, L, depth*width*d_param = d_pos)
+        tree_weights = self._compute_weights(positions.device)
+        treeified = positions.unsqueeze(-1) * tree_weights  # (B, L, depth*width, d_param)
+        treeified = treeified.flatten(start_dim=2)           # (B, L, depth*width*d_param = d_pos)
         if treeified.shape[-1] != self.d_model:
             treeified = self.fc(treeified)
         return treeified
 
-    def _update_weights(self):
+    def _compute_weights(self, device):
         params = torch.tanh(self.params)
         tiled_tree_params = params.view(1, 1, -1).repeat(self.depth, self.width, 1)
-        tiled_depths = torch.arange(self.depth, dtype=torch.float32, device=params.device).view(-1, 1, 1).repeat(1, self.width, self.d_params)
+        tiled_depths = torch.arange(self.depth, dtype=torch.float32, device=device).view(-1, 1, 1).repeat(1, self.width, self.d_params)
         tree_norm = torch.sqrt((1 - params.square()) * self.d_model / 2)
-        self.tree_weights = (tiled_tree_params ** tiled_depths) * tree_norm
-        self.tree_weights = self.tree_weights.view(self.depth * self.width, self.d_params)
+        weights = (tiled_tree_params ** tiled_depths) * tree_norm
+        return weights.view(self.depth * self.width, self.d_params)
 
 
 class FRATTVAE(nn.Module):
