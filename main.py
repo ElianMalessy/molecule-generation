@@ -42,16 +42,16 @@ def train(config: Config):
     logger.info(f"Loading {config.dataset} dataset for {config.model}...")
     train_loader, val_loader, metadata = get_dataloaders(config, logger)
 
-    if config.model == 'GVAE':
-        mc = config.gvae
-    elif config.model == 'GVAE_NF':
-        mc = config.gvae_nf
+    steps_per_epoch = len(train_loader)
+    if config.model in ('GVAE', 'GVAE_NF'):
+        mc = config.gvae if config.model == 'GVAE' else config.gvae_nf
+        one_cycle_steps = mc.kl_anneal_steps / mc.kl_cycles
+        kl_anneal_epoch = -(-int(one_cycle_steps) // steps_per_epoch)
+        logger.info(f"Cyclical β: {mc.kl_cycles} cycles over {mc.kl_anneal_steps} steps "
+                    f"(1 cycle = {kl_anneal_epoch} epochs, ramp ratio = {mc.kl_anneal_ratio})")
     else:
         mc = config.frattvae
-    steps_per_epoch = len(train_loader)
-    kl_anneal_epoch = -(-mc.kl_anneal_steps // steps_per_epoch)
-    logger.info(f"KL annealing: {mc.kl_anneal_steps} steps "
-                f"= {kl_anneal_epoch} epochs @ {steps_per_epoch} steps/epoch")
+        kl_anneal_epoch = 0  # not used for FRATTVAE
 
     if config.model == 'GVAE':
         model = GraphVAE(

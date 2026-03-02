@@ -2,7 +2,7 @@ import torch
 from tqdm import tqdm
 
 from models.gvae import gvae_loss, gvae_prepare_batch
-from utils.utils import Config
+from utils.utils import Config, cyclical_beta
 
 
 def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
@@ -17,7 +17,9 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-            kl_weight = min(config.gvae.kl_weight, global_step / config.gvae.kl_anneal_steps)
+            kl_weight = cyclical_beta(global_step, config.gvae.kl_anneal_steps,
+                                      config.gvae.kl_weight, config.gvae.kl_cycles,
+                                      config.gvae.kl_anneal_ratio)
             loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
                                         mu, logvar, kl_weight)
 
@@ -44,7 +46,9 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device, amp_
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-            beta = min(config.gvae.kl_weight, global_step / config.gvae.kl_anneal_steps)
+            beta = cyclical_beta(global_step, config.gvae.kl_anneal_steps,
+                                 config.gvae.kl_weight, config.gvae.kl_cycles,
+                                 config.gvae.kl_anneal_ratio)
             loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
                                         mu, logvar, beta)
 

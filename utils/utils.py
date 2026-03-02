@@ -22,6 +22,22 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def cyclical_beta(step: int, total_steps: int, beta_max: float,
+                  n_cycles: int = 4, ratio: float = 0.5) -> float:
+    """Cyclical β schedule (Fu et al., 2019).
+
+    Divides training into n_cycles equal windows. Within each window the first
+    `ratio` fraction linearly ramps β from 0 → beta_max; the remainder holds
+    β at beta_max. This forces the encoder to stay active across cycles.
+    """
+    cycle_len = max(total_steps / n_cycles, 1)
+    t = step % cycle_len
+    ramp_end = cycle_len * ratio
+    if t < ramp_end:
+        return beta_max * t / ramp_end
+    return beta_max
+
+
 @dataclass
 class GVAEConfig:
     batch_size: int = 128
@@ -31,8 +47,10 @@ class GVAEConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.1           # base 1.0 × 0.1 per paper practice
-    kl_anneal_steps: int = 40000
+    kl_weight: float = 0.1
+    kl_anneal_steps: int = 40000     # total steps over which cycles run
+    kl_cycles: int = 4              # number of β cycles (Fu et al., 2019)
+    kl_anneal_ratio: float = 0.5    # fraction of each cycle spent ramping up
 
 
 @dataclass
@@ -46,7 +64,9 @@ class GVAENFConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.1
-    kl_anneal_steps: int = 40000
+    kl_anneal_steps: int = 40000     # total steps over which cycles run
+    kl_cycles: int = 4
+    kl_anneal_ratio: float = 0.5
     num_flows: int = 4               # number of IAF steps
     flow_hidden_dim: int = 256       # hidden dim of each MADE inside IAF
 
@@ -59,7 +79,6 @@ class FRATTVAEConfig:
     patience: int = 10
     latent_dim: int = 256            # paper: d_latent=256
     kl_weight: float = 0.0005        # paper: kl_w=0.0005
-    kl_anneal_steps: int = 40000
     depth: int = 32                  # paper: maxLength=32
     width: int = 16                  # paper: maxDegree=16
     d_model: int = 512               # paper: d_model=512

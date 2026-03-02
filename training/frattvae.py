@@ -38,7 +38,7 @@ def train_epoch_frattvae(model, optimizer, loader, config: Config, global_step: 
 
         # Compute both losses in float32: label_loss uses softmax over many tokens (overflow risk
         # in bfloat16); KL uses exp(ln_var) which also overflows in bfloat16.
-        kl_weight  = min(config.frattvae.kl_weight, global_step / config.frattvae.kl_anneal_steps)
+        kl_weight  = config.frattvae.kl_weight
         kl_loss    = batched_kl_divergence(mu.float(), ln_var.float())
         label_loss = criterion(output.float().view(-1, num_tokens), target)
         loss       = kl_weight * kl_loss + config.frattvae.label_loss_weight * label_loss
@@ -94,7 +94,7 @@ def val_epoch_frattvae(model, loader, config: Config, global_step: int,
                                           sequential=False)
 
         # Compute both losses in float32 (same reason as train).
-        kl_weight  = min(config.frattvae.kl_weight, global_step / config.frattvae.kl_anneal_steps)
+        kl_weight  = config.frattvae.kl_weight
         kl_loss    = batched_kl_divergence(mu.float(), ln_var.float())
         label_loss = criterion(output.float().view(-1, num_tokens), target)
         loss       = kl_weight * kl_loss + config.frattvae.label_loss_weight * label_loss

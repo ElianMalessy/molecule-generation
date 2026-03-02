@@ -3,7 +3,7 @@ from tqdm import tqdm
 
 from models.gvae_nf import gvae_nf_loss
 from models.gvae import gvae_prepare_batch
-from utils.utils import Config
+from utils.utils import Config, cyclical_beta
 
 
 def train_epoch_gvae_nf(model, optimizer, loader, config: Config, global_step: int,
@@ -19,8 +19,9 @@ def train_epoch_gvae_nf(model, optimizer, loader, config: Config, global_step: i
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det = \
                 model(x_in, edge_index, edge_attr_in, batch)
-            kl_weight = min(config.gvae_nf.kl_weight,
-                            global_step / config.gvae_nf.kl_anneal_steps)
+            kl_weight = cyclical_beta(global_step, config.gvae_nf.kl_anneal_steps,
+                                      config.gvae_nf.kl_weight, config.gvae_nf.kl_cycles,
+                                      config.gvae_nf.kl_anneal_ratio)
             loss, recon, kl = gvae_nf_loss(
                 node_logits, edge_logits, target_nodes, target_edges,
                 mu, logvar, z0, zK, sum_log_det, kl_weight,
@@ -51,8 +52,9 @@ def val_epoch_gvae_nf(model, loader, config: Config, global_step: int,
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det = \
                 model(x_in, edge_index, edge_attr_in, batch)
-            beta = min(config.gvae_nf.kl_weight,
-                       global_step / config.gvae_nf.kl_anneal_steps)
+            beta = cyclical_beta(global_step, config.gvae_nf.kl_anneal_steps,
+                                 config.gvae_nf.kl_weight, config.gvae_nf.kl_cycles,
+                                 config.gvae_nf.kl_anneal_ratio)
             loss, recon, kl = gvae_nf_loss(
                 node_logits, edge_logits, target_nodes, target_edges,
                 mu, logvar, z0, zK, sum_log_det, beta,
