@@ -1,3 +1,6 @@
+import random
+import numpy as np
+import torch
 from torch_geometric.datasets import ZINC
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.loader import DataLoader as PyGDataLoader
@@ -5,45 +8,64 @@ from torch_geometric.transforms import BaseTransform
 
 import os
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from moses_dataset import MosesPyGDataset
 from models.frattvae import build_frattvae_dataset, collate_pad_fn
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+@dataclass
+class GVAEConfig:
+    batch_size: int = 128
+    epochs: int = 1000
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    patience: int = 10
+    max_atoms: int = 38
+    latent_dim: int = 128
+    kl_weight: float = 0.1           # base 1.0 × 0.1 per paper practice
+    kl_anneal_steps: int = 40000
+
+
+@dataclass
+class FRATTVAEConfig:
+    batch_size: int = 2048           # paper: 2048
+    epochs: int = 1000
+    lr: float = 1e-4                 # paper: 1e-4
+    patience: int = 10
+    latent_dim: int = 256            # paper: d_latent=256
+    kl_weight: float = 0.0005        # paper: kl_w=0.0005
+    kl_anneal_steps: int = 40000
+    depth: int = 32                  # paper: maxLength=32
+    width: int = 16                  # paper: maxDegree=16
+    d_model: int = 512               # paper: d_model=512
+    d_ff: int = 2048                 # paper: d_ff=2048
+    num_layers: int = 6              # paper: nlayer=6
+    nhead: int = 8                   # paper: nhead=8
+    n_bits: int = 2048               # Morgan fingerprint bits
+    max_nfrags: int = 30             # max fragments per molecule during decoding
+    label_loss_weight: float = 2.0   # paper: l_w=2.0
+    n_jobs: int = 8                  # parallel workers for BRICS preprocessing
 
 
 @dataclass
 class Config:
     model: str = 'GVAE'
     dataset: str = 'ZINC'
-    batch_size: int = 128
-    fratt_batch_size: int = 2048        # FRATTVAE batch size (paper: 2048, A100 can handle it)
-    epochs: int = 100
-    lr: float = 1e-3
-    weight_decay: float = 1e-4
     seed: int = 42
-    patience: int = 10
-
-    max_atoms: int = 38
-    latent_dim: int = 128           # GVAE latent dim
-    fratt_latent_dim: int = 256     # FRATTVAE latent dim (paper: d_latent=256)
-    kl_weight: float = 1.0
-    kl_anneal_steps: int = 40000
-    fratt_lr: float = 1e-4          # FRATTVAE learning rate (paper: 1e-4)
     num_samples: int = 10000
     num_workers: int = 4
-
-    # FRATTVAE-specific hyperparameters (defaults match original paper)
-    fratt_depth: int = 32           # max tree depth  (paper: maxLength=32)
-    fratt_width: int = 16           # max tree degree (paper: maxDegree=16)
-    fratt_d_model: int = 512        # transformer hidden dim (paper: d_model=512)
-    fratt_d_ff: int = 2048          # transformer FFN dim    (paper: d_ff=2048)
-    fratt_layers: int = 6           # number of transformer layers (paper: nlayer=6)
-    fratt_nhead: int = 8            # attention heads
-    fratt_n_bits: int = 2048        # Morgan fingerprint bits
-    fratt_max_nfrags: int = 30      # max fragments per molecule during decoding
-    label_loss_weight: float = 2.0  # cross-entropy weight relative to KL
-    n_jobs: int = 8                 # parallel workers for BRICS preprocessing
-    max_train_mols: int = 0         # cap training set size (0 = no cap, for quick tests)
+    max_train_mols: int = 0          # cap training set size (0 = no cap, for quick tests)
+    gvae: GVAEConfig = field(default_factory=GVAEConfig)
+    frattvae: FRATTVAEConfig = field(default_factory=FRATTVAEConfig)
 
 
 class NormalizeZINCBonds(BaseTransform):
@@ -66,22 +88,22 @@ def get_dataloaders(config: Config, logger):
             val_dataset = ZINC(root='data/ZINC', subset=False, split='val', pre_transform=transform)
             num_node_features, num_edge_features = 29, 5
         else:
-            train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=config.max_atoms)
-            val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=config.max_atoms)
+            train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=config.gvae.max_atoms)
+            val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=config.gvae.max_atoms)
             num_node_features, num_edge_features = 9, 5
 
-        train_loader = PyGDataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
-        val_loader = PyGDataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
+        train_loader = PyGDataLoader(train_dataset, batch_size=config.gvae.batch_size, shuffle=True, num_workers=config.num_workers)
+        val_loader = PyGDataLoader(val_dataset, batch_size=config.gvae.batch_size, shuffle=False, num_workers=config.num_workers)
 
         return train_loader, val_loader, {'num_nodes': num_node_features, 'num_edges': num_edge_features}
 
     elif config.model == 'FRATTVAE':
         cache_dir = os.path.join('data', config.dataset, 'frattvae_cache')
         frattvae_kwargs = dict(
-            max_nfrags=config.fratt_max_nfrags,
-            max_depth=config.fratt_depth,
-            max_degree=config.fratt_width,
-            n_bits=config.fratt_n_bits,
+            max_nfrags=config.frattvae.max_nfrags,
+            max_depth=config.frattvae.depth,
+            max_degree=config.frattvae.width,
+            n_bits=config.frattvae.n_bits,
         )
 
         train_smiles = get_smiles_list(config.dataset, split='train')
@@ -93,7 +115,7 @@ def get_dataloaders(config: Config, logger):
             val_smiles = val_smiles[:max(256, config.max_train_mols // 10)]
             logger.info(f"Capped dataset: {len(train_smiles)} train / {len(val_smiles)} val molecules")
 
-        frattvae_kwargs['n_jobs'] = config.n_jobs
+        frattvae_kwargs['n_jobs'] = config.frattvae.n_jobs
 
         logger.info("Building / loading FRATTVAE training dataset...")
         train_data = build_frattvae_dataset(train_smiles, cache_dir, split_name='train', **frattvae_kwargs)
@@ -102,14 +124,14 @@ def get_dataloaders(config: Config, logger):
 
         train_loader = TorchDataLoader(
             train_data['dataset'],
-            batch_size=config.fratt_batch_size,
+            batch_size=config.frattvae.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
             collate_fn=collate_pad_fn,
         )
         val_loader = TorchDataLoader(
             val_data['dataset'],
-            batch_size=config.fratt_batch_size,
+            batch_size=config.frattvae.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
             collate_fn=collate_pad_fn,
