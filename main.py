@@ -27,7 +27,7 @@ def parse_args() -> Config:
     parser.add_argument('--dataset', type=str, default='ZINC', choices=['ZINC', 'MOSES'])
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--fratt_batch_size', type=int, default=2048, help='FRATTVAE batch size (paper: 2048)')
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--fratt_lr', type=float, default=1e-4, help='FRATTVAE learning rate (paper: 1e-4)')
     parser.add_argument('--weight_decay', type=float, default=1e-4)
@@ -394,7 +394,10 @@ def train(config: Config):
             logger.info("New best model saved.")
         else:
             counter += 1
-            if epoch > kl_anneal_epoch and counter >= config.patience:
+            # GVAE: wait until KL warmup completes before allowing early stopping.
+            # FRATTVAE: warmup completes in ~20 steps (<1 epoch), so no gate needed.
+            early_stop_ok = (epoch > kl_anneal_epoch) if config.model == 'GVAE' else True
+            if early_stop_ok and counter >= config.patience:
                 logger.info(f"Early stopping triggered at epoch {epoch}")
                 break
 
