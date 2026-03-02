@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from molecule_benchmarks import Benchmarker, SmilesDataset
 
 import os
@@ -9,7 +10,8 @@ import numpy as np
 from tqdm import tqdm
 
 from models.gvae import GraphVAE, gvae_loss, gvae_prepare_batch
-from models.fast_jtnn import JTNNVAE
+from models.frattvae import FRATTVAE, batched_kl_divergence
+from models.frattvae.utils.mask import create_mask
 from utils.utils import Config, get_dataloaders, get_smiles_list
 from utils.constants import MOSES_ATOM_DECODER, ZINC_ATOM_DECODER, ZINC_CHARGE_DECODER
 
@@ -20,12 +22,27 @@ from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Train Molecular Graph VAE")
-    parser.add_argument('--model', type=str, default='GVAE', choices=['GVAE', 'JTVAE'])
+    parser = argparse.ArgumentParser(description="Train Molecular VAE")
+    parser.add_argument('--model', type=str, default='GVAE', choices=['GVAE', 'FRATTVAE'])
     parser.add_argument('--dataset', type=str, default='ZINC', choices=['ZINC', 'MOSES'])
     parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--num_samples', type=int, default=10000)
+    # FRATTVAE hyperparameters (ignored for GVAE)
+    parser.add_argument('--fratt_depth', type=int, default=8, help='Max fragment tree depth (paper default: 32)')
+    parser.add_argument('--fratt_width', type=int, default=4, help='Max fragment tree degree (paper default: 32)')
+    parser.add_argument('--fratt_d_model', type=int, default=256, help='Transformer hidden dim')
+    parser.add_argument('--fratt_d_ff', type=int, default=1024, help='Transformer FFN dim')
+    parser.add_argument('--fratt_layers', type=int, default=4, help='Number of transformer layers')
+    parser.add_argument('--fratt_nhead', type=int, default=8, help='Number of attention heads')
+    parser.add_argument('--fratt_n_bits', type=int, default=2048, help='Morgan fingerprint bits')
+    parser.add_argument('--fratt_max_nfrags', type=int, default=30, help='Max fragments during decoding')
+    parser.add_argument('--label_loss_weight', type=float, default=2.0, help='Label CE loss weight')
+    parser.add_argument('--n_jobs', type=int, default=8, help='CPU workers for BRICS preprocessing')
+    parser.add_argument('--max_train_mols', type=int, default=0, help='Cap training set size (0=all, useful for quick tests)')
     args = parser.parse_args()
     return Config(**vars(args))
 
@@ -75,45 +92,79 @@ def val_epoch_gvae(model, loader, config, global_step, device):
     n = len(loader.dataset)
     return total_loss/n, total_recon/n, total_kl/n
 
-def train_epoch_jtvae(model, optimizer, loader, config, global_step):
-    model.train()
-    total_loss, total_kl = 0, 0
-    for batch in tqdm(loader, desc="Training JTVAE", leave=False):
-        optimizer.zero_grad()
-        beta = min(config.kl_weight, global_step / config.kl_anneal_steps)
-        out = model(batch, beta)
-        loss, kl_div = out[0], out[1]
+def _frattvae_criterion(freq_label: torch.Tensor, device) -> nn.CrossEntropyLoss:
+    """Frequency-weighted CrossEntropyLoss for fragment token prediction."""
+    freq = freq_label.clone().clamp(max=1000)
+    weight = freq.max() / freq
+    weight[~torch.isfinite(weight)] = 0.001
+    return nn.CrossEntropyLoss(weight=weight.to(device))
 
-        # JTVAE losses are sums, so we normalize by the batch size
-        loss = loss / len(batch)
-            
+
+def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, frag_ecfps, freq_label):
+    model.train()
+    criterion = _frattvae_criterion(freq_label, device)
+    num_tokens = frag_ecfps.shape[0]
+    total_loss = total_kl = total_label = 0.0
+
+    for frag_indices, positions, _ in tqdm(loader, desc="Train FRATTVAE", leave=False):
+        B, L = frag_indices.shape
+        features      = frag_ecfps[frag_indices.flatten()].reshape(B, L, -1).to(device)
+        positions     = positions.to(device)
+        target        = torch.cat([frag_indices, torch.zeros(B, 1)], dim=1).flatten().long().to(device)
+        idx_with_root = torch.cat([torch.full((B, 1), -1), frag_indices], dim=1).to(device)
+
+        src_mask, tgt_mask, src_pad_mask, tgt_pad_mask = create_mask(idx_with_root, idx_with_root, pad_idx=0)
+        z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask)
+
+        kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
+        kl_loss    = batched_kl_divergence(mu, ln_var)
+        label_loss = criterion(output.view(-1, num_tokens), target)
+        loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
+
+        optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         global_step += 1
-        
-        batch_size = len(batch)
-        total_loss += loss.item() * batch_size
-        total_kl += kl_div.item() * batch_size
-        
+
+        total_loss  += loss.item()        * B
+        total_kl    += kl_loss.item()     * B
+        total_label += label_loss.item()  * B
+
     n = len(loader.dataset)
-    return total_loss/n, 0.0, total_kl/n, global_step
+    return total_loss / n, total_label / n, total_kl / n, global_step
+
 
 @torch.no_grad()
-def val_epoch_jtvae(model, loader, config, global_step):
+def val_epoch_frattvae(model, loader, config, global_step, device, frag_ecfps, freq_label):
     model.eval()
-    total_loss, total_kl = 0, 0
-    for batch in tqdm(loader, desc="Validation JTVAE", leave=False):
-        kl_weight = min(config.kl_weight, global_step / config.kl_anneal_steps)
-        out = model(batch, kl_weight)
-        loss, kl_div = out[0], out[1]
-            
-        batch_size = len(batch)
-        total_loss += loss.item() * batch_size
-        total_kl += kl_div.item() * batch_size
-        
+    criterion = _frattvae_criterion(freq_label, device)
+    num_tokens = frag_ecfps.shape[0]
+    total_loss = total_kl = total_label = 0.0
+
+    for frag_indices, positions, _ in tqdm(loader, desc="Val FRATTVAE", leave=False):
+        B, L = frag_indices.shape
+        features      = frag_ecfps[frag_indices.flatten()].reshape(B, L, -1).to(device)
+        positions     = positions.to(device)
+        target        = torch.cat([frag_indices, torch.zeros(B, 1)], dim=1).flatten().long().to(device)
+        idx_with_root = torch.cat([torch.full((B, 1), -1), frag_indices], dim=1).to(device)
+
+        src_mask, tgt_mask, src_pad_mask, tgt_pad_mask = create_mask(idx_with_root, idx_with_root, pad_idx=0)
+        # Use parallel (teacher-forcing) decode during validation for speed
+        z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask,
+                                      sequential=False)
+
+        kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
+        kl_loss    = batched_kl_divergence(mu, ln_var)
+        label_loss = criterion(output.view(-1, num_tokens), target)
+        loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
+
+        total_loss  += loss.item()        * B
+        total_kl    += kl_loss.item()     * B
+        total_label += label_loss.item()  * B
+
     n = len(loader.dataset)
-    return total_loss/n, 0.0, total_kl/n
+    return total_loss / n, total_label / n, total_kl / n
 
 
 def evaluate_model(model, config, device, metadata):
@@ -123,34 +174,35 @@ def evaluate_model(model, config, device, metadata):
 
     with torch.no_grad():
         if config.model == 'GVAE':
-            # Inverse mapping from model's internal node indices back to original atom types for both datasets
             if config.dataset == 'MOSES':
                 atom_decoder = MOSES_ATOM_DECODER
-                charge_decoder = None  # MOSES does not have charge prediction
+                charge_decoder = None
             else:
                 atom_decoder = ZINC_ATOM_DECODER
                 charge_decoder = ZINC_CHARGE_DECODER
 
             z = torch.randn(config.num_samples, config.latent_dim).to(device)
-            generated_smiles = model.sample_smiles(z, metadata['num_nodes'], metadata['num_edges'], atom_decoder, charge_decoder)
-            
-        elif config.model == 'JTVAE':
-            # JTVAE requires 1-by-1 decoding due to recursive DFS assembly
-            for _ in tqdm(range(config.num_samples), desc="Sampling JTVAE"):
-                # latent_size in JTNNVAE is latent_dim // 2
-                z_tree = torch.randn(1, model.latent_size).to(device)
-                z_mol = torch.randn(1, model.latent_size).to(device)
-                
-                # This calls the method you provided, satisfying the batch_size=1 assert
-                try:
-                    smiles = model.decode(z_tree, z_mol, prob_decode=False)
-                    if smiles:
-                        generated_smiles.append(smiles)
-                except Exception as e:
-                    # Catch rare RDKit assembly errors
-                    continue
+            generated_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
 
-    # Filter out invalid smiles (Nones or empty) before passing to benchmarker
+        elif config.model == 'FRATTVAE':
+            frag_ecfps = metadata['frag_ecfps'].to(device)
+            ndummys = metadata['ndummys'].to(device)
+            uni_fragments = metadata['uni_fragments']
+            model.set_labels(uni_fragments)
+
+            # Batch the sequential decode to avoid OOM
+            decode_batch = 256
+            z_all = torch.randn(config.num_samples, config.latent_dim)
+            logger.info("Sampling FRATTVAE (sequential decode)...")
+            for i in tqdm(range(0, config.num_samples, decode_batch), desc="Sampling FRATTVAE"):
+                z_batch = z_all[i:i + decode_batch].to(device)
+                smiles_batch = model.sequential_decode(
+                    z_batch, frag_ecfps, ndummys,
+                    max_nfrags=config.fratt_max_nfrags,
+                    asSmiles=True,
+                )
+                generated_smiles.extend(smiles_batch)
+
     valid_smiles = [s for s in generated_smiles if s]
     validity = len(valid_smiles) / max(1, len(generated_smiles))
     logger.info(f"Validity (Pre-benchmarking): {validity:.4f}")
@@ -159,37 +211,41 @@ def evaluate_model(model, config, device, metadata):
         logger.error("No valid molecules generated. Skipping Benchmarks.")
         return
 
-    logger.info("Running molecule-benchmarks...")
-        
-    if config.dataset == 'MOSES':
-        reference_data = SmilesDataset.load_moses_dataset()
-    else:
-        # ZINC does not have a built-in loader in molecule_benchmarks, so we manually build it
-        t_smi = random.sample(get_smiles_list('ZINC', 'train'), 10000)
-        v_smi = random.sample(get_smiles_list('ZINC', 'val'), 10000)
-        reference_data = SmilesDataset(train_smiles=t_smi, validation_smiles=v_smi)
+    if config.max_train_mols > 0:
+        logger.info("Skipping benchmarks (max_train_mols cap active — use full dataset for real evaluation).")
+        return
 
-    benchmarker = Benchmarker(
-        dataset=reference_data, 
-        num_samples_to_generate=len(valid_smiles), 
-        device=device.type if device.type != 'mps' else 'cpu' 
-    )
-    
-    # Execute run
-    metrics = benchmarker.benchmark(valid_smiles)
-    logger.info(f"Benchmark Results: {metrics}")
+    logger.info("Running molecule-benchmarks...")
+    try:
+        if config.dataset == 'MOSES':
+            reference_data = SmilesDataset.load_moses_dataset()
+        else:
+            t_smi = random.sample(get_smiles_list('ZINC', 'train'), 10000)
+            v_smi = random.sample(get_smiles_list('ZINC', 'val'), 10000)
+            reference_data = SmilesDataset(train_smiles=t_smi, validation_smiles=v_smi)
+
+        benchmarker = Benchmarker(
+            dataset=reference_data,
+            num_samples_to_generate=len(valid_smiles),
+            device=device.type if device.type != 'mps' else 'cpu'
+        )
+        metrics = benchmarker.benchmark(valid_smiles)
+        logger.info(f"Benchmark Results: {metrics}")
+    except KeyboardInterrupt:
+        logger.warning("Benchmarking interrupted by user.")
+    except Exception as e:
+        logger.warning(f"Benchmarking failed: {e}")
 
 
 def train(config: Config):
     if config.dataset == 'MOSES':
-        # MOSES is designed for molecules with up to 30 heavy atoms, we set this to 30 to save memory and speed up training
         config.max_atoms = 30
 
-    current_kl_weight = config.kl_weight
     if config.model == 'GVAE':
-        # GVAE needs much less KL pressure to avoid vanishing gradients
-        current_kl_weight = config.kl_weight * 0.1
-    config.kl_weight = current_kl_weight
+        config.kl_weight = config.kl_weight * 0.1
+    elif config.model == 'FRATTVAE':
+        # FRATTVAE uses a small initial KL weight; set to a good default if unchanged
+        config.kl_weight = min(config.kl_weight, 0.0005)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(f'checkpoints/{config.dataset}/{config.model}', exist_ok=True)
@@ -197,41 +253,54 @@ def train(config: Config):
 
     logger.info(f"Loading {config.dataset} dataset for {config.model}...")
     train_loader, val_loader, metadata = get_dataloaders(config, logger)
-    
+
     if config.model == 'GVAE':
         model = GraphVAE(
-            num_node_features=metadata['num_nodes'], 
-            num_edge_features=metadata['num_edges'], 
-            latent_dim=config.latent_dim, 
+            num_node_features=metadata['num_nodes'],
+            num_edge_features=metadata['num_edges'],
+            latent_dim=config.latent_dim,
             max_atoms=config.max_atoms
         ).to(device)
-    else:
-        model = JTNNVAE(
-            metadata['vocab'], 
-            hidden_size=256, 
-            latent_size=config.latent_dim // 2, 
-            depthT=20, 
-            depthG=3
+    else:  # FRATTVAE
+        model = FRATTVAE(
+            num_tokens=metadata['num_frags'],
+            depth=config.fratt_depth,
+            width=config.fratt_width,
+            feat_dim=config.fratt_n_bits,
+            latent_dim=config.latent_dim,
+            d_model=config.fratt_d_model,
+            d_ff=config.fratt_d_ff,
+            num_layers=config.fratt_layers,
+            nhead=config.fratt_nhead,
         ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+
+    frag_ecfps = metadata.get('frag_ecfps')
+    freq_label = metadata.get('freq_label')
 
     global_step, best_val_loss, counter = 0, float('inf'), 0
 
     logger.info(f"Starting training on {device}...")
     for epoch in range(1, config.epochs + 1):
         if config.model == 'GVAE':
-            train_l, train_r, train_kl, global_step = train_epoch_gvae(model, optimizer, train_loader, config, global_step, device)
-            val_l, val_r, val_kl = val_epoch_gvae(model, val_loader, config, global_step, device)
+            train_l, train_recon, train_kl, global_step = train_epoch_gvae(
+                model, optimizer, train_loader, config, global_step, device)
+            val_l, val_recon, val_kl = val_epoch_gvae(
+                model, val_loader, config, global_step, device)
+            logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
+                        f"| Recon: {val_recon:.4f} | KL: {val_kl:.4f}")
         else:
-            train_l, train_r, train_kl, global_step = train_epoch_jtvae(model, optimizer, train_loader, config, global_step)
-            val_l, val_r, val_kl = val_epoch_jtvae(model, val_loader, config, global_step)
-            
-        scheduler.step()       
+            train_l, train_label, train_kl, global_step = train_epoch_frattvae(
+                model, optimizer, train_loader, config, global_step, device, frag_ecfps, freq_label)
+            val_l, val_label, val_kl = val_epoch_frattvae(
+                model, val_loader, config, global_step, device, frag_ecfps, freq_label)
+            logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
+                        f"| Label: {val_label:.4f} | KL: {val_kl:.4f}")
 
-        logger.info(f"Epoch {epoch:03d} | Train L: {train_l:.4f} | Val L: {val_l:.4f} | KL: {val_kl:.4f}")
-        
+        scheduler.step()
+
         if val_l < best_val_loss:
             best_val_loss = val_l
             counter = 0
@@ -243,7 +312,6 @@ def train(config: Config):
                 logger.info(f"Early stopping triggered at epoch {epoch}")
                 break
 
-    # Load best model for benchmarking
     model.load_state_dict(torch.load(checkpoint_path))
     evaluate_model(model, config, device, metadata)
 
