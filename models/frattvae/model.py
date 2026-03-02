@@ -142,6 +142,9 @@ class FRATTVAE(nn.Module):
         out = out[:, 0, :].squeeze(1)                                # take super-root token
 
         mu, ln_var = self.fc_vae(out).chunk(2, dim=-1)
+        # Clamp ln_var to prevent exp() overflow (both float32 and bfloat16 overflow
+        # at ln_var > ~88). exp(10) ≈ 22000 is already a very large variance.
+        ln_var = ln_var.clamp(-10, 10)
         z = self.reparameterization_trick(mu, ln_var)
 
         return z, mu, ln_var

@@ -41,7 +41,6 @@ def parse_args() -> Config:
     parser.add_argument('--fratt_n_bits', type=int, default=2048, help='Morgan fingerprint bits')
     parser.add_argument('--fratt_max_nfrags', type=int, default=30, help='Max fragments during decoding')
     parser.add_argument('--label_loss_weight', type=float, default=2.0, help='Label CE loss weight')
-    parser.add_argument('--free_bits', type=float, default=0.5, help='Min KL per latent dim (free bits) to prevent posterior collapse; 0 disables')
     parser.add_argument('--n_jobs', type=int, default=8, help='CPU workers for BRICS preprocessing')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes')
     parser.add_argument('--max_train_mols', type=int, default=0, help='Cap training set size (0=all, useful for quick tests)')
@@ -123,10 +122,7 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
         # Compute KL in float32 — ln_var.exp() overflows in bfloat16 with fast annealing schedules.
         kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
         mu_f, lv_f = mu.float(), ln_var.float()
-        # Free bits: clamp per-dim KL to a floor to prevent posterior collapse.
-        per_dim_kl = 0.5 * (-1.0 - lv_f + mu_f.pow(2) + lv_f.exp())  # (B, latent_dim)
-        kl_loss    = torch.clamp(per_dim_kl, min=config.free_bits).sum(dim=-1).mean()
-        kl_raw     = per_dim_kl.sum(dim=-1).mean()   # unweighted, for logging
+        kl_loss    = batched_kl_divergence(mu_f, lv_f)
         loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
 
         optimizer.zero_grad()
@@ -136,7 +132,7 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
         global_step += 1
 
         total_loss  += loss.item()        * B
-        total_kl    += kl_raw.item()      * B
+        total_kl    += kl_loss.item()     * B
         total_label += label_loss.item()  * B
 
     n = len(loader.dataset)

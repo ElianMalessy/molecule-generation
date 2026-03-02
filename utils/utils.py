@@ -39,7 +39,6 @@ class Config:
     fratt_n_bits: int = 2048        # Morgan fingerprint bits
     fratt_max_nfrags: int = 30      # max fragments per molecule during decoding
     label_loss_weight: float = 2.0  # cross-entropy weight relative to KL
-    free_bits: float = 0.5          # minimum KL per latent dim (free bits, prevents posterior collapse)
     n_jobs: int = 8                 # parallel workers for BRICS preprocessing
     max_train_mols: int = 0         # cap training set size (0 = no cap, for quick tests)
 
