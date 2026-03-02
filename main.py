@@ -118,11 +118,12 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
         src_mask, tgt_mask, src_pad_mask, tgt_pad_mask = create_mask(idx_with_root, idx_with_root, pad_idx=0)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask)
-            label_loss = criterion(output.view(-1, num_tokens), target)
-        # Compute KL in float32 — ln_var.exp() overflows in bfloat16 with fast annealing schedules.
+        # Compute both losses in float32: label_loss uses softmax over many tokens (overflow risk
+        # in bfloat16); KL uses exp(ln_var) which also overflows in bfloat16.
         kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
         mu_f, lv_f = mu.float(), ln_var.float()
         kl_loss    = batched_kl_divergence(mu_f, lv_f)
+        label_loss = criterion(output.float().view(-1, num_tokens), target)
         loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
 
         optimizer.zero_grad()
@@ -158,10 +159,10 @@ def val_epoch_frattvae(model, loader, config, global_step, device, frag_ecfps, f
             # Use parallel (teacher-forcing) decode during validation for speed
             z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask,
                                           sequential=False)
-            label_loss = criterion(output.view(-1, num_tokens), target)
-        # Compute KL in float32 — same reason as train.
+        # Compute both losses in float32 (same reason as train).
         kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
         kl_loss    = batched_kl_divergence(mu.float(), ln_var.float())
+        label_loss = criterion(output.float().view(-1, num_tokens), target)
         loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
 
         total_loss  += loss.item()        * B
