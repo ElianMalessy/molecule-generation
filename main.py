@@ -41,6 +41,7 @@ def parse_args() -> Config:
     parser.add_argument('--fratt_n_bits', type=int, default=2048, help='Morgan fingerprint bits')
     parser.add_argument('--fratt_max_nfrags', type=int, default=30, help='Max fragments during decoding')
     parser.add_argument('--label_loss_weight', type=float, default=2.0, help='Label CE loss weight')
+    parser.add_argument('--free_bits', type=float, default=0.5, help='Min KL per latent dim (free bits) to prevent posterior collapse; 0 disables')
     parser.add_argument('--n_jobs', type=int, default=8, help='CPU workers for BRICS preprocessing')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes')
     parser.add_argument('--max_train_mols', type=int, default=0, help='Cap training set size (0=all, useful for quick tests)')
@@ -119,7 +120,12 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask)
             kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
-            kl_loss    = batched_kl_divergence(mu, ln_var)
+            # Free bits: clamp per-dim KL to a minimum to prevent posterior collapse.
+            # The gradient is zeroed for any dimension already below the floor,
+            # so the encoder can't fully shut off latent dimensions.
+            per_dim_kl = 0.5 * (-1.0 - ln_var + mu.pow(2) + ln_var.exp())  # (B, latent_dim)
+            kl_loss    = torch.clamp(per_dim_kl, min=config.free_bits).sum(dim=-1).mean()
+            kl_raw     = per_dim_kl.sum(dim=-1).mean()   # unweighted, for logging
             label_loss = criterion(output.view(-1, num_tokens), target)
             loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
 
@@ -130,7 +136,7 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
         global_step += 1
 
         total_loss  += loss.item()        * B
-        total_kl    += kl_loss.item()     * B
+        total_kl    += kl_raw.item()      * B
         total_label += label_loss.item()  * B
 
     n = len(loader.dataset)
@@ -233,11 +239,20 @@ def evaluate_model(model, config, device, metadata, val_loader=None):
 
     valid_smiles = [s for s in generated_smiles if s]
     validity = len(valid_smiles) / max(1, len(generated_smiles))
-    logger.info(f"Prior sampling validity: {validity:.4f} "
+    unique_smiles = set(valid_smiles)
+    uniqueness = len(unique_smiles) / max(1, len(valid_smiles))
+    logger.info(f"Prior sampling validity:  {validity:.4f} "
                 f"({len(valid_smiles)}/{len(generated_smiles)})")
+    logger.info(f"Prior sampling uniqueness: {uniqueness:.4f} "
+                f"({len(unique_smiles)} unique / {len(valid_smiles)} valid)")
 
     if not valid_smiles:
         logger.error("No valid molecules generated. Skipping Benchmarks.")
+        return
+
+    if len(unique_smiles) < 100:
+        logger.error(f"Too few unique molecules ({len(unique_smiles)}) — "
+                     "likely posterior collapse. Skipping Benchmarks.")
         return
 
     if config.max_train_mols > 0:
@@ -314,17 +329,13 @@ def train(config: Config):
     amp_dtype = torch.bfloat16 if device.type == 'cuda' else None
     logger.info(f"AMP: {'bfloat16' if amp_dtype else 'disabled (CPU)'}")
 
-    if device.type == 'cuda':
-        if config.model == 'GVAE':
-            # GVAE has variable-size molecular graphs (different atom counts per batch),
-            # which causes CUDA graph explosion under reduce-overhead. Use default mode
-            # for kernel fusion without CUDA graph capture.
-            logger.info("Compiling model with torch.compile mode='default'...")
-            model = torch.compile(model, mode='default', dynamic=True)
-        else:
-            # FRATTVAE operates on fixed-shape padded tensors — reduce-overhead is safe.
-            logger.info("Compiling model with torch.compile mode='reduce-overhead'...")
-            model = torch.compile(model, mode='reduce-overhead', dynamic=True)
+    if device.type == 'cuda' and config.model == 'FRATTVAE':
+        # FRATTVAE operates on fixed-shape padded tensors — torch.compile is effective.
+        # GVAE has variable-size molecular graphs that cause graph breaks inside PyG's
+        # global_mean_pool (int(index.max()) forces a CPU sync dynamo can't trace through),
+        # so compilation is skipped for GVAE.
+        logger.info("Compiling model with torch.compile mode='reduce-overhead'...")
+        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)

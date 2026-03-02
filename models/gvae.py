@@ -146,10 +146,17 @@ class GraphVAE(torch_nn.Module):
                             mol.AddBond(node_idx_map[j], node_idx_map[k], bt)
             
             try:
-                Chem.SanitizeMol(mol, catchErrors=True) 
+                sanitize_result = Chem.SanitizeMol(mol, catchErrors=True)
+                if sanitize_result != Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
+                    smiles_list.append(None)
+                    continue
                 smiles = Chem.MolToSmiles(mol)
-                smiles_list.append(smiles)
-            except:
+                # Round-trip check: re-parse the SMILES to confirm it's truly valid
+                if smiles and Chem.MolFromSmiles(smiles) is not None:
+                    smiles_list.append(smiles)
+                else:
+                    smiles_list.append(None)
+            except Exception:
                 smiles_list.append(None)
                     
         return smiles_list
