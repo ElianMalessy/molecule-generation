@@ -53,15 +53,16 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def train_epoch_gvae(model, optimizer, loader, config, global_step, device):
+def train_epoch_gvae(model, optimizer, loader, config, global_step, device, amp_dtype=None):
     model.train()
     total_loss, total_recon, total_kl = 0, 0, 0
     for data in tqdm(loader, desc="Training GVAE", leave=False):
         optimizer.zero_grad()
         x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = gvae_prepare_batch(data, device, config.max_atoms)
-        node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-        kl_weight = min(config.kl_weight, global_step / config.kl_anneal_steps)
-        loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
+            kl_weight = min(config.kl_weight, global_step / config.kl_anneal_steps)
+            loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight)
         
         loss.backward()
         optimizer.step()
@@ -75,15 +76,15 @@ def train_epoch_gvae(model, optimizer, loader, config, global_step, device):
     return total_loss/n, total_recon/n, total_kl/n, global_step
 
 @torch.no_grad()
-def val_epoch_gvae(model, loader, config, global_step, device):
+def val_epoch_gvae(model, loader, config, global_step, device, amp_dtype=None):
     model.eval()
     total_loss, total_recon, total_kl = 0, 0, 0
     for data in tqdm(loader, desc="Validation GVAE", leave=False):
         x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = gvae_prepare_batch(data, device, config.max_atoms)
-        node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-
-        beta = min(config.kl_weight, global_step / config.kl_anneal_steps)
-        loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, beta)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            node_logits, edge_logits, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
+            beta = min(config.kl_weight, global_step / config.kl_anneal_steps)
+            loss, recon, kl = gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, beta)
         
         total_loss += loss.item() * data.num_graphs
         total_recon += recon.item() * data.num_graphs
@@ -100,7 +101,7 @@ def _frattvae_criterion(freq_label: torch.Tensor, device) -> nn.CrossEntropyLoss
     return nn.CrossEntropyLoss(weight=weight.to(device))
 
 
-def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, frag_ecfps, freq_label):
+def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, frag_ecfps, freq_label, amp_dtype=None):
     model.train()
     criterion = _frattvae_criterion(freq_label, device)
     num_tokens = frag_ecfps.shape[0]
@@ -114,12 +115,12 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
         idx_with_root = torch.cat([torch.full((B, 1), -1), frag_indices], dim=1).to(device)
 
         src_mask, tgt_mask, src_pad_mask, tgt_pad_mask = create_mask(idx_with_root, idx_with_root, pad_idx=0)
-        z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask)
-
-        kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
-        kl_loss    = batched_kl_divergence(mu, ln_var)
-        label_loss = criterion(output.view(-1, num_tokens), target)
-        loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask)
+            kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
+            kl_loss    = batched_kl_divergence(mu, ln_var)
+            label_loss = criterion(output.view(-1, num_tokens), target)
+            loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -136,7 +137,7 @@ def train_epoch_frattvae(model, optimizer, loader, config, global_step, device, 
 
 
 @torch.no_grad()
-def val_epoch_frattvae(model, loader, config, global_step, device, frag_ecfps, freq_label):
+def val_epoch_frattvae(model, loader, config, global_step, device, frag_ecfps, freq_label, amp_dtype=None):
     model.eval()
     criterion = _frattvae_criterion(freq_label, device)
     num_tokens = frag_ecfps.shape[0]
@@ -150,14 +151,14 @@ def val_epoch_frattvae(model, loader, config, global_step, device, frag_ecfps, f
         idx_with_root = torch.cat([torch.full((B, 1), -1), frag_indices], dim=1).to(device)
 
         src_mask, tgt_mask, src_pad_mask, tgt_pad_mask = create_mask(idx_with_root, idx_with_root, pad_idx=0)
-        # Use parallel (teacher-forcing) decode during validation for speed
-        z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask,
-                                      sequential=False)
-
-        kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
-        kl_loss    = batched_kl_divergence(mu, ln_var)
-        label_loss = criterion(output.view(-1, num_tokens), target)
-        loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            # Use parallel (teacher-forcing) decode during validation for speed
+            z, mu, ln_var, output = model(features, positions, src_mask, src_pad_mask, tgt_mask, tgt_pad_mask,
+                                          sequential=False)
+            kl_weight  = min(config.kl_weight, global_step / config.kl_anneal_steps)
+            kl_loss    = batched_kl_divergence(mu, ln_var)
+            label_loss = criterion(output.view(-1, num_tokens), target)
+            loss       = kl_weight * kl_loss + config.label_loss_weight * label_loss
 
         total_loss  += loss.item()        * B
         total_kl    += kl_loss.item()     * B
@@ -187,7 +188,7 @@ def evaluate_model(model, config, device, metadata, val_loader=None):
             for data in val_loader:
                 x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = gvae_prepare_batch(data, device, config.max_atoms)
                 _, _, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
-                z = mu  # Use mean (no noise) for reconstruction eval
+                z = mu
                 recon_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
 
                 for i, smi in enumerate(recon_smiles):
@@ -274,7 +275,6 @@ def train(config: Config):
     if config.model == 'GVAE':
         config.kl_weight = config.kl_weight * 0.1
     elif config.model == 'FRATTVAE':
-        # FRATTVAE uses a small initial KL weight; set to a good default if unchanged
         config.kl_weight = min(config.kl_weight, 0.0005)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -309,6 +309,13 @@ def train(config: Config):
             nhead=config.fratt_nhead,
         ).to(device)
 
+    amp_dtype = torch.bfloat16 if device.type == 'cuda' else None
+    logger.info(f"AMP: {'bfloat16' if amp_dtype else 'disabled (CPU)'}")
+
+    if device.type == 'cuda':
+        logger.info("Compiling model with torch.compile (first epoch will be slower)...")
+        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
@@ -321,16 +328,16 @@ def train(config: Config):
     for epoch in range(1, config.epochs + 1):
         if config.model == 'GVAE':
             train_l, train_recon, train_kl, global_step = train_epoch_gvae(
-                model, optimizer, train_loader, config, global_step, device)
+                model, optimizer, train_loader, config, global_step, device, amp_dtype=amp_dtype)
             val_l, val_recon, val_kl = val_epoch_gvae(
-                model, val_loader, config, global_step, device)
+                model, val_loader, config, global_step, device, amp_dtype=amp_dtype)
             logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
                         f"| Recon: {val_recon:.4f} | KL: {val_kl:.4f}")
         else:
             train_l, train_label, train_kl, global_step = train_epoch_frattvae(
-                model, optimizer, train_loader, config, global_step, device, frag_ecfps, freq_label)
+                model, optimizer, train_loader, config, global_step, device, frag_ecfps, freq_label, amp_dtype=amp_dtype)
             val_l, val_label, val_kl = val_epoch_frattvae(
-                model, val_loader, config, global_step, device, frag_ecfps, freq_label)
+                model, val_loader, config, global_step, device, frag_ecfps, freq_label, amp_dtype=amp_dtype)
             logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
                         f"| Label: {val_label:.4f} | KL: {val_kl:.4f}")
 
@@ -347,7 +354,7 @@ def train(config: Config):
                 logger.info(f"Early stopping triggered at epoch {epoch}")
                 break
 
-    model.load_state_dict(torch.load(checkpoint_path))
+    model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
     evaluate_model(model, config, device, metadata, val_loader=val_loader)
 
 if __name__ == "__main__":
