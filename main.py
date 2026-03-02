@@ -20,12 +20,10 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Train Molecular VAE")
     parser.add_argument('--model',        type=str,   default='GVAE', choices=['GVAE', 'FRATTVAE'])
     parser.add_argument('--dataset',      type=str,   default='ZINC', choices=['ZINC', 'MOSES'])
-    parser.add_argument('--weight_decay', type=float, default=None,
-                        help='Override GVAE AdamW weight decay (default: 1e-4)')
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
-    if args.weight_decay is not None:
-        config.gvae.weight_decay = args.weight_decay
+    config.gvae.weight_decay = args.weight_decay
     return config
 
 

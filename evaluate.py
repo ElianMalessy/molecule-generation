@@ -1,15 +1,3 @@
-"""
-evaluate.py — evaluate a trained molecular VAE checkpoint.
-
-Importable:
-    from evaluate import evaluate_model
-
-Standalone:
-    python evaluate.py                  # all checkpoints under checkpoints/
-    python evaluate.py --model FRATTVAE --dataset ZINC
-    python evaluate.py --checkpoint checkpoints/ZINC/FRATTVAE/best.pth
-"""
-
 import torch
 import random
 import logging
@@ -30,10 +18,6 @@ RDLogger.DisableLog('rdApp.*')
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Core evaluation function
-# ---------------------------------------------------------------------------
 
 def evaluate_model(model, config: Config, device, metadata, val_loader=None):
     """
@@ -183,10 +167,6 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
         logger.warning(f"Benchmarking failed: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Helpers for the standalone runner
-# ---------------------------------------------------------------------------
-
 def _build_model(config: Config, metadata, device):
     """Instantiate the right model architecture from config + metadata."""
     if config.model == 'GVAE':
@@ -232,8 +212,7 @@ def _discover_checkpoints(root: str = 'checkpoints') -> list[tuple[str, str, str
 
 
 def run_validation(dataset: str, model_name: str, checkpoint: str,
-                   num_samples: int = 10000, num_workers: int = 4,
-                   device_str: str | None = None):
+                   num_samples: int = 10000, num_workers: int = 4):
     """
     Load a checkpoint and run the full evaluation suite.
 
@@ -243,11 +222,10 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
         checkpoint:  Path to best.pth
         num_samples: Number of molecules to sample for benchmarks
         num_workers: DataLoader worker count
-        device_str:  e.g. 'cuda', 'cpu'; auto-detected if None
     """
     logger.info(f"=== Evaluating {model_name} on {dataset} from {checkpoint} ===")
 
-    device = torch.device(device_str if device_str else ('cuda' if torch.cuda.is_available() else 'cpu'))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     config = Config(model=model_name, dataset=dataset, num_samples=num_samples, num_workers=num_workers)
     if dataset == 'MOSES':
@@ -262,10 +240,6 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
 
     evaluate_model(model, config, device, metadata, val_loader=val_loader)
 
-
-# ---------------------------------------------------------------------------
-# Standalone entry point
-# ---------------------------------------------------------------------------
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trained molecular VAE checkpoints")
@@ -290,7 +264,6 @@ if __name__ == '__main__':
     common = dict(
         num_samples=args.num_samples,
         num_workers=args.num_workers,
-        device_str=args.device,
     )
 
     if args.checkpoint:

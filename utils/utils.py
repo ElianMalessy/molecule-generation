@@ -170,7 +170,27 @@ def get_smiles_list(dataset_name, split):
         return all_smiles[start:end]
     else:
         moses_split = 'train' if split == 'train' else 'test'
+        cache_path = os.path.join('data', 'MOSES', f'smiles_{moses_split}.txt')
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                return [line.strip() for line in f if line.strip()]
         url = f"https://media.githubusercontent.com/media/molecularsets/moses/master/data/{moses_split}.csv"
-        df = pd.read_csv(url)
+        last_err = None
+        for attempt in range(1, 6):
+            try:
+                df = pd.read_csv(url)
+                break
+            except Exception as e:
+                last_err = e
+                import time
+                wait = 2 ** attempt
+                print(f"MOSES download attempt {attempt} failed ({e}); retrying in {wait}s...")
+                time.sleep(wait)
+        else:
+            raise RuntimeError(f"Failed to download MOSES {moses_split} after 5 attempts: {last_err}")
         col = 'SMILES' if 'SMILES' in df.columns else ('smiles' if 'smiles' in df.columns else df.columns[0])
-        return df[col].tolist()
+        smiles = df[col].tolist()
+        os.makedirs(os.path.join('data', 'MOSES'), exist_ok=True)
+        with open(cache_path, 'w') as f:
+            f.write('\n'.join(smiles))
+        return smiles
