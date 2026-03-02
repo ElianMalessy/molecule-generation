@@ -167,20 +167,47 @@ def val_epoch_frattvae(model, loader, config, global_step, device, frag_ecfps, f
     return total_loss / n, total_label / n, total_kl / n
 
 
-def evaluate_model(model, config, device, metadata):
-    logger.info(f"Generating {config.num_samples} samples for benchmarking...")
+def evaluate_model(model, config, device, metadata, val_loader=None):
     model.eval()
+
+    # Decoders needed for GVAE sampling and reconstruction
+    if config.model == 'GVAE':
+        atom_decoder = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
+        charge_decoder = None if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
+
+    # ------------------------------------------------------------------
+    # 1. Reconstruction accuracy on a held-out sample
+    #    Encode real molecules -> decode -> check recovery.
+    #    This is the most direct measure of VAE fidelity.
+    # ------------------------------------------------------------------
+    if config.model == 'GVAE' and val_loader is not None:
+        recon_correct = recon_total = 0
+        logger.info("Evaluating reconstruction accuracy on validation set (up to 1000 molecules)...")
+        with torch.no_grad():
+            for data in val_loader:
+                x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = gvae_prepare_batch(data, device, config.max_atoms)
+                _, _, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
+                z = mu  # Use mean (no noise) for reconstruction eval
+                recon_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
+
+                for i, smi in enumerate(recon_smiles):
+                    recon_total += 1
+                    if smi:
+                        recon_correct += 1
+                if recon_total >= 1000:
+                    break
+
+        logger.info(f"Reconstruction: {recon_correct}/{recon_total} valid decodes "
+                    f"({100 * recon_correct / max(1, recon_total):.1f}%) from posterior mean z")
+
+    # ------------------------------------------------------------------
+    # 2. Prior sampling + benchmark suite
+    # ------------------------------------------------------------------
+    logger.info(f"Generating {config.num_samples} samples for benchmarking...")
     generated_smiles = []
 
     with torch.no_grad():
         if config.model == 'GVAE':
-            if config.dataset == 'MOSES':
-                atom_decoder = MOSES_ATOM_DECODER
-                charge_decoder = None
-            else:
-                atom_decoder = ZINC_ATOM_DECODER
-                charge_decoder = ZINC_CHARGE_DECODER
-
             z = torch.randn(config.num_samples, config.latent_dim).to(device)
             generated_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
 
@@ -190,7 +217,6 @@ def evaluate_model(model, config, device, metadata):
             uni_fragments = metadata['uni_fragments']
             model.set_labels(uni_fragments)
 
-            # Batch the sequential decode to avoid OOM
             decode_batch = 256
             z_all = torch.randn(config.num_samples, config.latent_dim)
             logger.info("Sampling FRATTVAE (sequential decode)...")
@@ -205,7 +231,8 @@ def evaluate_model(model, config, device, metadata):
 
     valid_smiles = [s for s in generated_smiles if s]
     validity = len(valid_smiles) / max(1, len(generated_smiles))
-    logger.info(f"Validity (Pre-benchmarking): {validity:.4f}")
+    logger.info(f"Prior sampling validity: {validity:.4f} "
+                f"({len(valid_smiles)}/{len(generated_smiles)})")
 
     if not valid_smiles:
         logger.error("No valid molecules generated. Skipping Benchmarks.")
@@ -226,10 +253,13 @@ def evaluate_model(model, config, device, metadata):
 
         benchmarker = Benchmarker(
             dataset=reference_data,
-            num_samples_to_generate=len(valid_smiles),
-            device=device.type if device.type != 'mps' else 'cpu'
+            num_samples_to_generate=config.num_samples,
+            device=device.type
         )
-        metrics = benchmarker.benchmark(valid_smiles)
+        # Pass the full generated list (including None/invalid) so the benchmarker
+        # can compute validity metrics correctly. Pre-filtering would make
+        # valid_fraction always appear as ~1.0.
+        metrics = benchmarker.benchmark(generated_smiles)
         logger.info(f"Benchmark Results: {metrics}")
     except KeyboardInterrupt:
         logger.warning("Benchmarking interrupted by user.")
@@ -254,6 +284,11 @@ def train(config: Config):
     logger.info(f"Loading {config.dataset} dataset for {config.model}...")
     train_loader, val_loader, metadata = get_dataloaders(config, logger)
 
+    steps_per_epoch = len(train_loader)
+    kl_anneal_epoch = -(-config.kl_anneal_steps // steps_per_epoch)
+    logger.info(f"KL annealing: {config.kl_anneal_steps} steps "
+                f"= {kl_anneal_epoch} epochs @ {steps_per_epoch} steps/epoch")
+
     if config.model == 'GVAE':
         model = GraphVAE(
             num_node_features=metadata['num_nodes'],
@@ -261,7 +296,7 @@ def train(config: Config):
             latent_dim=config.latent_dim,
             max_atoms=config.max_atoms
         ).to(device)
-    else:  # FRATTVAE
+    else:
         model = FRATTVAE(
             num_tokens=metadata['num_frags'],
             depth=config.fratt_depth,
@@ -308,12 +343,12 @@ def train(config: Config):
             logger.info("New best model saved.")
         else:
             counter += 1
-            if epoch >= 30 and counter >= config.patience:
+            if epoch > kl_anneal_epoch and counter >= config.patience:
                 logger.info(f"Early stopping triggered at epoch {epoch}")
                 break
 
     model.load_state_dict(torch.load(checkpoint_path))
-    evaluate_model(model, config, device, metadata)
+    evaluate_model(model, config, device, metadata, val_loader=val_loader)
 
 if __name__ == "__main__":
     config = parse_args()

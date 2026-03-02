@@ -1,7 +1,7 @@
 import torch
 import torch.nn as torch_nn
 import torch.nn.functional as F
-from torch_geometric.nn import GINEConv, global_add_pool
+from torch_geometric.nn import GINEConv, global_mean_pool
 from torch_geometric.utils import to_dense_batch, to_dense_adj
 
 from rdkit import Chem
@@ -60,7 +60,7 @@ class GraphVAE(torch_nn.Module):
         h = F.relu(self.conv3(h, edge_index, e_emb))
         h = F.relu(self.conv4(h, edge_index, e_emb))
         
-        h_graph = global_add_pool(h, batch)
+        h_graph = global_mean_pool(h, batch)
         
         mu = self.fc_mu(h_graph)
         logvar = self.fc_logvar(h_graph)
@@ -190,7 +190,9 @@ def gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, 
         target_edges_triu.reshape(-1), 
         reduction='none'
     ).view(batch_size, -1)
-    recon_loss_edges = edge_ce.sum(dim=1).mean() # Sum over edges, mean over batch
+    # Mask out padding pairs (where either atom is padding) before summing
+    edge_ce = edge_ce * valid_pair_mask_triu.view(batch_size, -1)
+    recon_loss_edges = edge_ce.sum(dim=1).mean() # Sum over valid edges, mean over batch
     
     recon_loss = recon_loss_nodes + recon_loss_edges
     
