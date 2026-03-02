@@ -315,8 +315,16 @@ def train(config: Config):
     logger.info(f"AMP: {'bfloat16' if amp_dtype else 'disabled (CPU)'}")
 
     if device.type == 'cuda':
-        logger.info("Compiling model with torch.compile (first epoch will be slower)...")
-        model = torch.compile(model, mode='reduce-overhead', dynamic=True)
+        if config.model == 'GVAE':
+            # GVAE has variable-size molecular graphs (different atom counts per batch),
+            # which causes CUDA graph explosion under reduce-overhead. Use default mode
+            # for kernel fusion without CUDA graph capture.
+            logger.info("Compiling model with torch.compile mode='default'...")
+            model = torch.compile(model, mode='default', dynamic=True)
+        else:
+            # FRATTVAE operates on fixed-shape padded tensors — reduce-overhead is safe.
+            logger.info("Compiling model with torch.compile mode='reduce-overhead'...")
+            model = torch.compile(model, mode='reduce-overhead', dynamic=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
