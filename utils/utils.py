@@ -23,18 +23,19 @@ class Config:
     patience: int = 10
 
     max_atoms: int = 38
-    latent_dim: int = 128
+    latent_dim: int = 128           # GVAE latent dim
+    fratt_latent_dim: int = 256     # FRATTVAE latent dim (paper: d_latent=256)
     kl_weight: float = 1.0
     kl_anneal_steps: int = 40000
     num_samples: int = 10000
     num_workers: int = 4
 
-    # FRATTVAE-specific hyperparameters
-    fratt_depth: int = 8            # max tree depth
-    fratt_width: int = 4            # max tree degree
-    fratt_d_model: int = 256        # transformer hidden dim
-    fratt_d_ff: int = 1024          # transformer FFN dim
-    fratt_layers: int = 4           # number of transformer layers
+    # FRATTVAE-specific hyperparameters (defaults match original paper)
+    fratt_depth: int = 32           # max tree depth  (paper: maxLength=32)
+    fratt_width: int = 16           # max tree degree (paper: maxDegree=16)
+    fratt_d_model: int = 512        # transformer hidden dim (paper: d_model=512)
+    fratt_d_ff: int = 2048          # transformer FFN dim    (paper: d_ff=2048)
+    fratt_layers: int = 6           # number of transformer layers (paper: nlayer=6)
     fratt_nhead: int = 8            # attention heads
     fratt_n_bits: int = 2048        # Morgan fingerprint bits
     fratt_max_nfrags: int = 30      # max fragments per molecule during decoding

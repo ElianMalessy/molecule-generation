@@ -32,12 +32,14 @@ def parse_args() -> Config:
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--num_samples', type=int, default=10000)
     # FRATTVAE hyperparameters (ignored for GVAE)
-    parser.add_argument('--fratt_depth', type=int, default=8, help='Max fragment tree depth (paper default: 32)')
-    parser.add_argument('--fratt_width', type=int, default=4, help='Max fragment tree degree (paper default: 32)')
-    parser.add_argument('--fratt_d_model', type=int, default=256, help='Transformer hidden dim')
-    parser.add_argument('--fratt_d_ff', type=int, default=1024, help='Transformer FFN dim')
-    parser.add_argument('--fratt_layers', type=int, default=4, help='Number of transformer layers')
-    parser.add_argument('--fratt_nhead', type=int, default=8, help='Number of attention heads')
+    parser.add_argument('--latent_dim', type=int, default=128, help='GVAE latent dimension')
+    parser.add_argument('--fratt_latent_dim', type=int, default=256, help='FRATTVAE latent dimension (paper: 256)')
+    parser.add_argument('--fratt_depth', type=int, default=32, help='Max fragment tree depth (paper: 32)')
+    parser.add_argument('--fratt_width', type=int, default=16, help='Max fragment tree degree (paper: 16)')
+    parser.add_argument('--fratt_d_model', type=int, default=512, help='Transformer hidden dim (paper: 512)')
+    parser.add_argument('--fratt_d_ff', type=int, default=2048, help='Transformer FFN dim (paper: 2048)')
+    parser.add_argument('--fratt_layers', type=int, default=6, help='Number of transformer layers (paper: 6)')
+    parser.add_argument('--fratt_nhead', type=int, default=8, help='Number of attention heads (paper: 8)')
     parser.add_argument('--fratt_n_bits', type=int, default=2048, help='Morgan fingerprint bits')
     parser.add_argument('--fratt_max_nfrags', type=int, default=30, help='Max fragments during decoding')
     parser.add_argument('--label_loss_weight', type=float, default=2.0, help='Label CE loss weight')
@@ -224,7 +226,7 @@ def evaluate_model(model, config, device, metadata, val_loader=None):
             model.set_labels(uni_fragments)
 
             decode_batch = 256
-            z_all = torch.randn(config.num_samples, config.latent_dim)
+            z_all = torch.randn(config.num_samples, config.fratt_latent_dim)
             logger.info("Sampling FRATTVAE (sequential decode)...")
             for i in tqdm(range(0, config.num_samples, decode_batch), desc="Sampling FRATTVAE"):
                 z_batch = z_all[i:i + decode_batch].to(device)
@@ -316,7 +318,7 @@ def train(config: Config):
             depth=config.fratt_depth,
             width=config.fratt_width,
             feat_dim=config.fratt_n_bits,
-            latent_dim=config.latent_dim,
+            latent_dim=config.fratt_latent_dim,
             d_model=config.fratt_d_model,
             d_ff=config.fratt_d_ff,
             num_layers=config.fratt_layers,
