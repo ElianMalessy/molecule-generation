@@ -7,6 +7,7 @@ from tqdm import tqdm
 from molecule_benchmarks import Benchmarker, SmilesDataset
 
 from models.gvae import GraphVAE, gvae_prepare_batch
+from models.gvae_nf import GraphVAENF
 from models.frattvae import FRATTVAE, build_frattvae_dataset, collate_pad_fn
 from models.frattvae.utils.mask import create_mask
 from utils.utils import Config, get_dataloaders, get_smiles_list
@@ -32,8 +33,8 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
     """
     model.eval()
 
-    # Decoders needed for GVAE sampling and reconstruction
-    if config.model == 'GVAE':
+    # Decoders needed for GVAE/GVAE_NF sampling and reconstruction
+    if config.model in ('GVAE', 'GVAE_NF'):
         atom_decoder   = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
         charge_decoder = None               if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
 
@@ -41,14 +42,15 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
     # 1. Reconstruction accuracy on a held-out sample
     #    Encode real molecules -> decode -> check recovery.
     # ------------------------------------------------------------------
-    if config.model == 'GVAE' and val_loader is not None:
+    if config.model in ('GVAE', 'GVAE_NF') and val_loader is not None:
+        gc = config.gvae if config.model == 'GVAE' else config.gvae_nf
         recon_correct = recon_total = 0
         logger.info("Evaluating reconstruction accuracy on validation set (up to 1000 molecules)...")
         with torch.no_grad():
             for data in val_loader:
                 x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = \
-                    gvae_prepare_batch(data, device, config.gvae.max_atoms)
-                _, _, mu, logvar = model(x_in, edge_index, edge_attr_in, batch)
+                    gvae_prepare_batch(data, device, gc.max_atoms)
+                mu = model.encode(x_in, edge_index, edge_attr_in, batch)[0]
                 z = mu  # Use mean (no noise) for reconstruction eval
                 recon_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
 
@@ -100,8 +102,9 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
     generated_smiles = []
 
     with torch.no_grad():
-        if config.model == 'GVAE':
-            z = torch.randn(config.num_samples, config.gvae.latent_dim).to(device)
+        if config.model in ('GVAE', 'GVAE_NF'):
+            gc = config.gvae if config.model == 'GVAE' else config.gvae_nf
+            z = torch.randn(config.num_samples, gc.latent_dim).to(device)
             generated_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
 
         elif config.model == 'FRATTVAE':
@@ -146,7 +149,9 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
     logger.info("Running molecule-benchmarks...")
     try:
         if config.dataset == 'MOSES':
-            reference_data = SmilesDataset.load_moses_dataset()
+            t_smi = get_smiles_list('MOSES', 'train')
+            v_smi = get_smiles_list('MOSES', 'test')
+            reference_data = SmilesDataset(train_smiles=t_smi, validation_smiles=v_smi)
         else:
             t_smi = random.sample(get_smiles_list('ZINC', 'train'), 10000)
             v_smi = random.sample(get_smiles_list('ZINC', 'val'), 10000)
@@ -175,6 +180,15 @@ def _build_model(config: Config, metadata, device):
             num_edge_features=metadata['num_edges'],
             latent_dim=config.gvae.latent_dim,
             max_atoms=config.gvae.max_atoms,
+        )
+    elif config.model == 'GVAE_NF':
+        model = GraphVAENF(
+            num_node_features=metadata['num_nodes'],
+            num_edge_features=metadata['num_edges'],
+            latent_dim=config.gvae_nf.latent_dim,
+            max_atoms=config.gvae_nf.max_atoms,
+            num_flows=config.gvae_nf.num_flows,
+            flow_hidden_dim=config.gvae_nf.flow_hidden_dim,
         )
     else:
         model = FRATTVAE(
@@ -230,6 +244,7 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
     config = Config(model=model_name, dataset=dataset, num_samples=num_samples, num_workers=num_workers)
     if dataset == 'MOSES':
         config.gvae.max_atoms = 30
+        config.gvae_nf.max_atoms = 30
 
     _, val_loader, metadata = get_dataloaders(config, logger)
 
@@ -248,7 +263,7 @@ def _parse_args():
                        help='Path to a specific best.pth to evaluate')
     group.add_argument('--all', action='store_true', default=True,
                        help='Evaluate all checkpoints found under checkpoints/ (default)')
-    parser.add_argument('--model',   type=str, choices=['GVAE', 'FRATTVAE'], default=None,
+    parser.add_argument('--model',   type=str, choices=['GVAE', 'GVAE_NF', 'FRATTVAE'], default=None,
                         help='Filter to a specific model (used with --all)')
     parser.add_argument('--dataset', type=str, choices=['ZINC', 'MOSES'],    default=None,
                         help='Filter to a specific dataset (used with --all or with --checkpoint)')

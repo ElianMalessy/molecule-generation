@@ -1,10 +1,133 @@
 import torch
 import torch.nn as torch_nn
 import torch.nn.functional as F
-from torch_geometric.nn import GINEConv, global_mean_pool
+from torch_geometric.nn import GINEConv, global_add_pool
 from torch_geometric.utils import to_dense_batch, to_dense_adj
 
+import numpy as np
 from rdkit import Chem
+
+# ---------------------------------------------------------------------------
+# Valency constants & shared masked-decoding helper
+# ---------------------------------------------------------------------------
+
+# Maximum total bond order allowed per heavy/light atom type.
+# For atoms that can be charged (e.g. N+, O-) we adjust in the sampler below.
+_MAX_VALENCE = {
+    1:  1,   # H
+    6:  4,   # C
+    7:  3,   # N  (N+ handled separately → 4)
+    8:  2,   # O  (O- → 1)
+    9:  1,   # F
+    15: 5,   # P
+    16: 6,   # S
+    17: 1,   # Cl
+    35: 1,   # Br
+    53: 1,   # I
+}
+
+# How many valence units each bond-type index consumes.
+# Aromatic bonds are treated as 1.5 rounded to 1 for integer tracking.
+_BOND_ORDER = {0: 0, 1: 1, 2: 2, 3: 3, 4: 1}
+
+
+def _get_rdkit_bond(bond_idx):
+    mapping = {
+        1: Chem.BondType.SINGLE,
+        2: Chem.BondType.DOUBLE,
+        3: Chem.BondType.TRIPLE,
+        4: Chem.BondType.AROMATIC,
+    }
+    return mapping.get(bond_idx, Chem.BondType.SINGLE)
+
+
+def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
+                    atom_decoder_dict, charge_decoder):
+    """
+    Greedy decoding of one molecule with an explicit valency mask.
+
+    1. Argmax node_logits → atom types.
+    2. Iterate over upper-triangle atom pairs in row-major order.
+       For each pair, mask any bond type whose order would push either atom
+       over its maximum valence before taking argmax.
+    3. Build RDKit mol, sanitize, return canonical SMILES or None.
+
+    Args:
+        node_logits_np: (max_atoms, num_node_features)  float numpy array
+        edge_logits_np: (max_atoms, max_atoms, num_edge_features) float numpy array
+        max_atoms:       int
+        atom_decoder_dict: {class_idx: atomic_num}
+        charge_decoder:    {class_idx: formal_charge} or None
+    """
+    node_preds = np.argmax(node_logits_np, axis=-1)   # (max_atoms,)
+
+    mol = Chem.RWMol()
+    node_idx_map   = {}   # grid-idx → mol atom idx
+    max_valence    = {}   # grid-idx → max allowed valence
+    running_val    = {}   # grid-idx → current valence used
+
+    # --- Place atoms ---
+    for j, atom_idx in enumerate(node_preds):
+        if atom_idx == 0:
+            continue                        # padding
+        original_class = int(atom_idx) - 1
+        atomic_num = atom_decoder_dict.get(original_class, 6)
+        rd_atom    = Chem.Atom(atomic_num)
+        fc = 0
+        if charge_decoder is not None:
+            fc = charge_decoder.get(original_class, 0)
+            if fc != 0:
+                rd_atom.SetFormalCharge(fc)
+
+        idx = mol.AddAtom(rd_atom)
+        node_idx_map[j] = idx
+        running_val[j]  = 0
+        base = _MAX_VALENCE.get(atomic_num, 4)
+        # Positive formal charge opens an extra valence slot (e.g. N+ → 4);
+        # negative charge closes one (e.g. O- → 1).
+        if fc > 0:
+            base = base + 1
+        elif fc < 0:
+            base = max(base - 1, 0)
+        max_valence[j] = base
+
+    # --- Place bonds with valency masking ---
+    num_bond_types = edge_logits_np.shape[-1]
+    for j in range(max_atoms):
+        if j not in node_idx_map:
+            continue
+        for k in range(j + 1, max_atoms):
+            if k not in node_idx_map:
+                continue
+
+            logits = edge_logits_np[j, k].copy()   # (num_bond_types,)
+
+            # Mask bond types that would violate valency for either atom.
+            for b in range(1, num_bond_types):     # b=0 is "no bond", never masked
+                order = _BOND_ORDER.get(b, 1)
+                if (running_val[j] + order > max_valence[j] or
+                        running_val[k] + order > max_valence[k]):
+                    logits[b] = -np.inf
+
+            bond_idx = int(np.argmax(logits))
+            if bond_idx == 0:
+                continue
+
+            if not mol.GetBondBetweenAtoms(node_idx_map[j], node_idx_map[k]):
+                mol.AddBond(node_idx_map[j], node_idx_map[k], _get_rdkit_bond(bond_idx))
+                order = _BOND_ORDER.get(bond_idx, 1)
+                running_val[j] += order
+                running_val[k] += order
+
+    # --- Sanitize ---
+    try:
+        result = Chem.SanitizeMol(mol, catchErrors=True)
+        if result != Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
+            return None
+        smi = Chem.MolToSmiles(mol)
+        return smi if (smi and Chem.MolFromSmiles(smi) is not None) else None
+    except Exception:
+        return None
 
 class GraphVAE(torch_nn.Module):
     def __init__(self, num_node_features, num_edge_features, latent_dim=64, max_atoms=38):
@@ -60,7 +183,7 @@ class GraphVAE(torch_nn.Module):
         h = F.relu(self.conv3(h, edge_index, e_emb))
         h = F.relu(self.conv4(h, edge_index, e_emb))
         
-        h_graph = global_mean_pool(h, batch)
+        h_graph = global_add_pool(h, batch)
         
         mu = self.fc_mu(h_graph)
         logvar = self.fc_logvar(h_graph)
@@ -93,79 +216,17 @@ class GraphVAE(torch_nn.Module):
 
     def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None):
         """
-        Decodes a latent vector z into a list of SMILES strings.
-        Requires an atom_decoder_dict (e.g., {0: 6, 1: 7, ...}) mapping indices back to Atomic Numbers.
+        Decodes a batch of latent vectors with a valency-aware greedy decoder.
         """
         node_logits, edge_logits = self.decode(z)
+        node_np = node_logits.detach().cpu().float().numpy()   # (B, N, node_feat)
+        edge_np = edge_logits.detach().cpu().float().numpy()   # (B, N, N, edge_feat)
 
-        # Argmax to get discrete graph
-        # Shape: (Batch, Max_Atoms)
-        node_preds = torch.argmax(node_logits, dim=-1).cpu().numpy() 
-        # Shape: (Batch, Max_Atoms, Max_Atoms)
-        edge_preds = torch.argmax(edge_logits, dim=-1).cpu().numpy() 
-
-        smiles_list = []
-        for i in range(z.size(0)):
-            mol = Chem.RWMol()
-            nodes = node_preds[i]
-            adj = edge_preds[i]
-            
-            # 1. Add valid atoms
-            node_idx_map = {}
-            for j, atom_idx in enumerate(nodes):
-                if atom_idx == 0: continue # 0 is padding/empty
-                
-                # Shift back by -1 due to prep
-                original_class = atom_idx - 1 
-                
-                # Get atomic number (fallback to Carbon)
-                atomic_num = atom_decoder_dict.get(original_class, 6) 
-                
-                # Create the RDKit atom
-                rd_atom = Chem.Atom(atomic_num)
-                
-                # Apply formal charge if the class has one (default to 0)
-                if charge_decoder is not None:
-                    formal_charge = charge_decoder.get(original_class, 0)
-                    if formal_charge != 0:
-                        rd_atom.SetFormalCharge(formal_charge)
-                
-                # Add to molecule
-                idx = mol.AddAtom(rd_atom)
-                node_idx_map[j] = idx
-                
-            # 2. Add edges
-            for j in range(self.max_atoms):
-                for k in range(j + 1, self.max_atoms):
-                    bond_type_idx = adj[j, k]
-                    if bond_type_idx == 0: continue # No bond
-                    if j in node_idx_map and k in node_idx_map:
-                        # Prevent RDKit C++ crash if bond already exists
-                        if not mol.GetBondBetweenAtoms(node_idx_map[j], node_idx_map[k]):
-                            bt = self._get_rdkit_bond(bond_type_idx)
-                            mol.AddBond(node_idx_map[j], node_idx_map[k], bt)
-            
-            try:
-                sanitize_result = Chem.SanitizeMol(mol, catchErrors=True)
-                if sanitize_result != Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
-                    smiles_list.append(None)
-                    continue
-                smiles = Chem.MolToSmiles(mol)
-                # Round-trip check: re-parse the SMILES to confirm it's truly valid
-                if smiles and Chem.MolFromSmiles(smiles) is not None:
-                    smiles_list.append(smiles)
-                else:
-                    smiles_list.append(None)
-            except Exception:
-                smiles_list.append(None)
-                    
-        return smiles_list
-
-    def _get_rdkit_bond(self, bond_idx):
-        # Maps edge_attr back to RDKit bond types
-        mapping = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 
-                   3: Chem.BondType.TRIPLE, 4: Chem.BondType.AROMATIC}
-        return mapping.get(bond_idx, Chem.BondType.SINGLE)
+        return [
+            decode_to_smiles(node_np[i], edge_np[i], self.max_atoms,
+                             atom_decoder_dict, charge_decoder)
+            for i in range(z.size(0))
+        ]
 
 
 def gvae_loss(node_logits, edge_logits, target_nodes, target_edges, mu, logvar, kl_weight):

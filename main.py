@@ -5,9 +5,12 @@ import logging
 import argparse
 
 from models.gvae import GraphVAE
+from models.gvae_nf import GraphVAENF
 from models.frattvae import FRATTVAE
 from utils.utils import Config, get_dataloaders, set_seed
-from training import train_epoch_gvae, val_epoch_gvae, train_epoch_frattvae, val_epoch_frattvae
+from training import (train_epoch_gvae, val_epoch_gvae,
+                      train_epoch_gvae_nf, val_epoch_gvae_nf,
+                      train_epoch_frattvae, val_epoch_frattvae)
 from evaluate import evaluate_model
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -18,7 +21,7 @@ RDLogger.DisableLog('rdApp.*')
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Train Molecular VAE")
-    parser.add_argument('--model',        type=str,   default='GVAE', choices=['GVAE', 'FRATTVAE'])
+    parser.add_argument('--model',        type=str,   default='GVAE', choices=['GVAE', 'GVAE_NF', 'FRATTVAE'])
     parser.add_argument('--dataset',      type=str,   default='ZINC', choices=['ZINC', 'MOSES'])
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     args = parser.parse_args()
@@ -30,6 +33,7 @@ def parse_args() -> Config:
 def train(config: Config):
     if config.dataset == 'MOSES':
         config.gvae.max_atoms = 30
+        config.gvae_nf.max_atoms = 30
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(f'checkpoints/{config.dataset}/{config.model}', exist_ok=True)
@@ -38,7 +42,12 @@ def train(config: Config):
     logger.info(f"Loading {config.dataset} dataset for {config.model}...")
     train_loader, val_loader, metadata = get_dataloaders(config, logger)
 
-    mc = config.gvae if config.model == 'GVAE' else config.frattvae
+    if config.model == 'GVAE':
+        mc = config.gvae
+    elif config.model == 'GVAE_NF':
+        mc = config.gvae_nf
+    else:
+        mc = config.frattvae
     steps_per_epoch = len(train_loader)
     kl_anneal_epoch = -(-mc.kl_anneal_steps // steps_per_epoch)
     logger.info(f"KL annealing: {mc.kl_anneal_steps} steps "
@@ -50,6 +59,15 @@ def train(config: Config):
             num_edge_features=metadata['num_edges'],
             latent_dim=config.gvae.latent_dim,
             max_atoms=config.gvae.max_atoms,
+        ).to(device)
+    elif config.model == 'GVAE_NF':
+        model = GraphVAENF(
+            num_node_features=metadata['num_nodes'],
+            num_edge_features=metadata['num_edges'],
+            latent_dim=config.gvae_nf.latent_dim,
+            max_atoms=config.gvae_nf.max_atoms,
+            num_flows=config.gvae_nf.num_flows,
+            flow_hidden_dim=config.gvae_nf.flow_hidden_dim,
         ).to(device)
     else:
         model = FRATTVAE(
@@ -73,7 +91,11 @@ def train(config: Config):
         optimizer = torch.optim.Adam(model.parameters(), lr=config.frattvae.lr, eps=1e-3)
         # Paper uses constant lr throughout — no scheduler
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
-    else:
+    elif config.model == 'GVAE_NF':
+        optimizer = torch.optim.AdamW(model.parameters(),
+                                      lr=config.gvae_nf.lr, weight_decay=config.gvae_nf.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.gvae_nf.epochs)
+    else:  # GVAE
         optimizer = torch.optim.AdamW(model.parameters(),
                                       lr=config.gvae.lr, weight_decay=config.gvae.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.gvae.epochs)
@@ -89,6 +111,13 @@ def train(config: Config):
             train_l, train_recon, train_kl, global_step = train_epoch_gvae(
                 model, optimizer, train_loader, config, global_step, device, amp_dtype=amp_dtype)
             val_l, val_recon, val_kl = val_epoch_gvae(
+                model, val_loader, config, global_step, device, amp_dtype=amp_dtype)
+            logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
+                        f"| Recon: {val_recon:.4f} | KL: {val_kl:.4f}")
+        elif config.model == 'GVAE_NF':
+            train_l, train_recon, train_kl, global_step = train_epoch_gvae_nf(
+                model, optimizer, train_loader, config, global_step, device, amp_dtype=amp_dtype)
+            val_l, val_recon, val_kl = val_epoch_gvae_nf(
                 model, val_loader, config, global_step, device, amp_dtype=amp_dtype)
             logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
                         f"| Recon: {val_recon:.4f} | KL: {val_kl:.4f}")
@@ -113,7 +142,7 @@ def train(config: Config):
             counter += 1
             # GVAE: wait until KL warmup completes before allowing early stopping.
             # FRATTVAE: warmup completes in ~20 steps (<1 epoch), so no gate needed.
-            early_stop_ok = (epoch > kl_anneal_epoch) if config.model == 'GVAE' else True
+            early_stop_ok = (epoch > kl_anneal_epoch) if config.model in ('GVAE', 'GVAE_NF') else True
             if early_stop_ok and counter >= mc.patience:
                 logger.info(f"Early stopping triggered at epoch {epoch}")
                 break

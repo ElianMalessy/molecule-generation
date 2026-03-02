@@ -36,6 +36,22 @@ class GVAEConfig:
 
 
 @dataclass
+class GVAENFConfig:
+    """Same architecture as GVAEConfig plus a planar flow stack."""
+    batch_size: int = 128
+    epochs: int = 1000
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    patience: int = 10
+    max_atoms: int = 38
+    latent_dim: int = 128
+    kl_weight: float = 0.1
+    kl_anneal_steps: int = 40000
+    num_flows: int = 4               # number of IAF steps
+    flow_hidden_dim: int = 256       # hidden dim of each MADE inside IAF
+
+
+@dataclass
 class FRATTVAEConfig:
     batch_size: int = 2048           # paper: 2048
     epochs: int = 1000
@@ -65,6 +81,7 @@ class Config:
     num_workers: int = 4
     max_train_mols: int = 0          # cap training set size (0 = no cap, for quick tests)
     gvae: GVAEConfig = field(default_factory=GVAEConfig)
+    gvae_nf: GVAENFConfig = field(default_factory=GVAENFConfig)
     frattvae: FRATTVAEConfig = field(default_factory=FRATTVAEConfig)
 
 
@@ -81,19 +98,20 @@ class NormalizeZINCBonds(BaseTransform):
 
 def get_dataloaders(config: Config, logger):
     """Returns train_loader, val_loader, and dataset-specific metadata."""
-    if config.model == 'GVAE':
+    if config.model in ('GVAE', 'GVAE_NF'):
+        gc = config.gvae if config.model == 'GVAE' else config.gvae_nf
         if config.dataset == 'ZINC':
             transform = NormalizeZINCBonds()
             train_dataset = ZINC(root='data/ZINC', subset=False, split='train', pre_transform=transform)
             val_dataset = ZINC(root='data/ZINC', subset=False, split='val', pre_transform=transform)
             num_node_features, num_edge_features = 29, 5
         else:
-            train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=config.gvae.max_atoms)
-            val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=config.gvae.max_atoms)
+            train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=gc.max_atoms)
+            val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=gc.max_atoms)
             num_node_features, num_edge_features = 9, 5
 
-        train_loader = PyGDataLoader(train_dataset, batch_size=config.gvae.batch_size, shuffle=True, num_workers=config.num_workers)
-        val_loader = PyGDataLoader(val_dataset, batch_size=config.gvae.batch_size, shuffle=False, num_workers=config.num_workers)
+        train_loader = PyGDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True, num_workers=config.num_workers)
+        val_loader = PyGDataLoader(val_dataset, batch_size=gc.batch_size, shuffle=False, num_workers=config.num_workers)
 
         return train_loader, val_loader, {'num_nodes': num_node_features, 'num_edges': num_edge_features}
 
