@@ -42,6 +42,7 @@ def parse_args() -> Config:
     parser.add_argument('--fratt_max_nfrags', type=int, default=30, help='Max fragments during decoding')
     parser.add_argument('--label_loss_weight', type=float, default=2.0, help='Label CE loss weight')
     parser.add_argument('--n_jobs', type=int, default=8, help='CPU workers for BRICS preprocessing')
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes')
     parser.add_argument('--max_train_mols', type=int, default=0, help='Cap training set size (0=all, useful for quick tests)')
     args = parser.parse_args()
     return Config(**vars(args))
@@ -307,7 +308,7 @@ def train(config: Config):
             d_ff=config.fratt_d_ff,
             num_layers=config.fratt_layers,
             nhead=config.fratt_nhead,
-            n_jobs=max(1, (os.cpu_count() or 1) - 2),
+            n_jobs=config.n_jobs,
         ).to(device)
 
     amp_dtype = torch.bfloat16 if device.type == 'cuda' else None

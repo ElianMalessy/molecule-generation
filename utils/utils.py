@@ -27,6 +27,7 @@ class Config:
     kl_weight: float = 1.0
     kl_anneal_steps: int = 40000
     num_samples: int = 10000
+    num_workers: int = 4
 
     # FRATTVAE-specific hyperparameters
     fratt_depth: int = 8            # max tree depth
@@ -66,8 +67,8 @@ def get_dataloaders(config: Config, logger):
             val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=config.max_atoms)
             num_node_features, num_edge_features = 9, 5
 
-        train_loader = PyGDataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4)
-        val_loader = PyGDataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4)
+        train_loader = PyGDataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
+        val_loader = PyGDataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
 
         return train_loader, val_loader, {'num_nodes': num_node_features, 'num_edges': num_edge_features}
 
@@ -100,14 +101,14 @@ def get_dataloaders(config: Config, logger):
             train_data['dataset'],
             batch_size=config.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=config.num_workers,
             collate_fn=collate_pad_fn,
         )
         val_loader = TorchDataLoader(
             val_data['dataset'],
             batch_size=config.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=config.num_workers,
             collate_fn=collate_pad_fn,
         )
 
