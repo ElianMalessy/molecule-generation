@@ -8,8 +8,30 @@ import numpy as np
 from rdkit import Chem
 
 # ---------------------------------------------------------------------------
-# Valency constants & shared masked-decoding helper
+# Optional property prediction head (plogP, QED, SA)
 # ---------------------------------------------------------------------------
+
+class PropertyHead(torch_nn.Module):
+    """
+    3-layer MLP that predicts a vector of 3 molecular properties from the
+    posterior mean μ.  Predicts in the *normalised* space; callers are
+    responsible for denormalising for interpretation.
+
+    Architecture: latent_dim → 256 → 128 → 3
+    """
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.net = torch_nn.Sequential(
+            torch_nn.Linear(latent_dim, 256),
+            torch_nn.ReLU(),
+            torch_nn.Linear(256, 128),
+            torch_nn.ReLU(),
+            torch_nn.Linear(128, 3),
+        )
+
+    def forward(self, mu: torch.Tensor) -> torch.Tensor:
+        """Returns (B, 3) predicted [plogP_z, QED_z, SA_z] in normalised space."""
+        return self.net(mu)
 
 # Maximum total bond order allowed per heavy/light atom type.
 # For atoms that can be charged (e.g. N+, O-) we adjust in the sampler below.
@@ -42,7 +64,7 @@ def _get_rdkit_bond(bond_idx):
 
 
 def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
-                    atom_decoder_dict, charge_decoder):
+                    atom_decoder_dict, charge_decoder, valency_mask=True):
     """
     Greedy decoding of one molecule with an explicit valency mask.
 
@@ -103,11 +125,12 @@ def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
             logits = edge_logits_np[j, k].copy()   # (num_bond_types,)
 
             # Mask bond types that would violate valency for either atom.
-            for b in range(1, num_bond_types):     # b=0 is "no bond", never masked
-                order = _BOND_ORDER.get(b, 1)
-                if (running_val[j] + order > max_valence[j] or
-                        running_val[k] + order > max_valence[k]):
-                    logits[b] = -np.inf
+            if valency_mask:
+                for b in range(1, num_bond_types):     # b=0 is "no bond", never masked
+                    order = _BOND_ORDER.get(b, 1)
+                    if (running_val[j] + order > max_valence[j] or
+                            running_val[k] + order > max_valence[k]):
+                        logits[b] = -np.inf
 
             bond_idx = int(np.argmax(logits))
             if bond_idx == 0:
@@ -130,7 +153,8 @@ def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
         return None
 
 class GraphVAE(torch_nn.Module):
-    def __init__(self, num_node_features, num_edge_features, latent_dim=64, max_atoms=38):
+    def __init__(self, num_node_features, num_edge_features, latent_dim=64, max_atoms=38,
+                 prop_pred: bool = False):
         super(GraphVAE, self).__init__()
         
         self.max_atoms = max_atoms
@@ -160,6 +184,9 @@ class GraphVAE(torch_nn.Module):
         
         self.fc_mu = torch_nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = torch_nn.Linear(hidden_dim, latent_dim)
+        
+        # Optional property prediction head
+        self.prop_head = PropertyHead(latent_dim) if prop_pred else None
         
         # Decoder
         self.decoder_nodes = torch_nn.Sequential(
@@ -214,17 +241,23 @@ class GraphVAE(torch_nn.Module):
         node_logits, edge_logits = self.decode(z)
         return node_logits, edge_logits, mu, logvar
 
-    def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None):
+    def predict_props(self, mu: torch.Tensor) -> torch.Tensor:
         """
-        Decodes a batch of latent vectors with a valency-aware greedy decoder.
+        Predict normalised property vector (B, 3) from posterior mean μ.
+        Raises RuntimeError if the model was built without prop_pred=True.
         """
+        if self.prop_head is None:
+            raise RuntimeError("GraphVAE was built without prop_pred=True")
+        return self.prop_head(mu)
+
+    def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None, valency_mask=True):
         node_logits, edge_logits = self.decode(z)
-        node_np = node_logits.detach().cpu().float().numpy()   # (B, N, node_feat)
-        edge_np = edge_logits.detach().cpu().float().numpy()   # (B, N, N, edge_feat)
+        node_np = node_logits.detach().cpu().float().numpy()
+        edge_np = edge_logits.detach().cpu().float().numpy()
 
         return [
             decode_to_smiles(node_np[i], edge_np[i], self.max_atoms,
-                             atom_decoder_dict, charge_decoder)
+                             atom_decoder_dict, charge_decoder, valency_mask)
             for i in range(z.size(0))
         ]
 

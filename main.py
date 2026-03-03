@@ -24,9 +24,28 @@ def parse_args() -> Config:
     parser.add_argument('--model',        type=str,   default='GVAE', choices=['GVAE', 'GVAE_NF', 'FRATTVAE'])
     parser.add_argument('--dataset',      type=str,   default='ZINC', choices=['ZINC', 'MOSES'])
     parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--no_valency_mask', action='store_true',
+                        help='Disable valency masking during GVAE decoding')
+    # Joint property prediction
+    parser.add_argument('--prop_pred',          action='store_true',
+                        help='Attach a property prediction head (plogP, QED, SA) to GVAE/GVAE_NF')
+    parser.add_argument('--prop_weight',        type=float, default=1.0,
+                        help='γ: property loss weight at full scale (default 1.0)')
+    parser.add_argument('--prop_warmup_epochs', type=int,   default=15,
+                        help='Epochs before property loss starts ramping up (default 15)')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
     config.gvae.weight_decay = args.weight_decay
+    if args.no_valency_mask:
+        config.gvae.valency_mask = False
+        config.gvae_nf.valency_mask = False
+    if args.prop_pred:
+        config.gvae.prop_pred          = True
+        config.gvae.prop_weight        = args.prop_weight
+        config.gvae.prop_warmup_epochs = args.prop_warmup_epochs
+        config.gvae_nf.prop_pred          = True
+        config.gvae_nf.prop_weight        = args.prop_weight
+        config.gvae_nf.prop_warmup_epochs = args.prop_warmup_epochs
     return config
 
 
@@ -59,6 +78,7 @@ def train(config: Config):
             num_edge_features=metadata['num_edges'],
             latent_dim=config.gvae.latent_dim,
             max_atoms=config.gvae.max_atoms,
+            prop_pred=config.gvae.prop_pred,
         ).to(device)
     elif config.model == 'GVAE_NF':
         model = GraphVAENF(
@@ -68,6 +88,7 @@ def train(config: Config):
             max_atoms=config.gvae_nf.max_atoms,
             num_flows=config.gvae_nf.num_flows,
             flow_hidden_dim=config.gvae_nf.flow_hidden_dim,
+            prop_pred=config.gvae_nf.prop_pred,
         ).to(device)
     else:
         model = FRATTVAE(
@@ -102,25 +123,44 @@ def train(config: Config):
 
     frag_ecfps = metadata.get('frag_ecfps')
     freq_label = metadata.get('freq_label')
+    prop_mean  = metadata.get('prop_mean')   # None when prop_pred=False
+    prop_std   = metadata.get('prop_std')
+
+    if config.model in ('GVAE', 'GVAE_NF') and mc.prop_pred:
+        logger.info(f"Joint property prediction: γ={mc.prop_weight}, "
+                    f"warmup={mc.prop_warmup_epochs} epochs (plogP / QED / SA)")
 
     global_step, best_val_loss, counter = 0, float('inf'), 0
 
     logger.info(f"Starting training on {device}...")
     for epoch in range(1, mc.epochs + 1):
+        ep_kw = dict(epoch=epoch, prop_mean=prop_mean, prop_std=prop_std)
         if config.model == 'GVAE':
-            train_l, train_recon, train_kl, global_step = train_epoch_gvae(
-                model, optimizer, train_loader, config, global_step, device, amp_dtype=amp_dtype)
-            val_l, val_recon, val_kl = val_epoch_gvae(
-                model, val_loader, config, global_step, device, amp_dtype=amp_dtype)
-            logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
-                        f"| Recon: {val_recon:.4f} | KL: {val_kl:.4f}")
+            train_l, train_recon, train_kl, train_prop, global_step = train_epoch_gvae(
+                model, optimizer, train_loader, config, global_step, device,
+                amp_dtype=amp_dtype, **ep_kw)
+            val_l, val_recon, val_kl, val_prop = val_epoch_gvae(
+                model, val_loader, config, global_step, device,
+                amp_dtype=amp_dtype, **ep_kw)
+            prop_str = f" | val_prop: {val_prop:.4f}" if mc.prop_pred else ""
+            logger.info(
+                f"Epoch {epoch:03d} "
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}) "
+                f"| val: {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
+                f"{prop_str}")
         elif config.model == 'GVAE_NF':
-            train_l, train_recon, train_kl, global_step = train_epoch_gvae_nf(
-                model, optimizer, train_loader, config, global_step, device, amp_dtype=amp_dtype)
-            val_l, val_recon, val_kl = val_epoch_gvae_nf(
-                model, val_loader, config, global_step, device, amp_dtype=amp_dtype)
-            logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
-                        f"| Recon: {val_recon:.4f} | KL: {val_kl:.4f}")
+            train_l, train_recon, train_kl, train_prop, global_step = train_epoch_gvae_nf(
+                model, optimizer, train_loader, config, global_step, device,
+                amp_dtype=amp_dtype, **ep_kw)
+            val_l, val_recon, val_kl, val_prop = val_epoch_gvae_nf(
+                model, val_loader, config, global_step, device,
+                amp_dtype=amp_dtype, **ep_kw)
+            prop_str = f" | val_prop: {val_prop:.4f}" if mc.prop_pred else ""
+            logger.info(
+                f"Epoch {epoch:03d} "
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}) "
+                f"| val: {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
+                f"{prop_str}")
         else:
             train_l, train_label, train_kl, global_step = train_epoch_frattvae(
                 model, optimizer, train_loader, config, global_step, device,

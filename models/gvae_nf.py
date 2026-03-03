@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GINEConv, global_add_pool
 from torch_geometric.utils import to_dense_adj, to_dense_batch
 
-from models.gvae import decode_to_smiles
+from models.gvae import decode_to_smiles, PropertyHead
 
 
 class MaskedLinear(nn.Linear):
@@ -70,7 +70,8 @@ class InverseAutoregressiveFlow(nn.Module):
 
 class GraphVAENF(nn.Module):
     def __init__(self, num_node_features, num_edge_features,
-                 latent_dim=128, max_atoms=38, num_flows=4, flow_hidden_dim=256):
+                 latent_dim=128, max_atoms=38, num_flows=4, flow_hidden_dim=256,
+                 prop_pred: bool = False):
         super().__init__()
 
         self.max_atoms = max_atoms
@@ -100,6 +101,9 @@ class GraphVAENF(nn.Module):
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
         self.flow = InverseAutoregressiveFlow(latent_dim, num_flows=num_flows, hidden_dim=flow_hidden_dim)
+
+        # Optional property prediction head
+        self.prop_head = PropertyHead(latent_dim) if prop_pred else None
 
         # --- Decoder (identical to GraphVAE) ---
         self.decoder_nodes = nn.Sequential(
@@ -146,7 +150,16 @@ class GraphVAENF(nn.Module):
         node_logits, edge_logits = self.decode(zK)
         return node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det
 
-    def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None):
+    def predict_props(self, mu: torch.Tensor) -> torch.Tensor:
+        """
+        Predict normalised property vector (B, 3) from posterior mean μ.
+        Raises RuntimeError if the model was built without prop_pred=True.
+        """
+        if self.prop_head is None:
+            raise RuntimeError("GraphVAENF was built without prop_pred=True")
+        return self.prop_head(mu)
+
+    def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None, valency_mask=True):
         zK, _ = self.flow(z)
         node_logits, edge_logits = self.decode(zK)
         node_np = node_logits.detach().cpu().float().numpy()
@@ -154,7 +167,7 @@ class GraphVAENF(nn.Module):
 
         return [
             decode_to_smiles(node_np[i], edge_np[i], self.max_atoms,
-                             atom_decoder_dict, charge_decoder)
+                             atom_decoder_dict, charge_decoder, valency_mask)
             for i in range(z.size(0))
         ]
 

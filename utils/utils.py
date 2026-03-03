@@ -11,6 +11,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 
 from moses_dataset import MosesPyGDataset
+from utils.properties import build_props_cache, compute_normalisation_stats
 from models.frattvae import build_frattvae_dataset, collate_pad_fn
 
 
@@ -51,6 +52,11 @@ class GVAEConfig:
     kl_anneal_steps: int = 40000     # total steps over which cycles run
     kl_cycles: int = 4              # number of β cycles (Fu et al., 2019)
     kl_anneal_ratio: float = 0.5    # fraction of each cycle spent ramping up
+    valency_mask: bool = True        # apply valency masking during decoding
+    # --- joint property prediction ---
+    prop_pred: bool = False          # attach property prediction head
+    prop_weight: float = 1.0         # γ: property loss weight at full scale
+    prop_warmup_epochs: int = 15     # epochs before γ starts ramping up
 
 
 @dataclass
@@ -69,6 +75,11 @@ class GVAENFConfig:
     kl_anneal_ratio: float = 0.5
     num_flows: int = 4               # number of IAF steps
     flow_hidden_dim: int = 256       # hidden dim of each MADE inside IAF
+    valency_mask: bool = True
+    # --- joint property prediction ---
+    prop_pred: bool = False
+    prop_weight: float = 1.0
+    prop_warmup_epochs: int = 15
 
 
 @dataclass
@@ -104,6 +115,24 @@ class Config:
     frattvae: FRATTVAEConfig = field(default_factory=FRATTVAEConfig)
 
 
+class PropsDataset(torch.utils.data.Dataset):
+    """
+    Lightweight wrapper that injects a pre-computed property vector (plogP, QED, SA)
+    into each PyG Data object as `data.props`.
+    """
+    def __init__(self, base_dataset, props: torch.Tensor):
+        self.base  = base_dataset
+        self.props = props   # (N, 3) float32
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        data = self.base[idx].clone()
+        data.props = self.props[idx]   # (3,) — batched by PyG into (B, 3)
+        return data
+
+
 class NormalizeZINCBonds(BaseTransform):
     """
     ZINC bonds are naturally 1, 2, 3, 4.
@@ -129,10 +158,33 @@ def get_dataloaders(config: Config, logger):
             val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=gc.max_atoms)
             num_node_features, num_edge_features = 9, 5
 
+        metadata: dict = {'num_nodes': num_node_features, 'num_edges': num_edge_features}
+
+        if gc.prop_pred:
+            from utils.constants import ZINC_ATOM_DECODER, ZINC_CHARGE_DECODER, MOSES_ATOM_DECODER
+            atom_dec    = ZINC_ATOM_DECODER if config.dataset == 'ZINC' else MOSES_ATOM_DECODER
+            charge_dec  = ZINC_CHARGE_DECODER if config.dataset == 'ZINC' else None
+            cache_root  = os.path.join('data', config.dataset, 'prop_cache')
+            os.makedirs(cache_root, exist_ok=True)
+
+            train_props = build_props_cache(
+                train_dataset, atom_dec, charge_dec,
+                os.path.join(cache_root, 'props_train.pt'))
+            val_props = build_props_cache(
+                val_dataset, atom_dec, charge_dec,
+                os.path.join(cache_root, 'props_val.pt'))
+
+            prop_mean, prop_std = compute_normalisation_stats(train_props)
+            metadata['prop_mean'] = prop_mean   # (3,)
+            metadata['prop_std']  = prop_std    # (3,)
+
+            train_dataset = PropsDataset(train_dataset, train_props)
+            val_dataset   = PropsDataset(val_dataset,   val_props)
+
         train_loader = PyGDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True, num_workers=config.num_workers)
         val_loader = PyGDataLoader(val_dataset, batch_size=gc.batch_size, shuffle=False, num_workers=config.num_workers)
 
-        return train_loader, val_loader, {'num_nodes': num_node_features, 'num_edges': num_edge_features}
+        return train_loader, val_loader, metadata
 
     elif config.model == 'FRATTVAE':
         cache_dir = os.path.join('data', config.dataset, 'frattvae_cache')

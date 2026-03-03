@@ -3,6 +3,8 @@ import random
 import logging
 import argparse
 import os
+import json
+from datetime import datetime, timezone
 from tqdm import tqdm
 from molecule_benchmarks import Benchmarker, SmilesDataset
 
@@ -52,7 +54,8 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
                     gvae_prepare_batch(data, device, gc.max_atoms)
                 mu = model.encode(x_in, edge_index, edge_attr_in, batch)[0]
                 z = mu  # Use mean (no noise) for reconstruction eval
-                recon_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
+                recon_smiles = model.sample_smiles(z, atom_decoder, charge_decoder,
+                                                   valency_mask=gc.valency_mask)
 
                 for smi in recon_smiles:
                     recon_total += 1
@@ -105,7 +108,8 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
         if config.model in ('GVAE', 'GVAE_NF'):
             gc = config.gvae if config.model == 'GVAE' else config.gvae_nf
             z = torch.randn(config.num_samples, gc.latent_dim).to(device)
-            generated_smiles = model.sample_smiles(z, atom_decoder, charge_decoder)
+            generated_smiles = model.sample_smiles(z, atom_decoder, charge_decoder,
+                                                   valency_mask=gc.valency_mask)
 
         elif config.model == 'FRATTVAE':
             frag_ecfps = metadata['frag_ecfps'].to(device)
@@ -165,11 +169,104 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
         # Pass the full generated list (including None/invalid) so the benchmarker
         # can compute validity metrics correctly.  Pre-filtering would inflate valid_fraction.
         metrics = benchmarker.benchmark(generated_smiles)
-        logger.info(f"Benchmark Results: {metrics}")
+        _log_metrics_table(metrics, logger)
+        _save_metrics(metrics, config)
     except KeyboardInterrupt:
         logger.warning("Benchmarking interrupted by user.")
     except Exception as e:
         logger.warning(f"Benchmarking failed: {e}")
+
+
+def _run_key(config: Config) -> str:
+    """
+    Build a human-readable unique key for this run, e.g.
+      'ZINC/GVAE_NF+prop+no_valency'
+    Used as the key in checkpoints/scores.json.
+    """
+    gc = config.gvae if config.model == 'GVAE' else config.gvae_nf if config.model == 'GVAE_NF' else None
+    parts = [config.dataset, config.model]
+    if gc is not None:
+        parts.append('prop' if gc.prop_pred else 'no_prop')
+        if not gc.valency_mask:
+            parts.append('no_valency')
+    return '/'.join(parts[:2]) + ('+' + '+'.join(parts[2:]) if len(parts) > 2 else '')
+
+
+def _log_metrics_table(metrics: dict, log):
+    """Pretty-print benchmark metrics as an aligned table."""
+    v    = metrics.get('validity', {})
+    fcd  = metrics.get('fcd', {})
+    mos  = metrics.get('moses', {})
+
+    rows = [
+        # (label, value, fmt)
+        ('Validity',               v.get('valid_fraction'),                        '.4f'),
+        ('Uniqueness',             v.get('unique_fraction_of_valids'),              '.4f'),
+        ('Novelty',                v.get('unique_and_novel_fraction_of_valids'),    '.4f'),
+        ('Valid & Unique',         v.get('valid_and_unique_fraction'),              '.4f'),
+        ('Valid & Unique & Novel', v.get('valid_and_unique_and_novel_fraction'),    '.4f'),
+        ('FCD',                    fcd.get('fcd'),                                  '.4f'),
+        ('FCD (normalised)',       fcd.get('fcd_normalized'),                       '.4f'),
+        ('KL score',               metrics.get('kl_score'),                         '.4f'),
+        ('MOSES filters pass',     mos.get('fraction_passing_moses_filters'),       '.4f'),
+        ('SNN',                    mos.get('snn_score'),                             '.4f'),
+        ('IntDiv',                 mos.get('IntDiv'),                                '.4f'),
+        ('IntDiv2',                mos.get('IntDiv2'),                               '.4f'),
+        ('Scaffold similarity',    mos.get('scaffolds_similarity'),                  '.4f'),
+        ('Fragment similarity',    mos.get('fragment_similarity'),                   '.4f'),
+    ]
+
+    col_w = max(len(r[0]) for r in rows)
+    sep   = '+' + '-' * (col_w + 2) + '+' + '-' * 12 + '+'
+    log.info(sep)
+    log.info(f"| {'Metric':<{col_w}} | {'Value':>10} |")
+    log.info(sep)
+    for label, val, fmt in rows:
+        if val is None:
+            formatted = '       N/A'
+        else:
+            formatted = format(val, fmt).rjust(10)
+        log.info(f"| {label:<{col_w}} | {formatted} |")
+    log.info(sep)
+
+
+def _save_metrics(metrics: dict, config: Config, scores_path: str = 'checkpoints/scores.json'):
+    """Append / update results in a shared scores.json keyed by run identifier."""
+    os.makedirs(os.path.dirname(scores_path), exist_ok=True)
+
+    if os.path.exists(scores_path):
+        with open(scores_path) as f:
+            scores = json.load(f)
+    else:
+        scores = {}
+
+    key = _run_key(config)
+
+    v   = metrics.get('validity', {})
+    fcd = metrics.get('fcd', {})
+    mos = metrics.get('moses', {})
+
+    scores[key] = {
+        'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+        'validity':              v.get('valid_fraction'),
+        'uniqueness':            v.get('unique_fraction_of_valids'),
+        'novelty':               v.get('unique_and_novel_fraction_of_valids'),
+        'valid_unique':          v.get('valid_and_unique_fraction'),
+        'valid_unique_novel':    v.get('valid_and_unique_and_novel_fraction'),
+        'fcd':                   fcd.get('fcd'),
+        'fcd_normalized':        fcd.get('fcd_normalized'),
+        'kl_score':              metrics.get('kl_score'),
+        'moses_filters':         mos.get('fraction_passing_moses_filters'),
+        'snn':                   mos.get('snn_score'),
+        'intdiv':                mos.get('IntDiv'),
+        'intdiv2':               mos.get('IntDiv2'),
+        'scaffold_sim':          mos.get('scaffolds_similarity'),
+        'fragment_sim':          mos.get('fragment_similarity'),
+    }
+
+    with open(scores_path, 'w') as f:
+        json.dump(scores, f, indent=2)
+    logger.info(f"Scores saved → {scores_path}  (key: '{key}')")
 
 
 def _build_model(config: Config, metadata, device):
@@ -180,6 +277,7 @@ def _build_model(config: Config, metadata, device):
             num_edge_features=metadata['num_edges'],
             latent_dim=config.gvae.latent_dim,
             max_atoms=config.gvae.max_atoms,
+            prop_pred=config.gvae.prop_pred,
         )
     elif config.model == 'GVAE_NF':
         model = GraphVAENF(
@@ -189,6 +287,7 @@ def _build_model(config: Config, metadata, device):
             max_atoms=config.gvae_nf.max_atoms,
             num_flows=config.gvae_nf.num_flows,
             flow_hidden_dim=config.gvae_nf.flow_hidden_dim,
+            prop_pred=config.gvae_nf.prop_pred,
         )
     else:
         model = FRATTVAE(
@@ -226,7 +325,8 @@ def _discover_checkpoints(root: str = 'checkpoints') -> list[tuple[str, str, str
 
 
 def run_validation(dataset: str, model_name: str, checkpoint: str,
-                   num_samples: int = 10000, num_workers: int = 4):
+                   num_samples: int = 10000, num_workers: int = 4,
+                   valency_mask: bool = True):
     """
     Load a checkpoint and run the full evaluation suite.
 
@@ -245,6 +345,8 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
     if dataset == 'MOSES':
         config.gvae.max_atoms = 30
         config.gvae_nf.max_atoms = 30
+    config.gvae.valency_mask = valency_mask
+    config.gvae_nf.valency_mask = valency_mask
 
     _, val_loader, metadata = get_dataloaders(config, logger)
 
@@ -269,6 +371,8 @@ def _parse_args():
                         help='Filter to a specific dataset (used with --all or with --checkpoint)')
     parser.add_argument('--num_samples', type=int, default=10000)
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--no_valency_mask', action='store_true',
+                        help='Disable valency masking for GVAE decoders')
 
     return parser.parse_args()
 
@@ -279,6 +383,7 @@ if __name__ == '__main__':
     common = dict(
         num_samples=args.num_samples,
         num_workers=args.num_workers,
+        valency_mask=not args.no_valency_mask,
     )
 
     if args.checkpoint:
