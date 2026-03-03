@@ -22,84 +22,25 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def evaluate_model(model, config: Config, device, metadata, val_loader=None):
+def evaluate_model(model, config: Config, device, metadata):
     """
-    Run reconstruction accuracy + prior-sampling benchmarks for a trained model.
+    Run prior-sampling benchmarks for a trained model.
 
     Args:
-        model:       Trained GraphVAE or FRATTVAE (already on `device`).
-        config:      Config object (model, dataset, latent dims, etc.).
-        device:      torch.device.
-        metadata:    Dict returned by get_dataloaders (keys depend on model type).
-        val_loader:  Validation DataLoader used for reconstruction eval; optional.
+        model:    Trained GraphVAE, GraphVAENF, or FRATTVAE (already on `device`).
+        config:   Config object (model, dataset, latent dims, etc.).
+        device:   torch.device.
+        metadata: Dict returned by get_dataloaders.
     """
     model.eval()
 
-    # Decoders needed for GVAE/GVAE_NF sampling and reconstruction
+    # Decoders needed for GVAE/GVAE_NF sampling
     if config.model in ('GVAE', 'GVAE_NF'):
         atom_decoder   = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
         charge_decoder = None               if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
 
     # ------------------------------------------------------------------
-    # 1. Reconstruction accuracy on a held-out sample
-    #    Encode real molecules -> decode -> check recovery.
-    # ------------------------------------------------------------------
-    if config.model in ('GVAE', 'GVAE_NF') and val_loader is not None:
-        gc = config.gvae if config.model == 'GVAE' else config.gvae_nf
-        recon_correct = recon_total = 0
-        logger.info("Evaluating reconstruction accuracy on validation set (up to 1000 molecules)...")
-        with torch.no_grad():
-            for data in val_loader:
-                x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = \
-                    gvae_prepare_batch(data, device, gc.max_atoms)
-                mu = model.encode(x_in, edge_index, edge_attr_in, batch)[0]
-                z = mu  # Use mean (no noise) for reconstruction eval
-                recon_smiles = model.sample_smiles(z, atom_decoder, charge_decoder,
-                                                   valency_mask=gc.valency_mask)
-
-                for smi in recon_smiles:
-                    recon_total += 1
-                    if smi:
-                        recon_correct += 1
-                if recon_total >= 1000:
-                    break
-
-        logger.info(f"Reconstruction: {recon_correct}/{recon_total} valid decodes "
-                    f"({100 * recon_correct / max(1, recon_total):.1f}%) from posterior mean z")
-
-    if config.model == 'FRATTVAE' and val_loader is not None:
-        frag_ecfps_r = metadata['frag_ecfps'].to(device)
-        ndummys_r    = metadata['ndummys'].to(device)
-        model.set_labels(metadata['uni_fragments'])
-
-        recon_correct = recon_total = 0
-        logger.info("Evaluating reconstruction accuracy on validation set (up to 1000 molecules)...")
-        with torch.no_grad():
-            for frag_indices, positions, _ in val_loader:
-                B, L = frag_indices.shape
-                features_r    = frag_ecfps_r[frag_indices.flatten()].reshape(B, L, -1).to(device)
-                positions_r   = positions.to(device=device, dtype=torch.float32)
-                idx_with_root = torch.cat([torch.full((B, 1), -1), frag_indices], dim=1).to(device)
-                _, _, src_pad_mask, _ = create_mask(idx_with_root, idx_with_root, pad_idx=0)
-
-                _, mu, _ = model.encode(features_r, positions_r, src_pad_mask=src_pad_mask)
-                recon_smiles = model.sequential_decode(
-                    mu, frag_ecfps_r, ndummys_r,
-                    max_nfrags=config.frattvae.max_nfrags, asSmiles=True,
-                )
-
-                for smi in recon_smiles:
-                    recon_total += 1
-                    if smi:
-                        recon_correct += 1
-                if recon_total >= 1000:
-                    break
-
-        logger.info(f"Reconstruction: {recon_correct}/{recon_total} valid decodes "
-                    f"({100 * recon_correct / max(1, recon_total):.1f}%) from posterior mean z")
-
-    # ------------------------------------------------------------------
-    # 2. Prior sampling + benchmark suite
+    # Prior sampling + benchmark suite
     # ------------------------------------------------------------------
     logger.info(f"Generating {config.num_samples} samples for benchmarking...")
     generated_smiles = []
@@ -368,7 +309,7 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
     model.load_state_dict(state)
     logger.info(f"Loaded weights from {checkpoint}")
 
-    evaluate_model(model, config, device, metadata, val_loader=val_loader)
+    evaluate_model(model, config, device, metadata)
 
 
 def _parse_args():

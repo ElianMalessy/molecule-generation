@@ -149,31 +149,43 @@ def train(config: Config):
     for epoch in range(1, mc.epochs + 1):
         ep_kw = dict(epoch=epoch, prop_mean=prop_mean, prop_std=prop_std)
         if config.model == 'GVAE':
-            train_l, train_recon, train_kl, train_prop, global_step = train_epoch_gvae(
+            train_l, train_recon, train_kl, train_prop, train_raw_prop, global_step = train_epoch_gvae(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            val_l, val_recon, val_kl, val_prop = val_epoch_gvae(
+            val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            prop_str = f" | val_prop: {val_prop:.4f}" if mc.prop_pred else ""
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r²={max(0.0, 1 - train_raw_prop):.4f}"
+                              if mc.prop_pred else "")
+            val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r²={max(0.0, 1 - val_raw_prop):.4f}"
+                              if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}) "
-                f"| val: {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
-                f"{prop_str}")
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f})"
+                f"{train_prop_str}")
+            logger.info(
+                f"Epoch {epoch:03d} "
+                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
+                f"{val_prop_str}")
         elif config.model == 'GVAE_NF':
-            train_l, train_recon, train_kl, train_prop, global_step = train_epoch_gvae_nf(
+            train_l, train_recon, train_kl, train_prop, train_raw_prop, global_step = train_epoch_gvae_nf(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            val_l, val_recon, val_kl, val_prop = val_epoch_gvae_nf(
+            val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae_nf(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            prop_str = f" | val_prop: {val_prop:.4f}" if mc.prop_pred else ""
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r²={max(0.0, 1 - train_raw_prop):.4f}"
+                              if mc.prop_pred else "")
+            val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r²={max(0.0, 1 - val_raw_prop):.4f}"
+                              if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}) "
-                f"| val: {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
-                f"{prop_str}")
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f})"
+                f"{train_prop_str}")
+            logger.info(
+                f"Epoch {epoch:03d} "
+                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
+                f"{val_prop_str}")
         else:
             train_l, train_label, train_kl, global_step = train_epoch_frattvae(
                 model, optimizer, train_loader, config, global_step, device,
@@ -201,7 +213,7 @@ def train(config: Config):
                 break
 
     model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-    evaluate_model(model, config, device, metadata, val_loader=val_loader)
+    evaluate_model(model, config, device, metadata)
 
 if __name__ == "__main__":
     config = parse_args()

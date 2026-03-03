@@ -150,14 +150,16 @@ class GraphVAENF(nn.Module):
         node_logits, edge_logits = self.decode(zK)
         return node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det
 
-    def predict_props(self, mu: torch.Tensor) -> torch.Tensor:
+    def predict_props(self, zK: torch.Tensor) -> torch.Tensor:
         """
-        Predict normalised property vector (B, 3) from posterior mean μ.
+        Predict normalised property vector (B, 3) from the post-flow latent zK.
+        This is the same space the decoder operates in, so property structure
+        learned here transfers directly to generation/latent optimisation.
         Raises RuntimeError if the model was built without prop_pred=True.
         """
         if self.prop_head is None:
             raise RuntimeError("GraphVAENF was built without prop_pred=True")
-        return self.prop_head(mu)
+        return self.prop_head(zK)
 
     def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None, valency_mask=True):
         zK, _ = self.flow(z)
