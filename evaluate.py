@@ -308,7 +308,7 @@ def _build_model(config: Config, metadata, device):
 def _discover_checkpoints(root: str = 'checkpoints') -> list[tuple[str, str, str]]:
     """
     Walk checkpoints/ and return (dataset, model_name, path) for every best.pth found.
-    Expected layout: checkpoints/{DATASET}/{MODEL}/best.pth
+    Expected layout: checkpoints/{DATASET}/{MODEL}/{VARIANT}/best.pth
     """
     found = []
     if not os.path.isdir(root):
@@ -318,35 +318,48 @@ def _discover_checkpoints(root: str = 'checkpoints') -> list[tuple[str, str, str
         if not os.path.isdir(d_path):
             continue
         for model_name in sorted(os.listdir(d_path)):
-            ckpt = os.path.join(d_path, model_name, 'best.pth')
-            if os.path.isfile(ckpt):
-                found.append((dataset, model_name, ckpt))
+            m_path = os.path.join(d_path, model_name)
+            if not os.path.isdir(m_path):
+                continue
+            for variant in sorted(os.listdir(m_path)):
+                ckpt = os.path.join(m_path, variant, 'best.pth')
+                if os.path.isfile(ckpt):
+                    found.append((dataset, model_name, ckpt))
     return found
 
 
 def run_validation(dataset: str, model_name: str, checkpoint: str,
-                   num_samples: int = 10000, num_workers: int = 4,
-                   valency_mask: bool = True):
+                   num_samples: int = 10000, num_workers: int = 4):
     """
     Load a checkpoint and run the full evaluation suite.
 
     Args:
         dataset:     'ZINC' or 'MOSES'
-        model_name:  'GVAE' or 'FRATTVAE'
-        checkpoint:  Path to best.pth
+        model_name:  'GVAE', 'GVAE_NF', or 'FRATTVAE'
+        checkpoint:  Path to best.pth  (…/{DATASET}/{MODEL}/{VARIANT}/best.pth)
         num_samples: Number of molecules to sample for benchmarks
         num_workers: DataLoader worker count
+        valency_mask: Fallback if variant cannot be inferred from path
     """
     logger.info(f"=== Evaluating {model_name} on {dataset} from {checkpoint} ===")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Infer flags from the variant directory name embedded in the checkpoint path.
+    # Layout: …/{DATASET}/{MODEL}/{VARIANT}/best.pth
+    variant = os.path.basename(os.path.dirname(checkpoint))   # e.g. 'prop+no_valency'
+    variant_parts = set(variant.split('+'))
+    prop_pred    = 'prop'       in variant_parts
+    no_valency   = 'no_valency' in variant_parts
+
     config = Config(model=model_name, dataset=dataset, num_samples=num_samples, num_workers=num_workers)
     if dataset == 'MOSES':
         config.gvae.max_atoms = 30
         config.gvae_nf.max_atoms = 30
-    config.gvae.valency_mask = valency_mask
-    config.gvae_nf.valency_mask = valency_mask
+    config.gvae.prop_pred     = prop_pred
+    config.gvae_nf.prop_pred  = prop_pred
+    config.gvae.valency_mask    = not no_valency
+    config.gvae_nf.valency_mask = not no_valency
 
     _, val_loader, metadata = get_dataloaders(config, logger)
 
@@ -371,8 +384,6 @@ def _parse_args():
                         help='Filter to a specific dataset (used with --all or with --checkpoint)')
     parser.add_argument('--num_samples', type=int, default=10000)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--no_valency_mask', action='store_true',
-                        help='Disable valency masking for GVAE decoders')
 
     return parser.parse_args()
 
@@ -383,16 +394,15 @@ if __name__ == '__main__':
     common = dict(
         num_samples=args.num_samples,
         num_workers=args.num_workers,
-        valency_mask=not args.no_valency_mask,
     )
 
     if args.checkpoint:
-        # Single explicit checkpoint; infer dataset/model from path if not supplied
+        # Single explicit checkpoint; infer dataset/model from path if not supplied.
+        # Expected layout: …/{DATASET}/{MODEL}/{VARIANT}/best.pth
         parts = args.checkpoint.replace('\\', '/').split('/')
-        # Expect …/{DATASET}/{MODEL}/best.pth
         try:
-            model_name = args.model   or parts[-2]
-            dataset    = args.dataset or parts[-3]
+            model_name = args.model   or parts[-3]
+            dataset    = args.dataset or parts[-4]
         except IndexError:
             raise ValueError(
                 "Could not infer dataset/model from checkpoint path. "

@@ -49,14 +49,27 @@ def parse_args() -> Config:
     return config
 
 
+def _variant_name(config: Config) -> str:
+    """Unique subdirectory name for a run, e.g. 'prop+no_valency' or 'no_prop'.
+    Keeps checkpoints from different flag combinations from clobbering each other."""
+    gc = config.gvae if config.model == 'GVAE' else config.gvae_nf if config.model == 'GVAE_NF' else None
+    if gc is None:
+        return 'default'
+    parts = ['prop' if gc.prop_pred else 'no_prop']
+    if not gc.valency_mask:
+        parts.append('no_valency')
+    return '+'.join(parts)
+
+
 def train(config: Config):
     if config.dataset == 'MOSES':
         config.gvae.max_atoms = 30
         config.gvae_nf.max_atoms = 30
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(f'checkpoints/{config.dataset}/{config.model}', exist_ok=True)
-    checkpoint_path = f'checkpoints/{config.dataset}/{config.model}/best.pth'
+    ckpt_dir = f'checkpoints/{config.dataset}/{config.model}/{_variant_name(config)}'
+    os.makedirs(ckpt_dir, exist_ok=True)
+    checkpoint_path = f'{ckpt_dir}/best.pth'
 
     logger.info(f"Loading {config.dataset} dataset for {config.model}...")
     train_loader, val_loader, metadata = get_dataloaders(config, logger)

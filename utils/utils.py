@@ -129,7 +129,7 @@ class PropsDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         data = self.base[idx].clone()
-        data.props = self.props[idx]   # (3,) — batched by PyG into (B, 3)
+        data.props = self.props[idx].unsqueeze(0)   # (1, 3) → PyG batches to (B, 3)
         return data
 
 
