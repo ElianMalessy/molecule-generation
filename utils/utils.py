@@ -208,8 +208,9 @@ class NormalizeZINCBonds(BaseTransform):
 
 def get_dataloaders(config: Config, logger):
     """Returns train_loader, val_loader, and dataset-specific metadata."""
-    if config.model in ('GVAE', 'GVAE_NF'):
-        gc = config.gvae if config.model == 'GVAE' else config.gvae_nf
+    if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
+        gc = {'GVAE': config.gvae, 'GVAE_NF': config.gvae_nf,
+              'GVAE_AR': config.gvae_ar, 'GVAE_AR_NF': config.gvae_ar_nf}[config.model]
         if config.dataset == 'ZINC':
             transform = NormalizeZINCBonds()
             train_dataset = ZINC(root='data/ZINC', subset=False, split='train', pre_transform=transform)
