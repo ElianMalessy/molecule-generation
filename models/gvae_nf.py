@@ -170,8 +170,11 @@ class GraphVAENF(nn.Module):
         return self.prop_head(mu)
 
     def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None, valency_mask=True):
-        zK, _ = self.flow(z)
-        node_logits, edge_logits = self.decode(zK)
+        # z ~ N(0, I) is sampled from the prior p(zK) = N(0, I).
+        # The KL term trains q(zK|x) → N(0, I), so zK IS the decoder input space.
+        # Do NOT pass z through the flow — that would map N(0,I) → flow(N(0,I)),
+        # which is out-of-distribution for the decoder.
+        node_logits, edge_logits = self.decode(z)
         node_np = node_logits.detach().cpu().float().numpy()
         edge_np = edge_logits.detach().cpu().float().numpy()
 
