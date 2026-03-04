@@ -29,13 +29,20 @@ class PropertyHead(nn.Module):
     """3-layer MLP: latent_dim → 256 → 128 → 3.
 
     Predicts normalised [plogP, QED, SA] from the posterior mean μ.
+
+    Design notes:
+    - LayerNorm on the input makes the head scale-invariant to μ magnitude,
+      which is critical early in training when KL ≈ free-bits floor (μ ≈ 0).
+    - GELU avoids the dead-neuron problem that ReLU would cause when all
+      pre-activations start near zero (because μ ≈ 0 early on).
     Callers are responsible for denormalising for interpretation.
     """
     def __init__(self, latent_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, 256), nn.ReLU(),
-            nn.Linear(256, 128),        nn.ReLU(),
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, 256), nn.GELU(),
+            nn.Linear(256, 128),        nn.GELU(),
             nn.Linear(128, 3),
         )
 

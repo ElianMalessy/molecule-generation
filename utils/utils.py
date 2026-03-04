@@ -74,7 +74,7 @@ class GVAEConfig:
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
     prop_weight: float = 1.0         # γ: property loss weight at full scale
-    prop_warmup_epochs: int = 15     # epochs before γ starts ramping up
+    prop_warmup_epochs: int = 3      # epochs before γ starts ramping up
 
 
 @dataclass
@@ -103,7 +103,7 @@ class GVAENFConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 1.0
-    prop_warmup_epochs: int = 15
+    prop_warmup_epochs: int = 3
 
 
 @dataclass
@@ -133,7 +133,7 @@ class GVAEARConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 1.0
-    prop_warmup_epochs: int = 15
+    prop_warmup_epochs: int = 3
 
 
 @dataclass
@@ -164,7 +164,7 @@ class GVAEARNFConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 1.0
-    prop_warmup_epochs: int = 15
+    prop_warmup_epochs: int = 3
 
 
 @dataclass

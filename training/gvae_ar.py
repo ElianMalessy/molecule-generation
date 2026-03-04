@@ -65,7 +65,7 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                     loss = loss + gamma * raw_prop_loss
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         global_step += 1
 
