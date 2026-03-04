@@ -54,8 +54,8 @@ def _bfs_order(adj_bin, n: int) -> list:
     while queue:
         node = queue.popleft()
         order.append(node)
-        for nb in range(n):
-            if adj_bin[node, nb] and not visited[nb]:
+        for nb in adj_bin[node].nonzero()[0].tolist():
+            if not visited[nb]:
                 visited[nb] = True
                 queue.append(nb)
 
@@ -67,8 +67,8 @@ def _bfs_order(adj_bin, n: int) -> list:
             while q2:
                 node = q2.popleft()
                 order.append(node)
-                for nb in range(n):
-                    if adj_bin[node, nb] and not visited[nb]:
+                for nb in adj_bin[node].nonzero()[0].tolist():
+                    if not visited[nb]:
                         visited[nb] = True
                         q2.append(nb)
     return order
@@ -131,22 +131,29 @@ def build_ar_batch(target_nodes, target_edges, eos_id: int, abs_max_len: int):
 
     max_L = min(max(len(t) for t in all_tokens), abs_max_len)
 
-    # input_tokens: seq[:-1], padded with 1 (a safe non-padding atom index)
-    # target_tokens: seq,      padded with -1 (ignored by cross_entropy)
-    input_tokens  = torch.ones (B, max_L - 1, dtype=torch.long, device=device)
-    target_tokens = torch.full ((B, max_L),   -1, dtype=torch.long, device=device)
-    target_types  = torch.zeros(B, max_L,         dtype=torch.long, device=device)
-    seq_lens      = torch.zeros(B,                dtype=torch.long, device=device)
+    # Build on CPU, then move in one H2D copy
+    input_tokens  = torch.ones (B, max_L - 1, dtype=torch.long)
+    target_tokens = torch.full ((B, max_L),   -1, dtype=torch.long)
+    target_types  = torch.zeros(B, max_L,         dtype=torch.long)
+    seq_lens      = torch.zeros(B,                dtype=torch.long)
 
     for b, (tok, typ) in enumerate(zip(all_tokens, all_types)):
-        L = min(len(tok), max_L)
+        # Guard: if truncated, ensure the last token is EOS so the model
+        # always learns when to stop (issue 1.3)
+        tok_b = tok[:max_L]
+        typ_b = typ[:max_L]
+        if len(tok) > max_L and tok_b[-1] != eos_id:
+            tok_b = tok[:max_L - 1] + [eos_id]
+            typ_b = typ[:max_L - 1] + [1]
+        L = len(tok_b)
         seq_lens[b] = L
         if L > 1:
-            input_tokens [b, :L - 1] = torch.tensor(tok[:L - 1], dtype=torch.long, device=device)
-        target_tokens[b, :L]     = torch.tensor(tok[:L],     dtype=torch.long, device=device)
-        target_types [b, :L]     = torch.tensor(typ[:L],     dtype=torch.long, device=device)
+            input_tokens [b, :L - 1] = torch.tensor(tok_b[:L - 1], dtype=torch.long)
+        target_tokens[b, :L] = torch.tensor(tok_b, dtype=torch.long)
+        target_types [b, :L] = torch.tensor(typ_b, dtype=torch.long)
 
-    return input_tokens, target_tokens, target_types, seq_lens
+    return (input_tokens.to(device), target_tokens.to(device),
+            target_types.to(device), seq_lens.to(device))
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +213,14 @@ class ARDecoder(nn.Module):
         # Dual output heads
         self.node_head = nn.Linear(d_model, self.node_vocab)
         self.edge_head = nn.Linear(d_model, self.edge_vocab)
+
+        # torch.compile the two hot paths:
+        #   - transformer: teacher-forced training forward (static shapes, compiles cleanly)
+        #   - _kv_step:    inner sampling loop (~742 calls per sample); dynamic=True because
+        #                  the KV-cache sequence dimension grows by 1 at every step
+        if hasattr(torch, 'compile'):
+            self.transformer = torch.compile(self.transformer, fullgraph=False)
+            self._kv_step    = torch.compile(self._kv_step, dynamic=True, fullgraph=False)
 
     # ------------------------------------------------------------------
     # Internal: build transformer input embeddings
@@ -300,26 +315,31 @@ class ARDecoder(nn.Module):
                              mask=causal_mask,
                              src_key_padding_mask=kpm)               # (B, max_L, d)
 
-        # Compute loss: select positions by type, apply appropriate head
-        node_mask = (target_types == 1)  # (B, max_L)
-        edge_mask = (target_types == 2)
+        # Concatenate node and edge predictions into a single cross-entropy
+        # so loss is averaged per token regardless of type ratio (issue 2.1).
+        # Node positions → node_head; edge positions → edge_head.
+        # Pad logits to a common vocab size (max of the two heads).
+        token_mask = (target_types > 0)   # True at all non-padding positions
+        if not token_mask.any():
+            return torch.tensor(0.0, device=device)
 
-        recon_loss = torch.tensor(0.0, device=device)
-        n_terms = 0
+        vocab_n = self.node_head.out_features
+        vocab_e = self.edge_head.out_features
+        vocab   = max(vocab_n, vocab_e)
 
-        if node_mask.any():
-            node_logits = self.node_head(h[node_mask])       # (N_node, node_vocab)
-            node_tgts   = target_tokens[node_mask]           # (N_node,)
-            recon_loss  = recon_loss + F.cross_entropy(node_logits, node_tgts, ignore_index=-1)
-            n_terms += 1
+        h_valid = h[token_mask]              # (N_tokens, d)
+        tgt_valid = target_tokens[token_mask]  # (N_tokens,)
+        type_valid = target_types[token_mask]  # (N_tokens,)
 
-        if edge_mask.any():
-            edge_logits = self.edge_head(h[edge_mask])       # (N_edge, edge_vocab)
-            edge_tgts   = target_tokens[edge_mask]           # (N_edge,)
-            recon_loss  = recon_loss + F.cross_entropy(edge_logits, edge_tgts, ignore_index=-1)
-            n_terms += 1
+        logits = torch.full((h_valid.size(0), vocab), float('-inf'), device=device)
+        n_mask = (type_valid == 1)
+        e_mask = (type_valid == 2)
+        if n_mask.any():
+            logits[n_mask, :vocab_n] = self.node_head(h_valid[n_mask])
+        if e_mask.any():
+            logits[e_mask, :vocab_e] = self.edge_head(h_valid[e_mask])
 
-        return recon_loss / max(n_terms, 1)
+        return F.cross_entropy(logits, tgt_valid, ignore_index=-1)
 
     # ------------------------------------------------------------------
     # Inference: autoregressive sampling
@@ -332,62 +352,71 @@ class ARDecoder(nn.Module):
         """Autoregressively sample B molecules in parallel using KV caching.
 
         KV caching avoids re-processing past tokens: each step runs one
-        (B, 1, d) token through all transformer layers, appending K/V to a
-        per-layer cache.  Total attention work is O(L) per step (vs O(L²) for
-        the naive full re-run), giving a large throughput improvement.
+        (B, 1, d) token through all transformer layers, writing K/V into
+        pre-allocated buffers.  Total attention work is O(L) per step.
+
+        Always runs in eval mode (dropout disabled).
         """
-        return self._sample_batch(z, atom_decoder, charge_decoder,
-                                  valency_mask, temperature)
+        training = self.training
+        self.eval()          # ensure dropout is off during sampling (issue 2.6)
+        try:
+            result = self._sample_batch(z, atom_decoder, charge_decoder,
+                                        valency_mask, temperature)
+        finally:
+            self.train(training)  # restore original mode
+        return result
 
     @torch.no_grad()
-    def _kv_step(self, h: torch.Tensor, kv_cache: list):
+    def _kv_step(self, h: torch.Tensor, K_bufs: list, V_bufs: list, t: int):
         """Run one (B, 1, d) token through all transformer layers with KV cache.
+
+        K/V projections for the new token are written in-place at position t
+        into the pre-allocated buffers K_bufs / V_bufs, avoiding the O(L²)
+        tensor allocations caused by torch.cat (issue 3.1).
 
         Parameters
         ----------
-        h        : (B, 1, d_model) – embedding of the token at the current step
-        kv_cache : list of (K, V) per layer, each (B, t, d_model)
+        h      : (B, 1, d_model) – embedding of the token at the current step
+        K_bufs : list[Tensor(B, max_tf_len, d)] – one per layer, pre-allocated
+        V_bufs : list[Tensor(B, max_tf_len, d)] – one per layer, pre-allocated
+        t      : int – current sequence position (0 = z prefix)
 
         Returns
         -------
-        last_h   : (B, d_model) – hidden state of the new token
-        new_cache: updated kv_cache with the new K/V appended
+        last_h : (B, d_model) – hidden state of the new token
         """
         B = h.size(0)
         d = self.d_model
-        new_cache = []
 
-        for layer, (K_cache, V_cache) in zip(self.transformer.layers, kv_cache):
+        for i, layer in enumerate(self.transformer.layers):
             mha      = layer.self_attn
             nhead    = mha.num_heads
             head_dim = d // nhead
 
-            # Pre-LN (norm_first=True in our constructor)
-            h_norm = layer.norm1(h)                                    # (B, 1, d)
+            # Pre-LN (norm_first=True)
+            h_norm = layer.norm1(h)                                        # (B, 1, d)
 
-            # Combined Q/K/V projection — only the new token is projected
+            # Project only the single new token
             qkv = F.linear(h_norm, mha.in_proj_weight, mha.in_proj_bias)  # (B, 1, 3d)
             q, k, v = qkv.chunk(3, dim=-1)                                 # each (B, 1, d)
 
-            # Grow the cache
-            K_cache = torch.cat([K_cache, k], dim=1)   # (B, t+1, d)
-            V_cache = torch.cat([V_cache, v], dim=1)
-            new_cache.append((K_cache, V_cache))
+            # Write K, V into pre-allocated buffers (no allocation, no copy)
+            K_bufs[i][:, t, :] = k[:, 0, :]
+            V_bufs[i][:, t, :] = v[:, 0, :]
 
-            # Reshape to (B, nhead, seq, head_dim) for Flash Attention via SDPA
-            q_h = q.view(B, 1,  nhead, head_dim).transpose(1, 2)
-            k_h = K_cache.view(B, -1, nhead, head_dim).transpose(1, 2)
-            v_h = V_cache.view(B, -1, nhead, head_dim).transpose(1, 2)
+            # Attend over positions 0..t (causal; query is always the last pos)
+            q_h = q.view(B, 1, nhead, head_dim).transpose(1, 2)
+            k_h = K_bufs[i][:, :t + 1, :].view(B, t + 1, nhead, head_dim).transpose(1, 2)
+            v_h = V_bufs[i][:, :t + 1, :].view(B, t + 1, nhead, head_dim).transpose(1, 2)
 
-            # No causal mask needed: query is always the last position
             attn_out = F.scaled_dot_product_attention(q_h, k_h, v_h, dropout_p=0.0)
-            attn_out = (attn_out.transpose(1, 2).contiguous().view(B, 1, d))
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, 1, d)
             attn_out = F.linear(attn_out, mha.out_proj.weight, mha.out_proj.bias)
 
-            h = h + layer.dropout1(attn_out)         # residual (dropout is no-op in eval)
+            h = h + attn_out                         # dropout omitted (eval mode enforced)
             h = h + layer._ff_block(layer.norm2(h))  # FFN with Pre-LN
 
-        return h[:, 0, :], new_cache   # (B, d)
+        return h[:, 0, :]   # (B, d)
 
     @torch.no_grad()
     def _sample_batch(self, z: torch.Tensor, atom_decoder: dict, charge_decoder,
@@ -405,10 +434,12 @@ class ARDecoder(nn.Module):
         d = self.d_model
         num_layers = len(self.transformer.layers)
 
-        # Empty KV cache: (B, 0, d) per layer
-        kv_cache = [(torch.empty(B, 0, d, device=device),
-                     torch.empty(B, 0, d, device=device))
-                    for _ in range(num_layers)]
+        # Pre-allocate KV buffers: (B, max_tf_len, d) per layer — written in-place
+        # at each step, eliminating O(L) tensor allocations from torch.cat (issue 3.1)
+        K_bufs = [torch.zeros(B, self.max_tf_len, d, device=device)
+                  for _ in range(num_layers)]
+        V_bufs = [torch.zeros(B, self.max_tf_len, d, device=device)
+                  for _ in range(num_layers)]
 
         # Per-molecule state
         atoms           = [[] for _ in range(B)]
@@ -422,7 +453,7 @@ class ARDecoder(nn.Module):
         z_emb = (self.z_proj(z).unsqueeze(1)
                  + self.type_emb(torch.zeros(B, 1, dtype=torch.long, device=device))
                  + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device)))
-        last_h, kv_cache = self._kv_step(z_emb, kv_cache)  # (B, d)
+        last_h = self._kv_step(z_emb, K_bufs, V_bufs, 0)  # (B, d)
 
         for step in range(self.max_seq_len):
             if all(finished):
@@ -467,7 +498,12 @@ class ARDecoder(nn.Module):
                             if (val_used[b][ci] + order > atoms[b][ci][2] or
                                     val_used[b][tj] + order > atoms[b][tj][2]):
                                 logits[bt] = float('-inf')
-                    token = int(torch.multinomial(F.softmax(logits, dim=-1), 1).item())
+                    # Guard: if every bond type is valency-masked, fall back to
+                    # no-bond (token 0) rather than sampling NaN (issue 1.1)
+                    if not logits.isfinite().any():
+                        token = 0
+                    else:
+                        token = int(torch.multinomial(F.softmax(logits, dim=-1), 1).item())
                     new_toks[b] = token
                     new_types[b] = 2
                     if token > 0:
@@ -480,7 +516,8 @@ class ARDecoder(nn.Module):
             if all(finished):
                 break
 
-            # Embed the new token at position step+1 and advance KV cache
+            # Embed the new token at position step+1 and run KV step
+            pos = min(step + 1, self.max_tf_len - 1)
             tok_emb = torch.zeros(B, 1, d, device=device)
             n_mask = (new_types == 1)
             e_mask = (new_types == 2)
@@ -490,10 +527,9 @@ class ARDecoder(nn.Module):
                 tok_emb[e_mask, 0] = self.edge_emb(new_toks[e_mask])
             tok_emb = (tok_emb
                        + self.type_emb(new_types.unsqueeze(1))
-                       + self.pos_emb(torch.tensor(
-                           [[min(step + 1, self.max_tf_len - 1)]], device=device)))
+                       + self.pos_emb(torch.tensor([[pos]], device=device)))
 
-            last_h, kv_cache = self._kv_step(tok_emb, kv_cache)  # (B, d)
+            last_h = self._kv_step(tok_emb, K_bufs, V_bufs, pos)  # (B, d)
 
         return [self._build_mol(atoms[b], bonds[b]) for b in range(B)]
 
@@ -586,11 +622,10 @@ class GraphVAEAR(nn.Module):
         mu, logvar = self.encode(x, edge_index, edge_attr, batch)
         z = self.reparameterize(mu, logvar)
 
-        abs_max_len = self.max_atoms * (self.max_atoms + 1) // 2 + 1
         eos_id = self.decoder.eos_id
 
         input_tokens, target_tokens, target_types, seq_lens = build_ar_batch(
-            target_nodes, target_edges, eos_id, abs_max_len,
+            target_nodes, target_edges, eos_id, self.decoder.max_seq_len,
         )
 
         recon_loss = self.decoder(z, input_tokens, target_tokens, target_types, seq_lens)
@@ -700,11 +735,10 @@ class GraphVAEARNF(nn.Module):
         z0 = self.reparameterize(mu, logvar)
         zK, sum_log_det = self.flow(z0)
 
-        abs_max_len = self.max_atoms * (self.max_atoms + 1) // 2 + 1
         eos_id = self.decoder.eos_id
 
         input_tokens, target_tokens, target_types, seq_lens = build_ar_batch(
-            target_nodes, target_edges, eos_id, abs_max_len,
+            target_nodes, target_edges, eos_id, self.decoder.max_seq_len,
         )
 
         recon_loss = self.decoder(zK, input_tokens, target_tokens, target_types, seq_lens)
