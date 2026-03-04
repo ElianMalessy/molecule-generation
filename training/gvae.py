@@ -61,7 +61,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
 
         total_loss     += loss.item()                    * data.num_graphs
         total_recon    += recon.item()                   * data.num_graphs
-        total_kl       += (kl_weight * kl).item()        * data.num_graphs
+        total_kl       += kl.item()                       * data.num_graphs
         total_prop     += (gamma * raw_prop_loss).item() * data.num_graphs
         total_raw_prop += raw_prop_loss.item()           * data.num_graphs
 
@@ -111,7 +111,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
 
         total_loss     += loss.item()                    * data.num_graphs
         total_recon    += recon.item()                   * data.num_graphs
-        total_kl       += (beta * kl).item()             * data.num_graphs
+        total_kl       += kl.item()                       * data.num_graphs
         total_prop     += (gamma * raw_prop_loss).item() * data.num_graphs
         total_raw_prop += raw_prop_loss.item()           * data.num_graphs
 

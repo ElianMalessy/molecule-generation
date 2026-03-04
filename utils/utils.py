@@ -1,7 +1,10 @@
 import random
 import numpy as np
 import torch
+from functools import partial
 from torch_geometric.datasets import ZINC
+from torch_geometric.data import Batch
+from torch_geometric.utils import to_dense_batch, to_dense_adj
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch_geometric.transforms import BaseTransform
@@ -206,6 +209,29 @@ class NormalizeZINCBonds(BaseTransform):
         return data
 
 
+def ar_collate_fn(data_list, *, max_atoms, eos_id, max_seq_len):
+    """Custom collate for GVAE_AR: build AR sequences in DataLoader workers.
+
+    BFS serialization runs on CPU in parallel worker processes, so the GPU
+    never blocks on Python list operations during forward().
+    Returns (Batch, input_tokens, target_tokens, target_types, seq_lens)
+    all as CPU tensors; the training loop moves them to device.
+    """
+    from models.gvae_ar import build_ar_batch  # lazy import avoids circular dependency
+    batch = Batch.from_data_list(data_list)
+    x_in  = batch.x.squeeze(-1) + 1
+    ea_in = batch.edge_attr.squeeze(-1) + 1
+    target_nodes, _ = to_dense_batch(x_in, batch.batch, max_num_nodes=max_atoms)
+    target_edges = to_dense_adj(
+        batch.edge_index, batch.batch,
+        edge_attr=ea_in, max_num_nodes=max_atoms,
+    ).squeeze(-1).long()
+    input_tokens, target_tokens, target_types, seq_lens = build_ar_batch(
+        target_nodes, target_edges, eos_id, max_seq_len,
+    )
+    return batch, input_tokens, target_tokens, target_types, seq_lens
+
+
 def get_dataloaders(config: Config, logger):
     """Returns train_loader, val_loader, and dataset-specific metadata."""
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
@@ -244,8 +270,19 @@ def get_dataloaders(config: Config, logger):
             train_dataset = PropsDataset(train_dataset, train_props)
             val_dataset   = PropsDataset(val_dataset,   val_props)
 
-        train_loader = PyGDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True, num_workers=config.num_workers)
-        val_loader = PyGDataLoader(val_dataset, batch_size=gc.batch_size, shuffle=False, num_workers=config.num_workers)
+        # AR models pre-compute BFS sequences in the DataLoader workers so
+        # the GPU never waits on Python list operations inside forward().
+        if config.model in ('GVAE_AR', 'GVAE_AR_NF'):
+            max_seq_len = gc.max_atoms * (gc.max_atoms + 1) // 2 + 1
+            collate_fn = partial(ar_collate_fn, max_atoms=gc.max_atoms,
+                                 eos_id=num_node_features, max_seq_len=max_seq_len)
+        else:
+            collate_fn = None  # PyGDataLoader default
+
+        train_loader = PyGDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True,
+                                     num_workers=config.num_workers, collate_fn=collate_fn)
+        val_loader   = PyGDataLoader(val_dataset,   batch_size=gc.batch_size, shuffle=False,
+                                     num_workers=config.num_workers, collate_fn=collate_fn)
 
         return train_loader, val_loader, metadata
 

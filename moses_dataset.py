@@ -46,6 +46,11 @@ class MosesPyGDataset(InMemoryDataset):
             # Kekulize to get explicit single/double bond types, and clear aromatic flags to avoid confusion
             Chem.Kekulize(mol, clearAromaticFlags=True)
 
+            # Renumber atoms into canonical (Morgan-invariant) order so the same molecule
+            # always serializes identically regardless of the SMILES atom ordering.
+            ranks = Chem.CanonicalRankAtoms(mol)
+            mol = Chem.RenumberAtoms(mol, sorted(range(mol.GetNumAtoms()), key=lambda i: ranks[i]))
+
             xs = [[atom_map.get(atom.GetAtomicNum(), 0)] for atom in mol.GetAtoms()]
             x = torch.tensor(xs, dtype=torch.long)
             

@@ -198,7 +198,7 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            ckpt_loss = val_recon + val_kl
+            ckpt_loss = val_l
             train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
@@ -218,7 +218,7 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            ckpt_loss = val_recon + val_kl
+            ckpt_loss = val_l
             train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"

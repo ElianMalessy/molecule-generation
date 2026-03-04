@@ -157,6 +157,106 @@ def build_ar_batch(target_nodes, target_edges, eos_id: int, abs_max_len: int):
 
 
 # ---------------------------------------------------------------------------
+# Causal Transformer with first-class KV-cache support
+# ---------------------------------------------------------------------------
+
+class _CausalLayer(nn.Module):
+    """Pre-LN causal transformer layer.
+
+    Explicit Q/K/V projections (vs. fused in_proj) give a clean public API
+    for KV-cached inference — no private PyTorch internals required.
+    Activation is GELU (standard for GPT-style decoders; original used ReLU).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads  = n_heads
+        self.head_dim = d_model // n_heads
+        self.norm1    = nn.LayerNorm(d_model)
+        self.norm2    = nn.LayerNorm(d_model)
+        self.q_proj   = nn.Linear(d_model, d_model)
+        self.k_proj   = nn.Linear(d_model, d_model)
+        self.v_proj   = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+        self.attn_drop = dropout
+
+    def _to_heads(self, t: torch.Tensor) -> torch.Tensor:
+        """(B, L, d) → (B, n_heads, L, head_dim).  reshape handles non-contiguous slices."""
+        B, L, _ = t.shape
+        return t.reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Full-sequence causal forward (teacher-forced training).
+
+        attn_mask: additive float mask, broadcastable to (B, n_heads, L, L).
+        Combine the causal and key-padding masks before calling (see ARDecoder.forward).
+        """
+        h = self.norm1(x)
+        q, k, v = self._to_heads(self.q_proj(h)), self._to_heads(self.k_proj(h)), self._to_heads(self.v_proj(h))
+        drop = self.attn_drop if self.training else 0.0
+        a    = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop)
+        x    = x + self.out_proj(a.transpose(1, 2).contiguous().view_as(x))
+        x    = x + self.ff(self.norm2(x))
+        return x
+
+    def step(self, x: torch.Tensor,
+             K_buf: torch.Tensor, V_buf: torch.Tensor, t: int) -> torch.Tensor:
+        """Single-token causal step with in-place KV-cache writes.
+
+        Parameters
+        ----------
+        x     : (B, 1, d_model) – embedding of the current token
+        K_buf : (B, max_tf_len, d_model) – pre-allocated; mutated at column t
+        V_buf : (B, max_tf_len, d_model) – pre-allocated; mutated at column t
+        t     : absolute position of this token in the sequence
+
+        No causal mask is needed: the query is always the newest position and
+        may legally attend to all t+1 entries in the cache.
+        """
+        h = self.norm1(x)
+        K_buf[:, t : t + 1, :] = self.k_proj(h)          # write in-place — no allocation
+        V_buf[:, t : t + 1, :] = self.v_proj(h)
+        q = self._to_heads(self.q_proj(h))                 # (B, nh, 1, hd)
+        k = self._to_heads(K_buf[:, : t + 1, :])          # (B, nh, t+1, hd)
+        v = self._to_heads(V_buf[:, : t + 1, :])
+        a = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        x = x + self.out_proj(a.transpose(1, 2).contiguous().view_as(x))
+        x = x + self.ff(self.norm2(x))
+        return x                                           # (B, 1, d_model)
+
+
+class _CausalTransformer(nn.Module):
+    """Stack of _CausalLayer with a training forward and a KV-cached inference step."""
+
+    def __init__(self, n_layers: int, d_model: int, n_heads: int, d_ff: int, dropout: float):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_CausalLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+        )
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, attn_mask)
+        return x
+
+    def step(self, x: torch.Tensor,
+             K_bufs: list[torch.Tensor], V_bufs: list[torch.Tensor], t: int) -> torch.Tensor:
+        """Run one token through every layer using the shared KV buffers.
+        Returns (B, d_model) — the hidden state of the new token.
+        """
+        for i, layer in enumerate(self.layers):
+            x = layer.step(x, K_bufs[i], V_bufs[i], t)
+        return x[:, 0, :]
+
+# ---------------------------------------------------------------------------
 # Autoregressive Transformer decoder
 # ---------------------------------------------------------------------------
 
@@ -184,8 +284,10 @@ class ARDecoder(nn.Module):
         self.max_atoms       = max_atoms
         # Maximum sequence length = L_max = N*(N+1)/2 + 1  (atoms + edges + EOS)
         self.max_seq_len     = max_atoms * (max_atoms + 1) // 2 + 1
-        # Transformer input length = 1 (z) + max_seq_len - 1 (graph tokens) = max_seq_len
-        self.max_tf_len      = self.max_seq_len
+        # Training uses positions 0..max_seq_len-1 (z prefix + seq[:-1]).
+        # Sampling needs one extra slot: z at 0, then up to max_seq_len graph
+        # tokens at positions 1..max_seq_len.  Allocate max_seq_len + 1 (B1).
+        self.max_tf_len      = self.max_seq_len + 1
 
         # Latent prefix projection
         self.z_proj = nn.Linear(latent_dim, d_model)
@@ -202,26 +304,18 @@ class ARDecoder(nn.Module):
         # for this highly structured sequence where position encodes atom index)
         self.pos_emb = nn.Embedding(self.max_tf_len, d_model)
 
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, batch_first=True, norm_first=True,  # Pre-LN for stability
-        )
-        self.transformer = nn.TransformerEncoder(
-            layer, num_layers=n_layers, enable_nested_tensor=False,
-        )
-
         # Dual output heads
         self.node_head = nn.Linear(d_model, self.node_vocab)
         self.edge_head = nn.Linear(d_model, self.edge_vocab)
 
-        # torch.compile the training transformer forward (static shapes, compiles cleanly).
-        # _kv_step is intentionally NOT compiled as an instance attribute: doing so would
-        # bypass the compiled self.transformer (OptimizedModule proxies .layers to the
-        # original module), and storing a compiled callable as self._kv_step breaks
-        # nn.Module.to(device) / load_state_dict since it is not a registered parameter
-        # or buffer (issue N2).
+        # Replace nn.TransformerEncoderLayer / nn.TransformerEncoder with _CausalTransformer.
+        # dynamic=True handles the varying sequence lengths seen both at training time
+        # (max_L differs per batch) and the growing L during the sampling loop (P1).
+        self.transformer = _CausalTransformer(n_layers, d_model, n_heads, d_ff, dropout)
         if hasattr(torch, 'compile'):
-            self.transformer = torch.compile(self.transformer, fullgraph=False)
+            self.transformer = torch.compile(self.transformer, dynamic=True, fullgraph=False)
+        # Note: self.transformer.step(...) is accessed via OptimizedModule.__getattr__ and
+        # runs uncompiled, which is correct and safe — no device/state issues.
 
     # ------------------------------------------------------------------
     # Internal: build transformer input embeddings
@@ -231,116 +325,73 @@ class ARDecoder(nn.Module):
                input_types: torch.Tensor) -> torch.Tensor:
         """Build full embedding sequence [z_prefix | graph_tokens].
 
-        Parameters
-        ----------
-        z            : (B, latent_dim)
-        input_tokens : (B, L-1) – seq[:-1], padded
-        input_types  : (B, L-1) – 1=node/2=edge at each position, 0=padding
-
-        Returns
-        -------
-        emb : (B, L, d_model)
+        node_emb / edge_emb are kept in the computation graph via weighted sum.
+        The previous scatter-write approach (tok_emb[mask] = emb(...)) severed
+        their gradient path because __setitem__ on a requires_grad=False tensor
+        does not create a grad_fn.
         """
-        B = z.size(0)
-        L_in = input_tokens.size(1)
+        B    = z.size(0)
         device = z.device
 
-        # Embed graph tokens with separate tables + type signal
-        tok_emb = torch.zeros(B, L_in, self.d_model, device=device)
-        n_mask = (input_types == 1)
-        e_mask = (input_types == 2)
-        if n_mask.any():
-            tok_emb[n_mask] = self.node_emb(input_tokens[n_mask])
-        if e_mask.any():
-            tok_emb[e_mask] = self.edge_emb(input_tokens[e_mask])
-        tok_emb = tok_emb + self.type_emb(input_types)
+        # Clamp to valid ranges; per-position weights zero out irrelevant lookups
+        # so out-of-vocabulary indices for the "wrong" table are harmless.
+        node_idx = input_tokens.clamp(0, self.node_vocab - 1)
+        edge_idx = input_tokens.clamp(0, self.edge_vocab - 1)
+        n_w = (input_types == 1).to(dtype=z.dtype).unsqueeze(-1)  # (B, L, 1)
+        e_w = (input_types == 2).to(dtype=z.dtype).unsqueeze(-1)
 
-        # Z prefix: linear projection + type-0 embedding
-        z_emb = self.z_proj(z).unsqueeze(1)                                    # (B, 1, d)
-        z_emb = z_emb + self.type_emb(torch.zeros(B, 1, dtype=torch.long, device=device))
+        tok_emb = (n_w * self.node_emb(node_idx)
+                   + e_w * self.edge_emb(edge_idx)
+                   + self.type_emb(input_types))                        # (B, L-1, d)
 
-        full = torch.cat([z_emb, tok_emb], dim=1)                              # (B, L, d)
+        z_emb = self.z_proj(z).unsqueeze(1) + self.type_emb.weight[0]
 
-        # Positional encoding
-        L = full.size(1)
-        full = full + self.pos_emb(torch.arange(L, device=device).unsqueeze(0))
+        full = torch.cat([z_emb, tok_emb], dim=1)                      # (B, L, d)
+        full = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
         return full
 
     # ------------------------------------------------------------------
     # Training forward (teacher-forced, fully parallel)
     # ------------------------------------------------------------------
 
-    def forward(self, z: torch.Tensor, input_tokens: torch.Tensor,
-                target_tokens: torch.Tensor, target_types: torch.Tensor,
-                seq_lens: torch.Tensor) -> torch.Tensor:
-        """Teacher-forced training pass.
-
-        The entire batch is processed in one parallel Transformer forward pass.
-
-        Parameters
-        ----------
-        z             : (B, latent_dim)
-        input_tokens  : (B, max_L-1) – seq[:-1] per molecule
-        target_tokens : (B, max_L)   – seq per molecule (includes EOS)
-        target_types  : (B, max_L)   – 1=node, 2=edge, 0=padding
-        seq_lens      : (B,)         – actual sequence length per molecule
-
-        Returns
-        -------
-        recon_loss : scalar – cross-entropy per token (nodes + edges)
-        """
-        B = z.size(0)
+    def forward(self, z, input_tokens, target_tokens, target_types, seq_lens):
+        B     = z.size(0)
         max_L = target_tokens.size(1)
         device = z.device
 
-        # Input types equal target types shifted right by 1 position:
-        # input at transformer-pos t is seq[t-1], whose type is target_types[:, t-1].
-        # For position 0 (z prefix), we handle separately in _embed.
-        # So input_types = target_types[:, :max_L-1]
-        input_types = target_types[:, :max_L - 1]   # (B, max_L-1)
+        input_types = target_types[:, :max_L - 1]
+        full_emb    = self._embed(z, input_tokens, input_types)
 
-        full_emb = self._embed(z, input_tokens, input_types)  # (B, max_L, d)
+        causal    = nn.Transformer.generate_square_subsequent_mask(max_L, device=device)
+        positions = torch.arange(max_L, device=device)
+        kpm       = torch.zeros(B, max_L, device=device).masked_fill_(
+                        positions.unsqueeze(0) >= seq_lens.unsqueeze(1), float('-inf'))
+        attn_mask = causal.unsqueeze(0).unsqueeze(0) + kpm.unsqueeze(1).unsqueeze(2)
 
-        # Key-padding mask: -inf at positions t >= seq_lens[b], 0 elsewhere
-        # (float additive, matching the float causal mask to avoid PyTorch warnings)
-        # position 0 is z (never padded); input at pos t corresponds to seq[t-1]
-        pos = torch.arange(max_L, device=device).unsqueeze(0)  # (1, max_L)
-        kpm = torch.zeros(B, max_L, device=device).masked_fill_(
-            pos >= seq_lens.unsqueeze(1), float('-inf'))        # (B, max_L)
+        h = self.transformer(full_emb, attn_mask=attn_mask)  # (B, max_L, d)
 
-        # Float additive causal mask — triggers SDPA / Flash Attention
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            max_L, device=device)                               # (max_L, max_L)
-
-        h = self.transformer(full_emb,
-                             mask=causal_mask,
-                             src_key_padding_mask=kpm)               # (B, max_L, d)
-
-        # Concatenate node and edge predictions into a single cross-entropy
-        # so loss is averaged per token regardless of type ratio (issue 2.1).
-        # Node positions → node_head; edge positions → edge_head.
-        # Pad logits to a common vocab size (max of the two heads).
-        token_mask = (target_types > 0)   # True at all non-padding positions
+        token_mask = (target_types > 0)
         if not token_mask.any():
-            return torch.tensor(0.0, device=device)
+            return torch.tensor(0.0, device=device, requires_grad=True)
 
-        vocab_n = self.node_head.out_features
-        vocab_e = self.edge_head.out_features
-        vocab   = max(vocab_n, vocab_e)
+        h_valid    = h[token_mask]               # (N_tokens, d)
+        tgt_valid  = target_tokens[token_mask]   # (N_tokens,)
+        type_valid = target_types[token_mask]    # (N_tokens,)
 
-        h_valid = h[token_mask]              # (N_tokens, d)
-        tgt_valid = target_tokens[token_mask]  # (N_tokens,)
-        type_valid = target_types[token_mask]  # (N_tokens,)
-
-        logits = torch.full((h_valid.size(0), vocab), float('-inf'), device=device)
         n_mask = (type_valid == 1)
         e_mask = (type_valid == 2)
-        if n_mask.any():
-            logits[n_mask, :vocab_n] = self.node_head(h_valid[n_mask])
-        if e_mask.any():
-            logits[e_mask, :vocab_e] = self.edge_head(h_valid[e_mask])
 
-        return F.cross_entropy(logits, tgt_valid, ignore_index=-1)
+        # Compute each head's CE with reduction='sum', then normalise by total tokens.
+        # This gives correct per-token loss with full gradient flow — no scatter-writes.
+        total_tokens = token_mask.sum()
+        loss = torch.tensor(0.0, device=device)
+        if n_mask.any():
+            loss = loss + F.cross_entropy(
+                self.node_head(h_valid[n_mask]), tgt_valid[n_mask], reduction='sum')
+        if e_mask.any():
+            loss = loss + F.cross_entropy(
+                self.edge_head(h_valid[e_mask]), tgt_valid[e_mask], reduction='sum')
+        return loss / total_tokens.float()
 
     # ------------------------------------------------------------------
     # Inference: autoregressive sampling
@@ -368,84 +419,25 @@ class ARDecoder(nn.Module):
         return result
 
     @torch.no_grad()
-    def _kv_step(self, h: torch.Tensor, K_bufs: list, V_bufs: list, t: int):
-        """Run one (B, 1, d) token through all transformer layers with KV cache.
-
-        K/V projections for the new token are written in-place at position t
-        into the pre-allocated buffers K_bufs / V_bufs, avoiding the O(L²)
-        tensor allocations caused by torch.cat (issue 3.1).
-
-        Parameters
-        ----------
-        h      : (B, 1, d_model) – embedding of the token at the current step
-        K_bufs : list[Tensor(B, max_tf_len, d)] – one per layer, pre-allocated
-        V_bufs : list[Tensor(B, max_tf_len, d)] – one per layer, pre-allocated
-        t      : int – current sequence position (0 = z prefix)
-
-        Returns
-        -------
-        last_h : (B, d_model) – hidden state of the new token
-        """
-        B = h.size(0)
-        d = self.d_model
-
-        for i, layer in enumerate(self.transformer.layers):
-            mha      = layer.self_attn
-            nhead    = mha.num_heads
-            head_dim = d // nhead
-
-            # Pre-LN (norm_first=True)
-            h_norm = layer.norm1(h)                                        # (B, 1, d)
-
-            # Project only the single new token
-            qkv = F.linear(h_norm, mha.in_proj_weight, mha.in_proj_bias)  # (B, 1, 3d)
-            q, k, v = qkv.chunk(3, dim=-1)                                 # each (B, 1, d)
-
-            # Write K, V into pre-allocated buffers (no allocation, no copy)
-            K_bufs[i][:, t, :] = k[:, 0, :]
-            V_bufs[i][:, t, :] = v[:, 0, :]
-
-            # Attend over positions 0..t (causal; query is always the last pos)
-            q_h = q.view(B, 1, nhead, head_dim).transpose(1, 2)
-            k_h = K_bufs[i][:, :t + 1, :].view(B, t + 1, nhead, head_dim).transpose(1, 2)
-            v_h = V_bufs[i][:, :t + 1, :].view(B, t + 1, nhead, head_dim).transpose(1, 2)
-
-            attn_out = F.scaled_dot_product_attention(q_h, k_h, v_h, dropout_p=0.0)
-            attn_out = attn_out.transpose(1, 2).contiguous().view(B, 1, d)
-            attn_out = F.linear(attn_out, mha.out_proj.weight, mha.out_proj.bias)
-
-            h = h + attn_out                         # dropout omitted (eval mode enforced)
-            h = h + layer._ff_block(layer.norm2(h))  # FFN with Pre-LN
-
-        return h[:, 0, :]   # (B, d)
-
-    @torch.no_grad()
     def _sample_batch(self, z: torch.Tensor, atom_decoder: dict, charge_decoder,
                       valency_mask: bool, temperature: float) -> list:
         """KV-cached parallel AR sampling.
 
-        All B molecules advance in lockstep. Per step:
-          1. Sample the next token for each molecule from last_h.
-          2. Embed the new token (B, 1, d).
-          3. Run one _kv_step → new last_h in O(1) transformer ops per token.
+        Attention cost per step is O(t) (one query against t cached keys),
+        giving O(L²) total vs O(L³) for the full-sequence-rerun approach.
+        KV projections are written into pre-allocated buffers in-place,
+        so there are no per-step tensor allocations.
         """
-        B = z.size(0)
-        device = z.device
-        T = max(temperature, 1e-6)
-        d = self.d_model
-        num_layers = len(self.transformer.layers)
+        B        = z.size(0)
+        device   = z.device
+        T        = max(temperature, 1e-6)
+        d        = self.d_model
+        n_layers = len(self.transformer.layers)
 
-        # Pre-allocate KV buffers with max_tf_len + 1 slots:
-        #   slot 0      = z prefix
-        #   slots 1..max_seq_len = up to max_seq_len graph tokens
-        # Allocating exactly max_tf_len would cause slots max_seq_len-1 and
-        # max_seq_len to alias onto slot max_tf_len-1 (issue N1).
-        K_bufs = [torch.zeros(B, self.max_tf_len + 1, d, device=device)
-                  for _ in range(num_layers)]
-        V_bufs = [torch.zeros(B, self.max_tf_len + 1, d, device=device)
-                  for _ in range(num_layers)]
+        # Pre-allocate K/V buffers: one (B, max_tf_len, d) pair per layer.
+        K_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
+        V_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
 
-        # Per-molecule state
         atoms           = [[] for _ in range(B)]
         val_used        = [[] for _ in range(B)]
         bonds           = [{} for _ in range(B)]
@@ -453,19 +445,19 @@ class ARDecoder(nn.Module):
         current_atom_i  = [0]     * B
         finished        = [False] * B
 
-        # ---- Position 0: feed z prefix, get first prediction ----
-        z_emb = (self.z_proj(z).unsqueeze(1)
-                 + self.type_emb(torch.zeros(B, 1, dtype=torch.long, device=device))
-                 + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device)))
-        last_h = self._kv_step(z_emb, K_bufs, V_bufs, 0)  # (B, d)
+        # ── Position 0: z prefix ──────────────────────────────────────────
+        z_emb  = (self.z_proj(z).unsqueeze(1)
+                  + self.type_emb(torch.zeros(B, 1, dtype=torch.long, device=device))
+                  + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device)))
+        last_h = self.transformer.step(z_emb, K_bufs, V_bufs, t=0)  # (B, d)
 
-        for step in range(self.max_seq_len):
+        for step in range(self.max_seq_len - 1):
             if all(finished):
                 break
 
-            node_logits = self.node_head(last_h) / T    # (B, V_node)
-            edge_logits = self.edge_head(last_h) / T    # (B, V_edge)
-            node_logits[:, 0] = float('-inf')           # never predict padding
+            node_logits = self.node_head(last_h) / T   # (B, node_vocab)
+            edge_logits = self.edge_head(last_h) / T   # (B, edge_vocab)
+            node_logits[:, 0] = float('-inf')           # never predict padding index
 
             new_toks  = torch.full((B,), self.eos_id, dtype=torch.long, device=device)
             new_types = torch.ones(B, dtype=torch.long, device=device)
@@ -475,16 +467,15 @@ class ARDecoder(nn.Module):
                     continue
 
                 if edges_remaining[b] == 0:
-                    token = int(torch.multinomial(
-                        F.softmax(node_logits[b], dim=-1), 1).item())
-                    new_toks[b] = token
+                    token        = int(torch.multinomial(F.softmax(node_logits[b], dim=-1), 1).item())
+                    new_toks[b]  = token
                     new_types[b] = 1
                     if token == self.eos_id:
                         finished[b] = True
                     else:
                         cls_idx    = token - 1
                         atomic_num = atom_decoder.get(cls_idx, 6)
-                        fc = charge_decoder.get(cls_idx, 0) if charge_decoder else 0
+                        fc         = charge_decoder.get(cls_idx, 0) if charge_decoder else 0
                         base_val   = _MAX_VALENCE.get(atomic_num, 4)
                         if fc > 0:   base_val += 1
                         elif fc < 0: base_val = max(base_val - 1, 0)
@@ -502,13 +493,9 @@ class ARDecoder(nn.Module):
                             if (val_used[b][ci] + order > atoms[b][ci][2] or
                                     val_used[b][tj] + order > atoms[b][tj][2]):
                                 logits[bt] = float('-inf')
-                    # Guard: if every bond type is valency-masked, fall back to
-                    # no-bond (token 0) rather than sampling NaN (issue 1.1)
-                    if not logits.isfinite().any():
-                        token = 0
-                    else:
-                        token = int(torch.multinomial(F.softmax(logits, dim=-1), 1).item())
-                    new_toks[b] = token
+                    token = (0 if not logits.isfinite().any()
+                             else int(torch.multinomial(F.softmax(logits, dim=-1), 1).item()))
+                    new_toks[b]  = token
                     new_types[b] = 2
                     if token > 0:
                         ci = current_atom_i[b]; tj = ci - edges_remaining[b]
@@ -517,24 +504,30 @@ class ARDecoder(nn.Module):
                         bonds[b][(ci, tj)] = _get_rdkit_bond(token)
                     edges_remaining[b] -= 1
 
+            # After the per-b sampling loop, before embedding:
             if all(finished):
                 break
 
-            # Embed the new token at position step+1 and run KV step.
-            # No clamping needed: buffers have max_tf_len+1 slots (0..max_seq_len).
-            pos = step + 1
-            tok_emb = torch.zeros(B, 1, d, device=device)
-            n_mask = (new_types == 1)
-            e_mask = (new_types == 2)
-            if n_mask.any():
-                tok_emb[n_mask, 0] = self.node_emb(new_toks[n_mask])
-            if e_mask.any():
-                tok_emb[e_mask, 0] = self.edge_emb(new_toks[e_mask])
-            tok_emb = (tok_emb
-                       + self.type_emb(new_types.unsqueeze(1))
-                       + self.pos_emb(torch.tensor([[pos]], device=device)))
+            # Mask out finished molecules: use a zero embedding so their
+            # KV writes are inert (they will never be queried again).
+            active = torch.tensor([not f for f in finished], device=device)  # (B,)
+            # Zero-out new_toks/new_types for finished molecules so their
+            # embeddings are zero — safe arbitrary value, never read again.
+            new_toks  = new_toks  * active
+            new_types = new_types * active
 
-            last_h = self._kv_step(tok_emb, K_bufs, V_bufs, pos)  # (B, d)
+            # Embed sampled tokens and advance the KV cache.
+            # pos = step + 1: valid range 1..max_seq_len ⊂ 0..max_tf_len-1.
+            pos = step + 1
+            n_w = (new_types == 1).to(dtype=z.dtype).unsqueeze(-1)  # (B, 1)
+            e_w = (new_types == 2).to(dtype=z.dtype).unsqueeze(-1)
+            tok_emb = (
+                n_w * self.node_emb(new_toks.clamp(0, self.node_vocab - 1))
+                + e_w * self.edge_emb(new_toks.clamp(0, self.edge_vocab - 1))
+                + self.type_emb(new_types)
+                + self.pos_emb(torch.full((B,), pos, dtype=torch.long, device=device))
+            ).unsqueeze(1)                                           # (B, 1, d)
+            last_h = self.transformer.step(tok_emb, K_bufs, V_bufs, t=pos)
 
         return [self._build_mol(atoms[b], bonds[b]) for b in range(B)]
 
@@ -615,8 +608,11 @@ class GraphVAEAR(nn.Module):
             raise RuntimeError("GraphVAEAR built without prop_pred=True")
         return self.prop_head(mu)
 
-    def forward(self, x, edge_index, edge_attr, batch, target_nodes, target_edges):
+    def forward(self, x, edge_index, edge_attr, batch,
+                input_tokens, target_tokens, target_types, seq_lens):
         """Teacher-forced training forward pass.
+
+        BFS sequences are pre-built by ar_collate_fn in DataLoader workers.
 
         Returns
         -------
@@ -626,13 +622,6 @@ class GraphVAEAR(nn.Module):
         """
         mu, logvar = self.encode(x, edge_index, edge_attr, batch)
         z = self.reparameterize(mu, logvar)
-
-        eos_id = self.decoder.eos_id
-
-        input_tokens, target_tokens, target_types, seq_lens = build_ar_batch(
-            target_nodes, target_edges, eos_id, self.decoder.max_seq_len,
-        )
-
         recon_loss = self.decoder(z, input_tokens, target_tokens, target_types, seq_lens)
         return recon_loss, mu, logvar
 
@@ -724,8 +713,11 @@ class GraphVAEARNF(nn.Module):
             raise RuntimeError("GraphVAEARNF built without prop_pred=True")
         return self.prop_head(mu)
 
-    def forward(self, x, edge_index, edge_attr, batch, target_nodes, target_edges):
+    def forward(self, x, edge_index, edge_attr, batch,
+                input_tokens, target_tokens, target_types, seq_lens):
         """Teacher-forced training forward pass.
+
+        BFS sequences are pre-built by ar_collate_fn in DataLoader workers.
 
         Returns
         -------
@@ -739,13 +731,6 @@ class GraphVAEARNF(nn.Module):
         mu, logvar = self.encode(x, edge_index, edge_attr, batch)
         z0 = self.reparameterize(mu, logvar)
         zK, sum_log_det = self.flow(z0)
-
-        eos_id = self.decoder.eos_id
-
-        input_tokens, target_tokens, target_types, seq_lens = build_ar_batch(
-            target_nodes, target_edges, eos_id, self.decoder.max_seq_len,
-        )
-
         recon_loss = self.decoder(zK, input_tokens, target_tokens, target_types, seq_lens)
         return recon_loss, mu, logvar, z0, zK, sum_log_det
 
