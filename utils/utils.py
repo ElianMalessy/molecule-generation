@@ -48,7 +48,7 @@ class GVAEConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.1
+    kl_weight: float = 0.3
     kl_anneal_steps: int = 40000     # total steps over which cycles run
     kl_cycles: int = 4              # number of β cycles (Fu et al., 2019)
     kl_anneal_ratio: float = 0.5    # fraction of each cycle spent ramping up
@@ -69,7 +69,7 @@ class GVAENFConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.1
+    kl_weight: float = 0.3
     kl_anneal_steps: int = 40000     # total steps over which cycles run
     kl_cycles: int = 4
     kl_anneal_ratio: float = 0.5

@@ -150,16 +150,24 @@ class GraphVAENF(nn.Module):
         node_logits, edge_logits = self.decode(zK)
         return node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det
 
-    def predict_props(self, zK: torch.Tensor) -> torch.Tensor:
+    def predict_props(self, mu: torch.Tensor) -> torch.Tensor:
         """
-        Predict normalised property vector (B, 3) from the post-flow latent zK.
-        This is the same space the decoder operates in, so property structure
-        learned here transfers directly to generation/latent optimisation.
+        Predict normalised property vector (B, 3) from the posterior mean μ.
+
+        We intentionally use μ (pre-flow) rather than zK = flow(z0), because:
+        - μ is a stable, low-variance target that the encoder can cleanly learn
+          to make property-predictive.
+        - Routing property gradients through the stochastic z0 = μ + ε·σ path
+          (or through the flow layers) distorts the flow's N(0,I) calibration
+          and collapses generation validity.
+        - The property head is a training-time regulariser for the encoder;
+          it does not need to operate in decoder (zK) space.
+
         Raises RuntimeError if the model was built without prop_pred=True.
         """
         if self.prop_head is None:
             raise RuntimeError("GraphVAENF was built without prop_pred=True")
-        return self.prop_head(zK)
+        return self.prop_head(mu)
 
     def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None, valency_mask=True):
         zK, _ = self.flow(z)

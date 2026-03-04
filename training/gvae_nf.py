@@ -35,7 +35,7 @@ def train_epoch_gvae_nf(model, optimizer, loader, config: Config, global_step: i
             if config.gvae_nf.prop_pred and hasattr(data, 'props'):
                 true_z = normalise_props(data.props.to(device, dtype=torch.float32),
                                          prop_mean, prop_std)
-                raw_prop_loss = F.mse_loss(model.predict_props(zK), true_z)
+                raw_prop_loss = F.mse_loss(model.predict_props(mu), true_z)
                 if gamma > 0:
                     loss = loss + gamma * raw_prop_loss
 
@@ -80,7 +80,7 @@ def val_epoch_gvae_nf(model, loader, config: Config, global_step: int,
             if config.gvae_nf.prop_pred and hasattr(data, 'props'):
                 true_z = normalise_props(data.props.to(device, dtype=torch.float32),
                                          prop_mean, prop_std)
-                raw_prop_loss = F.mse_loss(model.predict_props(zK), true_z)
+                raw_prop_loss = F.mse_loss(model.predict_props(mu), true_z)
                 if gamma > 0:
                     loss = loss + gamma * raw_prop_loss
 
