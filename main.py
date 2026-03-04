@@ -163,9 +163,12 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r²={max(0.0, 1 - train_raw_prop):.4f}"
+            # Checkpoint on recon+KL only: prop loss changes scale at warmup
+            # boundary and would otherwise cause spurious saves/patience resets.
+            ckpt_loss = val_recon + val_kl
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
-            val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r²={max(0.0, 1 - val_raw_prop):.4f}"
+            val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
                               if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
@@ -182,9 +185,10 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae_nf(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r²={max(0.0, 1 - train_raw_prop):.4f}"
+            ckpt_loss = val_recon + val_kl
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
-            val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r²={max(0.0, 1 - val_raw_prop):.4f}"
+            val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
                               if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
@@ -201,6 +205,7 @@ def train(config: Config):
             val_l, val_label, val_kl = val_epoch_frattvae(
                 model, val_loader, config, global_step, device,
                 frag_ecfps, freq_label, amp_dtype=amp_dtype)
+            ckpt_loss = val_l
             logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
                         f"| Label: {val_label:.4f} | KL: {val_kl:.4f}")
 
@@ -217,8 +222,8 @@ def train(config: Config):
         else:
             beta_mature = True  # FRATTVAE has a fixed small kl_weight, no cycling
 
-        if beta_mature and val_l < best_val_loss:
-            best_val_loss = val_l
+        if beta_mature and ckpt_loss < best_val_loss:
+            best_val_loss = ckpt_loss
             counter = 0
             torch.save(model.state_dict(), checkpoint_path)
             logger.info("New best model saved.")

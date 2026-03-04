@@ -69,7 +69,8 @@ class GVAENFConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.3
+    kl_weight: float = 0.5          # higher than GVAE: IAF log-det terms dilute
+                                    # effective KL pressure at the same beta_max
     kl_anneal_steps: int = 40000     # total steps over which cycles run
     kl_cycles: int = 4
     kl_anneal_ratio: float = 0.5

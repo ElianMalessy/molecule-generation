@@ -79,7 +79,7 @@ class GraphVAENF(nn.Module):
         self.num_node_features = num_node_features
         self.num_edge_features = num_edge_features
 
-        hidden_dim = 128
+        hidden_dim = 256
 
         # --- Encoder (identical to GraphVAE) ---
         self.node_emb = nn.Embedding(num_node_features, hidden_dim)
