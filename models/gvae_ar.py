@@ -139,7 +139,7 @@ def build_ar_batch(target_nodes, target_edges, eos_id: int, abs_max_len: int):
 
     for b, (tok, typ) in enumerate(zip(all_tokens, all_types)):
         # Guard: if truncated, ensure the last token is EOS so the model
-        # always learns when to stop (issue 1.3)
+        # always learns when to stop
         tok_b = tok[:max_L]
         typ_b = typ[:max_L]
         if tok_b[-1] != eos_id:          # always ensure termination token present
@@ -196,13 +196,19 @@ class _CausalLayer(nn.Module):
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Full-sequence causal forward (teacher-forced training).
 
-        attn_mask: additive float mask, broadcastable to (B, n_heads, L, L).
-        Combine the causal and key-padding masks before calling (see ARDecoder.forward).
+        attn_mask: optional boolean mask (B, 1, L, L) — True = attend, False = mask.
+          When None (the common path), is_causal=True is passed to SDPA so
+          FlashAttention can be selected automatically by PyTorch.
+          Note: PyTorch SDPA disallows is_causal=True alongside attn_mask, so
+          these two paths are mutually exclusive.
         """
         h = self.norm1(x)
         q, k, v = self._to_heads(self.q_proj(h)), self._to_heads(self.k_proj(h)), self._to_heads(self.v_proj(h))
         drop = self.attn_drop if self.training else 0.0
-        a    = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop)
+        if attn_mask is None:
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop)
+        else:
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop)
         x    = x + self.out_proj(a.transpose(1, 2).contiguous().view_as(x))
         x    = x + self.ff(self.norm2(x))
         return x
@@ -355,20 +361,18 @@ class ARDecoder(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, z, input_tokens, target_tokens, target_types, seq_lens):
-        B     = z.size(0)
-        max_L = target_tokens.size(1)
+        max_L  = target_tokens.size(1)
         device = z.device
 
         input_types = target_types[:, :max_L - 1]
         full_emb    = self._embed(z, input_tokens, input_types)
 
-        causal    = nn.Transformer.generate_square_subsequent_mask(max_L, device=device)
-        positions = torch.arange(max_L, device=device)
-        kpm       = torch.zeros(B, max_L, device=device).masked_fill_(
-                        positions.unsqueeze(0) >= seq_lens.unsqueeze(1), float('-inf'))
-        attn_mask = causal.unsqueeze(0).unsqueeze(0) + kpm.unsqueeze(1).unsqueeze(2)
-
-        h = self.transformer(full_emb, attn_mask=attn_mask)  # (B, max_L, d)
+        # No key-padding mask needed: padding always appears after EOS so the
+        # causal mask already prevents real tokens from attending to pad positions.
+        # Pad-token hidden states are excluded from the loss by token_mask below,
+        # so they never generate gradients.  Passing no mask lets SDPA use
+        # is_causal=True internally, which enables FlashAttention.
+        h = self.transformer(full_emb)  # (B, max_L, d)
 
         token_mask = (target_types > 0)
         if not token_mask.any():
