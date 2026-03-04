@@ -640,13 +640,18 @@ class GraphVAEAR(nn.Module):
 # ---------------------------------------------------------------------------
 
 def gvae_ar_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor,
-                 kl_weight: float):
+                 kl_weight: float, free_bits: float = 0.0, capacity: float = 0.0):
     """Combine AR reconstruction loss with KL divergence.
 
+    free_bits: minimum KL per latent dimension (nats).
+    capacity:  target KL (nats); loss = kl_weight * |KL - capacity|.
     Returns (total, recon, kl) where kl is the raw (unweighted) divergence.
     """
-    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
-    total = recon_loss + kl_weight * kl
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
+    if free_bits > 0:
+        kl_per_dim = kl_per_dim.clamp(min=free_bits)
+    kl = kl_per_dim.sum(dim=1).mean()
+    total = recon_loss + kl_weight * (kl - capacity).abs()
     return total, recon_loss, kl
 
 
@@ -748,14 +753,15 @@ class GraphVAEARNF(nn.Module):
 
 def gvae_ar_nf_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor,
                     z0: torch.Tensor, zK: torch.Tensor,
-                    sum_log_det: torch.Tensor, kl_weight: float):
+                    sum_log_det: torch.Tensor, kl_weight: float, capacity: float = 0.0):
     """AR + NF combined loss (same KL formulation as gvae_nf_loss).
 
+    capacity: target KL (nats); loss = kl_weight * |KL - capacity|.
     Returns (total, recon, kl_flow) where kl_flow is the raw divergence.
     """
     std = (0.5 * logvar).exp()
     log_q0  = -0.5 * (logvar + ((z0 - mu) / (std + 1e-8)).pow(2))
     log_pK  = -0.5 * zK.pow(2)
     kl_flow = (log_q0 - log_pK).sum(dim=1).mean() - sum_log_det.mean()
-    total   = recon_loss + kl_weight * kl_flow
+    total   = recon_loss + kl_weight * (kl_flow - capacity).abs()
     return total, recon_loss, kl_flow

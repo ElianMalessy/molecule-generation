@@ -51,9 +51,18 @@ def evaluate_model(model, config: Config, device, metadata):
                   config.gvae_nf if config.model == 'GVAE_NF' else
                   config.gvae_ar if config.model == 'GVAE_AR' else
                   config.gvae_ar_nf)
-            z = torch.randn(config.num_samples, gc.latent_dim).to(device)
-            generated_smiles = model.sample_smiles(z, atom_decoder, charge_decoder,
-                                                   valency_mask=gc.valency_mask)
+            # AR models pre-allocate KV buffers of shape (B, max_tf_len, d_model) per
+            # layer — at B=10 000 that is ~60 GB for ZINC defaults.  Chunk into smaller
+            # batches to keep peak memory bounded.  GVAE/GVAE_NF use a flat MLP decoder
+            # so a larger chunk is fine; AR models need a much smaller one.
+            decode_batch = 256 if config.model in ('GVAE_AR', 'GVAE_AR_NF') else 2048
+            z_all = torch.randn(config.num_samples, gc.latent_dim)
+            for i in tqdm(range(0, config.num_samples, decode_batch), desc=f"Sampling {config.model}"):
+                z_batch = z_all[i:i + decode_batch].to(device)
+                generated_smiles.extend(
+                    model.sample_smiles(z_batch, atom_decoder, charge_decoder,
+                                        valency_mask=gc.valency_mask)
+                )
 
         elif config.model == 'FRATTVAE':
             frag_ecfps = metadata['frag_ecfps'].to(device)

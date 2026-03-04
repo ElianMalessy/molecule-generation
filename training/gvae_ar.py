@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from models.gvae_ar import GraphVAEARNF, gvae_ar_loss, gvae_ar_nf_loss
-from utils.utils import Config, cyclical_beta
+from utils.utils import Config, cyclical_beta, kl_capacity
 from utils.properties import prop_gamma, normalise_props
 
 
@@ -42,16 +42,19 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             kl_weight = cyclical_beta(global_step, mc.kl_anneal_steps,
                                       mc.kl_weight, mc.kl_cycles, mc.kl_anneal_ratio)
+            capacity  = kl_capacity(global_step, mc.kl_capacity_max, mc.kl_capacity_steps)
             if use_nf:
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens)
-                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det, kl_weight)
+                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
+                                              kl_weight, capacity=capacity)
             else:
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens)
-                loss, _, kl = gvae_ar_loss(recon, mu, logvar, kl_weight)
+                loss, _, kl = gvae_ar_loss(recon, mu, logvar, kl_weight,
+                                           free_bits=mc.free_bits, capacity=capacity)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
             if mc.prop_pred and hasattr(pyg_batch, 'props'):
@@ -99,18 +102,21 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
         seq_lens      = seq_lens.to(device)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            beta = cyclical_beta(global_step, mc.kl_anneal_steps,
+            beta     = cyclical_beta(global_step, mc.kl_anneal_steps,
                                  mc.kl_weight, mc.kl_cycles, mc.kl_anneal_ratio)
+            capacity = kl_capacity(global_step, mc.kl_capacity_max, mc.kl_capacity_steps)
             if use_nf:
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens)
-                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det, beta)
+                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
+                                              beta, capacity=capacity)
             else:
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens)
-                loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta)
+                loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta,
+                                           free_bits=mc.free_bits, capacity=capacity)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
             if mc.prop_pred and hasattr(pyg_batch, 'props'):

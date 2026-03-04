@@ -42,6 +42,18 @@ def cyclical_beta(step: int, total_steps: int, beta_max: float,
     return beta_max
 
 
+def kl_capacity(step: int, capacity_max: float, capacity_steps: int) -> float:
+    """Linear ramp of KL capacity target from 0 → capacity_max over capacity_steps.
+
+    The loss becomes kl_weight * |KL − C| so the model is penalised equally
+    for being above OR below the target, preventing both collapse and
+    over-regularisation early in training.
+    """
+    if capacity_steps <= 0:
+        return capacity_max
+    return min(capacity_max * step / capacity_steps, capacity_max)
+
+
 @dataclass
 class GVAEConfig:
     batch_size: int = 128
@@ -52,9 +64,12 @@ class GVAEConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.3
-    kl_anneal_steps: int = 40000     # total steps over which cycles run
+    kl_anneal_steps: int = 100000    # total steps over which cycles run
     kl_cycles: int = 4              # number of β cycles (Fu et al., 2019)
     kl_anneal_ratio: float = 0.5    # fraction of each cycle spent ramping up
+    free_bits: float = 0.02         # min KL per latent dim (nats); 0.02×128=2.56 nats total
+    kl_capacity_max: float = 25.0   # target KL ceiling (nats); ramps from 0
+    kl_capacity_steps: int = 150000 # steps to ramp capacity to max
     valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
@@ -77,9 +92,11 @@ class GVAENFConfig:
                                     # consistent. The IAF log-det already adds to
                                     # kl_flow, so 0.3 gives slightly more KL pressure
                                     # than GVAE — no need to raise the weight further.
-    kl_anneal_steps: int = 40000     # total steps over which cycles run
+    kl_anneal_steps: int = 100000    # total steps over which cycles run
     kl_cycles: int = 4
     kl_anneal_ratio: float = 0.5
+    kl_capacity_max: float = 25.0   # NF: capacity only (no per-dim free bits)
+    kl_capacity_steps: int = 150000
     num_flows: int = 4               # number of IAF steps
     flow_hidden_dim: int = 256       # hidden dim of each MADE inside IAF
     valency_mask: bool = False
@@ -100,9 +117,12 @@ class GVAEARConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.05
-    kl_anneal_steps: int = 40000
+    kl_anneal_steps: int = 100000
     kl_cycles: int = 4
     kl_anneal_ratio: float = 0.5
+    free_bits: float = 0.02         # min KL per latent dim (nats); 0.02×128=2.56 nats total
+    kl_capacity_max: float = 20.0   # AR decoder is powerful; lower ceiling than GVAE
+    kl_capacity_steps: int = 150000
     valency_mask: bool = False
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
@@ -127,9 +147,11 @@ class GVAEARNFConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.05
-    kl_anneal_steps: int = 40000
+    kl_anneal_steps: int = 100000
     kl_cycles: int = 4
     kl_anneal_ratio: float = 0.5
+    kl_capacity_max: float = 20.0   # NF: capacity only
+    kl_capacity_steps: int = 150000
     num_flows: int = 4
     flow_hidden_dim: int = 256
     valency_mask: bool = False

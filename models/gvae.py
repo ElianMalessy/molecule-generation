@@ -348,19 +348,32 @@ def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges):
 
 
 def gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
-              mu, logvar, kl_weight):
-    """Standard VAE loss for GraphVAE.  Returns (total, recon, kl)."""
+              mu, logvar, kl_weight, free_bits: float = 0.0, capacity: float = 0.0):
+    """Standard VAE loss for GraphVAE.  Returns (total, recon, kl).
+
+    free_bits: minimum KL per latent dimension (nats).  Prevents collapse by
+      ensuring no dimension contributes less than this to the KL term.
+    capacity:  target KL (nats).  Loss = kl_weight * |KL - capacity|, so the
+      model is penalised equally for being above or below the target.
+    """
     recon = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges)
-    kl    = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
-    return recon + kl_weight * kl, recon, kl
+    kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
+    if free_bits > 0:
+        kl_per_dim = kl_per_dim.clamp(min=free_bits)
+    kl = kl_per_dim.sum(dim=1).mean()
+    return recon + kl_weight * (kl - capacity).abs(), recon, kl
 
 
 def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
-                 mu, logvar, z0, zK, sum_log_det, kl_weight):
+                 mu, logvar, z0, zK, sum_log_det, kl_weight, capacity: float = 0.0):
     """IAF-VAE loss for GraphVAENF.
 
     KL is computed via the change-of-variables formula:
         KL = E[log q(z0|x) - log p(zK)] - E[sum_log_det]
+
+    capacity: target KL (nats).  Loss = kl_weight * |KL - capacity|.
+      Free bits are not applied here because KL is not a sum of independent
+      per-dimension terms once the flow is involved.
 
     Returns (total, recon, kl_flow).
     """
@@ -369,7 +382,7 @@ def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
     log_q0  = -0.5 * (logvar + ((z0 - mu) / (std + 1e-8)).pow(2))
     log_pK  = -0.5 * zK.pow(2)
     kl_flow = (log_q0 - log_pK).sum(dim=1).mean() - sum_log_det.mean()
-    return recon + kl_weight * kl_flow, recon, kl_flow
+    return recon + kl_weight * (kl_flow - capacity).abs(), recon, kl_flow
 
 
 # ---------------------------------------------------------------------------
