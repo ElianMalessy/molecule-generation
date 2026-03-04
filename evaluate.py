@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from tqdm import tqdm
 from molecule_benchmarks import Benchmarker, SmilesDataset
 
-from models.gvae import GraphVAE, gvae_prepare_batch
-from models.gvae_nf import GraphVAENF
+from models.gvae import GraphVAE, GraphVAENF, gvae_prepare_batch
+from models.gvae_ar import GraphVAEAR, GraphVAEARNF
 from models.frattvae import FRATTVAE, build_frattvae_dataset, collate_pad_fn
 from models.frattvae.utils.mask import create_mask
 from utils.utils import Config, get_dataloaders, get_smiles_list
@@ -34,8 +34,8 @@ def evaluate_model(model, config: Config, device, metadata):
     """
     model.eval()
 
-    # Decoders needed for GVAE/GVAE_NF sampling
-    if config.model in ('GVAE', 'GVAE_NF'):
+    # Decoders needed for GVAE/GVAE_NF/GVAE_AR sampling
+    if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
         atom_decoder   = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
         charge_decoder = None               if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
 
@@ -46,8 +46,11 @@ def evaluate_model(model, config: Config, device, metadata):
     generated_smiles = []
 
     with torch.no_grad():
-        if config.model in ('GVAE', 'GVAE_NF'):
-            gc = config.gvae if config.model == 'GVAE' else config.gvae_nf
+        if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
+            gc = (config.gvae if config.model == 'GVAE' else
+                  config.gvae_nf if config.model == 'GVAE_NF' else
+                  config.gvae_ar if config.model == 'GVAE_AR' else
+                  config.gvae_ar_nf)
             z = torch.randn(config.num_samples, gc.latent_dim).to(device)
             generated_smiles = model.sample_smiles(z, atom_decoder, charge_decoder,
                                                    valency_mask=gc.valency_mask)
@@ -124,12 +127,15 @@ def _run_key(config: Config) -> str:
       'ZINC/GVAE_NF+prop+no_valency'
     Used as the key in checkpoints/scores.json.
     """
-    gc = config.gvae if config.model == 'GVAE' else config.gvae_nf if config.model == 'GVAE_NF' else None
+    gc = (config.gvae if config.model == 'GVAE' else
+          config.gvae_nf if config.model == 'GVAE_NF' else
+          config.gvae_ar if config.model == 'GVAE_AR' else
+          config.gvae_ar_nf if config.model == 'GVAE_AR_NF' else None)
     parts = [config.dataset, config.model]
     if gc is not None:
         parts.append('prop' if gc.prop_pred else 'no_prop')
-        if not gc.valency_mask:
-            parts.append('no_valency')
+        if gc.valency_mask:
+            parts.append('valency')
     return '/'.join(parts[:2]) + ('+' + '+'.join(parts[2:]) if len(parts) > 2 else '')
 
 
@@ -230,6 +236,34 @@ def _build_model(config: Config, metadata, device):
             flow_hidden_dim=config.gvae_nf.flow_hidden_dim,
             prop_pred=config.gvae_nf.prop_pred,
         )
+    elif config.model == 'GVAE_AR':
+        model = GraphVAEAR(
+            num_node_features=metadata['num_nodes'],
+            num_edge_features=metadata['num_edges'],
+            latent_dim=config.gvae_ar.latent_dim,
+            max_atoms=config.gvae_ar.max_atoms,
+            ar_d_model=config.gvae_ar.ar_d_model,
+            ar_n_heads=config.gvae_ar.ar_n_heads,
+            ar_n_layers=config.gvae_ar.ar_n_layers,
+            ar_d_ff=config.gvae_ar.ar_d_ff,
+            ar_dropout=config.gvae_ar.ar_dropout,
+            prop_pred=config.gvae_ar.prop_pred,
+        )
+    elif config.model == 'GVAE_AR_NF':
+        model = GraphVAEARNF(
+            num_node_features=metadata['num_nodes'],
+            num_edge_features=metadata['num_edges'],
+            latent_dim=config.gvae_ar_nf.latent_dim,
+            max_atoms=config.gvae_ar_nf.max_atoms,
+            num_flows=config.gvae_ar_nf.num_flows,
+            flow_hidden_dim=config.gvae_ar_nf.flow_hidden_dim,
+            ar_d_model=config.gvae_ar_nf.ar_d_model,
+            ar_n_heads=config.gvae_ar_nf.ar_n_heads,
+            ar_n_layers=config.gvae_ar_nf.ar_n_layers,
+            ar_d_ff=config.gvae_ar_nf.ar_d_ff,
+            ar_dropout=config.gvae_ar_nf.ar_dropout,
+            prop_pred=config.gvae_ar_nf.prop_pred,
+        )
     else:
         model = FRATTVAE(
             num_tokens=metadata['num_frags'],
@@ -290,17 +324,23 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
     # Layout: …/{DATASET}/{MODEL}/{VARIANT}/best.pth
     variant = os.path.basename(os.path.dirname(checkpoint))   # e.g. 'prop+no_valency'
     variant_parts = set(variant.split('+'))
-    prop_pred    = 'prop'       in variant_parts
-    no_valency   = 'no_valency' in variant_parts
+    prop_pred = 'prop'    in variant_parts
+    valency   = 'valency' in variant_parts
 
     config = Config(model=model_name, dataset=dataset, num_samples=num_samples, num_workers=num_workers)
     if dataset == 'MOSES':
         config.gvae.max_atoms = 30
         config.gvae_nf.max_atoms = 30
+        config.gvae_ar.max_atoms = 30
+        config.gvae_ar_nf.max_atoms = 30
     config.gvae.prop_pred     = prop_pred
     config.gvae_nf.prop_pred  = prop_pred
-    config.gvae.valency_mask    = not no_valency
-    config.gvae_nf.valency_mask = not no_valency
+    config.gvae_ar.prop_pred  = prop_pred
+    config.gvae_ar_nf.prop_pred = prop_pred
+    config.gvae.valency_mask    = valency
+    config.gvae_nf.valency_mask = valency
+    config.gvae_ar.valency_mask = valency
+    config.gvae_ar_nf.valency_mask = valency
 
     _, val_loader, metadata = get_dataloaders(config, logger)
 
@@ -319,7 +359,7 @@ def _parse_args():
                        help='Path to a specific best.pth to evaluate')
     group.add_argument('--all', action='store_true', default=True,
                        help='Evaluate all checkpoints found under checkpoints/ (default)')
-    parser.add_argument('--model',   type=str, choices=['GVAE', 'GVAE_NF', 'FRATTVAE'], default=None,
+    parser.add_argument('--model',   type=str, choices=['GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF', 'FRATTVAE'], default=None,
                         help='Filter to a specific model (used with --all)')
     parser.add_argument('--dataset', type=str, choices=['ZINC', 'MOSES'],    default=None,
                         help='Filter to a specific dataset (used with --all or with --checkpoint)')

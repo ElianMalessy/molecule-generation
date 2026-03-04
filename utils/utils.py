@@ -52,7 +52,7 @@ class GVAEConfig:
     kl_anneal_steps: int = 40000     # total steps over which cycles run
     kl_cycles: int = 4              # number of β cycles (Fu et al., 2019)
     kl_anneal_ratio: float = 0.5    # fraction of each cycle spent ramping up
-    valency_mask: bool = True        # apply valency masking during decoding
+    valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
     prop_weight: float = 1.0         # γ: property loss weight at full scale
@@ -69,14 +69,73 @@ class GVAENFConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.5          # higher than GVAE: IAF log-det terms dilute
-                                    # effective KL pressure at the same beta_max
+    kl_weight: float = 0.3          # same as GVAE: same recon scale (~55-60 nats),
+                                    # so same kl_weight keeps the KL/recon fraction
+                                    # consistent. The IAF log-det already adds to
+                                    # kl_flow, so 0.3 gives slightly more KL pressure
+                                    # than GVAE — no need to raise the weight further.
     kl_anneal_steps: int = 40000     # total steps over which cycles run
     kl_cycles: int = 4
     kl_anneal_ratio: float = 0.5
     num_flows: int = 4               # number of IAF steps
     flow_hidden_dim: int = 256       # hidden dim of each MADE inside IAF
-    valency_mask: bool = True
+    valency_mask: bool = False
+    # --- joint property prediction ---
+    prop_pred: bool = False
+    prop_weight: float = 1.0
+    prop_warmup_epochs: int = 15
+
+
+@dataclass
+class GVAEARConfig:
+    """GVAE with autoregressive Transformer decoder."""
+    batch_size: int = 128
+    epochs: int = 1000
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    patience: int = 10
+    max_atoms: int = 38
+    latent_dim: int = 128
+    kl_weight: float = 0.05
+    kl_anneal_steps: int = 40000
+    kl_cycles: int = 4
+    kl_anneal_ratio: float = 0.5
+    valency_mask: bool = False
+    # --- AR Transformer decoder ---
+    ar_d_model: int = 256            # Transformer hidden dim
+    ar_n_heads: int = 8              # attention heads
+    ar_n_layers: int = 4             # Transformer layers
+    ar_d_ff: int = 512               # feed-forward dim
+    ar_dropout: float = 0.1
+    # --- joint property prediction ---
+    prop_pred: bool = False
+    prop_weight: float = 1.0
+    prop_warmup_epochs: int = 15
+
+
+@dataclass
+class GVAEARNFConfig:
+    """GVAE_AR with IAF normalizing flow encoder."""
+    batch_size: int = 128
+    epochs: int = 1000
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    patience: int = 10
+    max_atoms: int = 38
+    latent_dim: int = 128
+    kl_weight: float = 0.05
+    kl_anneal_steps: int = 40000
+    kl_cycles: int = 4
+    kl_anneal_ratio: float = 0.5
+    num_flows: int = 4
+    flow_hidden_dim: int = 256
+    valency_mask: bool = False
+    # --- AR Transformer decoder ---
+    ar_d_model: int = 256
+    ar_n_heads: int = 8
+    ar_n_layers: int = 4
+    ar_d_ff: int = 512
+    ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 1.0
@@ -113,6 +172,8 @@ class Config:
     max_train_mols: int = 0          # cap training set size (0 = no cap, for quick tests)
     gvae: GVAEConfig = field(default_factory=GVAEConfig)
     gvae_nf: GVAENFConfig = field(default_factory=GVAENFConfig)
+    gvae_ar: GVAEARConfig = field(default_factory=GVAEARConfig)
+    gvae_ar_nf: GVAEARNFConfig = field(default_factory=GVAEARNFConfig)
     frattvae: FRATTVAEConfig = field(default_factory=FRATTVAEConfig)
 
 

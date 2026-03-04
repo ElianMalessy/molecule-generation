@@ -1,28 +1,29 @@
 """
-Training epoch functions for GraphVAE and GraphVAENF.
+Training epoch functions for GraphVAEAR and GraphVAEARNF.
 
-A single pair of train/val functions handles both variants by dispatching
-on isinstance(model, GraphVAENF).  The correct config section (config.gvae
-or config.gvae_nf) is selected automatically.
+A single pair of train/val functions handles both AR variants by dispatching
+on isinstance(model, GraphVAEARNF).  The correct config section (config.gvae_ar
+or config.gvae_ar_nf) is selected automatically.
 """
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from models.gvae import GraphVAENF, gvae_loss, gvae_nf_loss, gvae_prepare_batch
+from models.gvae import gvae_prepare_batch
+from models.gvae_ar import GraphVAEARNF, gvae_ar_loss, gvae_ar_nf_loss
 from utils.utils import Config, cyclical_beta
 from utils.properties import prop_gamma, normalise_props
 
 
-def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
-                     device, amp_dtype=None, epoch: int = 1,
-                     prop_mean=None, prop_std=None):
+def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: int,
+                        device, amp_dtype=None, epoch: int = 1,
+                        prop_mean=None, prop_std=None):
     model.train()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
-    use_nf = isinstance(model, GraphVAENF)
-    mc     = config.gvae_nf if use_nf else config.gvae
+    use_nf = isinstance(model, GraphVAEARNF)
+    mc     = config.gvae_ar_nf if use_nf else config.gvae_ar
     gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
-    desc   = "Train GVAE-NF" if use_nf else "Train GVAE"
+    desc   = "Train GVAE_AR_NF" if use_nf else "Train GVAE_AR"
 
     for data in tqdm(loader, desc=desc, leave=False):
         optimizer.zero_grad()
@@ -33,19 +34,13 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
             kl_weight = cyclical_beta(global_step, mc.kl_anneal_steps,
                                       mc.kl_weight, mc.kl_cycles, mc.kl_anneal_ratio)
             if use_nf:
-                node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det = \
-                    model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_nf_loss(
-                    node_logits, edge_logits, target_nodes, target_edges,
-                    mu, logvar, z0, zK, sum_log_det, kl_weight,
-                )
+                recon, mu, logvar, z0, zK, sum_log_det = model(
+                    x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges)
+                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det, kl_weight)
             else:
-                node_logits, edge_logits, mu, logvar = \
-                    model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_loss(
-                    node_logits, edge_logits, target_nodes, target_edges,
-                    mu, logvar, kl_weight,
-                )
+                recon, mu, logvar = model(
+                    x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges)
+                loss, _, kl = gvae_ar_loss(recon, mu, logvar, kl_weight)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
             if mc.prop_pred and hasattr(data, 'props'):
@@ -56,6 +51,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                     loss = loss + gamma * raw_prop_loss
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         global_step += 1
 
@@ -66,18 +62,20 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         total_raw_prop += raw_prop_loss.item()           * data.num_graphs
 
     n = len(loader.dataset)
-    return total_loss / n, total_recon / n, total_kl / n, total_prop / n, total_raw_prop / n, global_step
+    return (total_loss / n, total_recon / n, total_kl / n,
+            total_prop / n, total_raw_prop / n, global_step)
 
 
 @torch.no_grad()
-def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
-                   amp_dtype=None, epoch: int = 1, prop_mean=None, prop_std=None):
+def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
+                      device, amp_dtype=None, epoch: int = 1,
+                      prop_mean=None, prop_std=None):
     model.eval()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
-    use_nf = isinstance(model, GraphVAENF)
-    mc     = config.gvae_nf if use_nf else config.gvae
+    use_nf = isinstance(model, GraphVAEARNF)
+    mc     = config.gvae_ar_nf if use_nf else config.gvae_ar
     gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
-    desc   = "Val GVAE-NF" if use_nf else "Val GVAE"
+    desc   = "Val GVAE_AR_NF" if use_nf else "Val GVAE_AR"
 
     for data in tqdm(loader, desc=desc, leave=False):
         x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges = \
@@ -87,19 +85,13 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
             beta = cyclical_beta(global_step, mc.kl_anneal_steps,
                                  mc.kl_weight, mc.kl_cycles, mc.kl_anneal_ratio)
             if use_nf:
-                node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det = \
-                    model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_nf_loss(
-                    node_logits, edge_logits, target_nodes, target_edges,
-                    mu, logvar, z0, zK, sum_log_det, beta,
-                )
+                recon, mu, logvar, z0, zK, sum_log_det = model(
+                    x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges)
+                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det, beta)
             else:
-                node_logits, edge_logits, mu, logvar = \
-                    model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_loss(
-                    node_logits, edge_logits, target_nodes, target_edges,
-                    mu, logvar, beta,
-                )
+                recon, mu, logvar = model(
+                    x_in, edge_index, edge_attr_in, batch, target_nodes, target_edges)
+                loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
             if mc.prop_pred and hasattr(data, 'props'):
@@ -116,4 +108,5 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
         total_raw_prop += raw_prop_loss.item()           * data.num_graphs
 
     n = len(loader.dataset)
-    return total_loss / n, total_recon / n, total_kl / n, total_prop / n, total_raw_prop / n
+    return (total_loss / n, total_recon / n, total_kl / n,
+            total_prop / n, total_raw_prop / n)
