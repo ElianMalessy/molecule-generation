@@ -326,143 +326,174 @@ class ARDecoder(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _step(self, z: torch.Tensor, seq_tokens: list, seq_types: list):
-        """Single autoregressive step.
-
-        Runs a full forward pass on [z, seq_tokens] and returns the hidden
-        state at the last position, which predicts the next token.
-
-        Parameters
-        ----------
-        z          : (1, latent_dim)
-        seq_tokens : current generated tokens (list of int)
-        seq_types  : corresponding types      (list of int: 1 or 2)
-
-        Returns
-        -------
-        last_h : (1, d_model)
-        """
-        device = z.device
-        L_in = len(seq_tokens)
-
-        if L_in == 0:
-            tok_t  = torch.zeros(1, 0, dtype=torch.long, device=device)
-            type_t = torch.zeros(1, 0, dtype=torch.long, device=device)
-        else:
-            tok_t  = torch.tensor(seq_tokens, dtype=torch.long, device=device).unsqueeze(0)
-            type_t = torch.tensor(seq_types,  dtype=torch.long, device=device).unsqueeze(0)
-
-        full_emb = self._embed(z, tok_t, type_t)   # (1, L_in+1, d)
-        seq_L = full_emb.size(1)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            seq_L, device=device)
-        h = self.transformer(full_emb, mask=causal_mask)  # (1, L_in+1, d)
-        return h[:, -1, :]                                # (1, d)
-
-    @torch.no_grad()
     def sample_smiles(self, z: torch.Tensor, atom_decoder: dict,
                       charge_decoder, valency_mask: bool = True,
                       temperature: float = 1.0) -> list:
-        """Autoregressively sample molecules from latent vectors.
+        """Autoregressively sample B molecules in parallel using KV caching.
 
-        All B molecules are decoded in parallel: one transformer forward per
-        step rather than one per (molecule × step).  This gives a large
-        throughput improvement at evaluation time.
+        KV caching avoids re-processing past tokens: each step runs one
+        (B, 1, d) token through all transformer layers, appending K/V to a
+        per-layer cache.  Total attention work is O(L) per step (vs O(L²) for
+        the naive full re-run), giving a large throughput improvement.
         """
         return self._sample_batch(z, atom_decoder, charge_decoder,
                                   valency_mask, temperature)
 
     @torch.no_grad()
+    def _kv_step(self, h: torch.Tensor, kv_cache: list):
+        """Run one (B, 1, d) token through all transformer layers with KV cache.
+
+        Parameters
+        ----------
+        h        : (B, 1, d_model) – embedding of the token at the current step
+        kv_cache : list of (K, V) per layer, each (B, t, d_model)
+
+        Returns
+        -------
+        last_h   : (B, d_model) – hidden state of the new token
+        new_cache: updated kv_cache with the new K/V appended
+        """
+        B = h.size(0)
+        d = self.d_model
+        new_cache = []
+
+        for layer, (K_cache, V_cache) in zip(self.transformer.layers, kv_cache):
+            mha      = layer.self_attn
+            nhead    = mha.num_heads
+            head_dim = d // nhead
+
+            # Pre-LN (norm_first=True in our constructor)
+            h_norm = layer.norm1(h)                                    # (B, 1, d)
+
+            # Combined Q/K/V projection — only the new token is projected
+            qkv = F.linear(h_norm, mha.in_proj_weight, mha.in_proj_bias)  # (B, 1, 3d)
+            q, k, v = qkv.chunk(3, dim=-1)                                 # each (B, 1, d)
+
+            # Grow the cache
+            K_cache = torch.cat([K_cache, k], dim=1)   # (B, t+1, d)
+            V_cache = torch.cat([V_cache, v], dim=1)
+            new_cache.append((K_cache, V_cache))
+
+            # Reshape to (B, nhead, seq, head_dim) for Flash Attention via SDPA
+            q_h = q.view(B, 1,  nhead, head_dim).transpose(1, 2)
+            k_h = K_cache.view(B, -1, nhead, head_dim).transpose(1, 2)
+            v_h = V_cache.view(B, -1, nhead, head_dim).transpose(1, 2)
+
+            # No causal mask needed: query is always the last position
+            attn_out = F.scaled_dot_product_attention(q_h, k_h, v_h, dropout_p=0.0)
+            attn_out = (attn_out.transpose(1, 2).contiguous().view(B, 1, d))
+            attn_out = F.linear(attn_out, mha.out_proj.weight, mha.out_proj.bias)
+
+            h = h + layer.dropout1(attn_out)         # residual (dropout is no-op in eval)
+            h = h + layer._ff_block(layer.norm2(h))  # FFN with Pre-LN
+
+        return h[:, 0, :], new_cache   # (B, d)
+
+    @torch.no_grad()
     def _sample_batch(self, z: torch.Tensor, atom_decoder: dict, charge_decoder,
                       valency_mask: bool, temperature: float) -> list:
-        """Batch-parallel AR sampling: one transformer call per step."""
+        """KV-cached parallel AR sampling.
+
+        All B molecules advance in lockstep. Per step:
+          1. Sample the next token for each molecule from last_h.
+          2. Embed the new token (B, 1, d).
+          3. Run one _kv_step → new last_h in O(1) transformer ops per token.
+        """
         B = z.size(0)
         device = z.device
         T = max(temperature, 1e-6)
+        d = self.d_model
+        num_layers = len(self.transformer.layers)
 
-        # Per-molecule Python state (all lists of length B)
-        seq_tokens      = [[] for _ in range(B)]
-        seq_types       = [[] for _ in range(B)]
-        atoms           = [[] for _ in range(B)]   # (atomic_num, fc, max_val)
+        # Empty KV cache: (B, 0, d) per layer
+        kv_cache = [(torch.empty(B, 0, d, device=device),
+                     torch.empty(B, 0, d, device=device))
+                    for _ in range(num_layers)]
+
+        # Per-molecule state
+        atoms           = [[] for _ in range(B)]
         val_used        = [[] for _ in range(B)]
         bonds           = [{} for _ in range(B)]
         edges_remaining = [0]     * B
         current_atom_i  = [0]     * B
         finished        = [False] * B
 
+        # ---- Position 0: feed z prefix, get first prediction ----
+        z_emb = (self.z_proj(z).unsqueeze(1)
+                 + self.type_emb(torch.zeros(B, 1, dtype=torch.long, device=device))
+                 + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device)))
+        last_h, kv_cache = self._kv_step(z_emb, kv_cache)  # (B, d)
+
         for step in range(self.max_seq_len):
             if all(finished):
                 break
 
-            # All sequences are exactly `step` tokens long — no padding needed
-            if step == 0:
-                tok_t  = torch.zeros(B, 0, dtype=torch.long, device=device)
-                type_t = torch.zeros(B, 0, dtype=torch.long, device=device)
-            else:
-                tok_t  = torch.tensor(seq_tokens, dtype=torch.long, device=device)  # (B, step)
-                type_t = torch.tensor(seq_types,  dtype=torch.long, device=device)
+            node_logits = self.node_head(last_h) / T    # (B, V_node)
+            edge_logits = self.edge_head(last_h) / T    # (B, V_edge)
+            node_logits[:, 0] = float('-inf')           # never predict padding
 
-            full_emb = self._embed(z, tok_t, type_t)              # (B, step+1, d)
-            seq_L    = full_emb.size(1)
-            causal_mask = nn.Transformer.generate_square_subsequent_mask(
-                seq_L, device=device)
-            last_h   = self.transformer(full_emb, mask=causal_mask)[:, -1, :]  # (B, d)
-
-            node_logits_all = self.node_head(last_h) / T          # (B, V_node)
-            edge_logits_all = self.edge_head(last_h) / T          # (B, V_edge)
-            node_logits_all[:, 0] = float('-inf')                 # never predict padding
+            new_toks  = torch.full((B,), self.eos_id, dtype=torch.long, device=device)
+            new_types = torch.ones(B, dtype=torch.long, device=device)
 
             for b in range(B):
                 if finished[b]:
-                    # Append dummy to keep all sequences the same length
-                    seq_tokens[b].append(self.eos_id)
-                    seq_types[b].append(1)
                     continue
 
                 if edges_remaining[b] == 0:
-                    # ---- NODE TOKEN ----
                     token = int(torch.multinomial(
-                        F.softmax(node_logits_all[b], dim=-1), 1).item())
-                    seq_tokens[b].append(token)
-                    seq_types[b].append(1)
+                        F.softmax(node_logits[b], dim=-1), 1).item())
+                    new_toks[b] = token
+                    new_types[b] = 1
                     if token == self.eos_id:
                         finished[b] = True
-                        continue
-                    cls_idx    = token - 1
-                    atomic_num = atom_decoder.get(cls_idx, 6)
-                    fc = charge_decoder.get(cls_idx, 0) if charge_decoder is not None else 0
-                    base_val   = _MAX_VALENCE.get(atomic_num, 4)
-                    if fc > 0:
-                        base_val += 1
-                    elif fc < 0:
-                        base_val = max(base_val - 1, 0)
-                    atoms[b].append((atomic_num, fc, base_val))
-                    val_used[b].append(0)
-                    current_atom_i[b]  = len(atoms[b]) - 1
-                    edges_remaining[b] = current_atom_i[b]
-
+                    else:
+                        cls_idx    = token - 1
+                        atomic_num = atom_decoder.get(cls_idx, 6)
+                        fc = charge_decoder.get(cls_idx, 0) if charge_decoder else 0
+                        base_val   = _MAX_VALENCE.get(atomic_num, 4)
+                        if fc > 0:   base_val += 1
+                        elif fc < 0: base_val = max(base_val - 1, 0)
+                        atoms[b].append((atomic_num, fc, base_val))
+                        val_used[b].append(0)
+                        current_atom_i[b]  = len(atoms[b]) - 1
+                        edges_remaining[b] = current_atom_i[b]
                 else:
-                    # ---- EDGE TOKEN ----
-                    logits = edge_logits_all[b].clone()
+                    logits = edge_logits[b].clone()
                     if valency_mask:
                         ci = current_atom_i[b]
                         tj = ci - edges_remaining[b]
-                        for b_type in range(1, self.edge_vocab):
-                            order = _BOND_ORDER.get(b_type, 1)
+                        for bt in range(1, self.edge_vocab):
+                            order = _BOND_ORDER.get(bt, 1)
                             if (val_used[b][ci] + order > atoms[b][ci][2] or
                                     val_used[b][tj] + order > atoms[b][tj][2]):
-                                logits[b_type] = float('-inf')
+                                logits[bt] = float('-inf')
                     token = int(torch.multinomial(F.softmax(logits, dim=-1), 1).item())
-                    seq_tokens[b].append(token)
-                    seq_types[b].append(2)
+                    new_toks[b] = token
+                    new_types[b] = 2
                     if token > 0:
-                        ci = current_atom_i[b]
-                        tj = ci - edges_remaining[b]
+                        ci = current_atom_i[b]; tj = ci - edges_remaining[b]
                         order = _BOND_ORDER.get(token, 1)
-                        val_used[b][ci] += order
-                        val_used[b][tj] += order
+                        val_used[b][ci] += order; val_used[b][tj] += order
                         bonds[b][(ci, tj)] = _get_rdkit_bond(token)
                     edges_remaining[b] -= 1
+
+            if all(finished):
+                break
+
+            # Embed the new token at position step+1 and advance KV cache
+            tok_emb = torch.zeros(B, 1, d, device=device)
+            n_mask = (new_types == 1)
+            e_mask = (new_types == 2)
+            if n_mask.any():
+                tok_emb[n_mask, 0] = self.node_emb(new_toks[n_mask])
+            if e_mask.any():
+                tok_emb[e_mask, 0] = self.edge_emb(new_toks[e_mask])
+            tok_emb = (tok_emb
+                       + self.type_emb(new_types.unsqueeze(1))
+                       + self.pos_emb(torch.tensor(
+                           [[min(step + 1, self.max_tf_len - 1)]], device=device)))
+
+            last_h, kv_cache = self._kv_step(tok_emb, kv_cache)  # (B, d)
 
         return [self._build_mol(atoms[b], bonds[b]) for b in range(B)]
 
