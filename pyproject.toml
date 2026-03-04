@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "carbon-sponges"
+version = "0.1.0"
+description = "Molecular graph VAE with normalizing flows and autoregressive decoder"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torch_geometric",
+    "rdkit",
+    "numpy",
+    "pandas",
+    "tqdm",
+    "joblib",
+]
+
+[project.optional-dependencies]
+# pip install "carbon-sponges[eval] @ git+..."
+eval = ["molecule-benchmarks"]
+
+[project.scripts]
+molgen-train = "main:main"
+molgen-eval  = "evaluate:main"
+
+[tool.setuptools.packages.find]
+# auto-discovers models/, models/frattvae/, models/frattvae/utils/,
+# training/, utils/ (all have __init__.py)
+where = ["."]
+
+[tool.setuptools]
+# root-level modules that aren't packages
+py-modules = ["main", "evaluate", "moses_dataset"]

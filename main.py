@@ -274,7 +274,11 @@ def train(config: Config):
     model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
     evaluate_model(model, config, device, metadata)
 
-if __name__ == "__main__":
+def main():
     config = parse_args()
     set_seed(config.seed)
     train(config)
+
+
+if __name__ == "__main__":
+    main()

@@ -369,7 +369,7 @@ def _parse_args():
     return parser.parse_args()
 
 
-if __name__ == '__main__':
+def main():
     args = _parse_args()
 
     common = dict(
@@ -401,3 +401,7 @@ if __name__ == '__main__':
             if args.dataset and dataset    != args.dataset:
                 continue
             run_validation(dataset, model_name, ckpt, **common)
+
+
+if __name__ == '__main__':
+    main()
