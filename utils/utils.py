@@ -294,17 +294,22 @@ def get_dataloaders(config: Config, logger):
 
         # AR models pre-compute BFS sequences in the DataLoader workers so
         # the GPU never waits on Python list operations inside forward().
+        # Use the standard TorchDataLoader instead of PyGDataLoader: our
+        # ar_collate_fn already calls Batch.from_data_list internally, so
+        # PyG's extra batching logic must not run on top of our 5-tuple output.
         if config.model in ('GVAE_AR', 'GVAE_AR_NF'):
             max_seq_len = gc.max_atoms * (gc.max_atoms + 1) // 2 + 1
             collate_fn = partial(ar_collate_fn, max_atoms=gc.max_atoms,
                                  eos_id=num_node_features, max_seq_len=max_seq_len)
+            train_loader = TorchDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True,
+                                           num_workers=config.num_workers, collate_fn=collate_fn)
+            val_loader   = TorchDataLoader(val_dataset,   batch_size=gc.batch_size, shuffle=False,
+                                           num_workers=config.num_workers, collate_fn=collate_fn)
         else:
-            collate_fn = None  # PyGDataLoader default
-
-        train_loader = PyGDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True,
-                                     num_workers=config.num_workers, collate_fn=collate_fn)
-        val_loader   = PyGDataLoader(val_dataset,   batch_size=gc.batch_size, shuffle=False,
-                                     num_workers=config.num_workers, collate_fn=collate_fn)
+            train_loader = PyGDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True,
+                                         num_workers=config.num_workers)
+            val_loader   = PyGDataLoader(val_dataset,   batch_size=gc.batch_size, shuffle=False,
+                                         num_workers=config.num_workers)
 
         return train_loader, val_loader, metadata
 
