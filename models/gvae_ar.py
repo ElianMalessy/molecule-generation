@@ -142,9 +142,9 @@ def build_ar_batch(target_nodes, target_edges, eos_id: int, abs_max_len: int):
         # always learns when to stop (issue 1.3)
         tok_b = tok[:max_L]
         typ_b = typ[:max_L]
-        if len(tok) > max_L and tok_b[-1] != eos_id:
-            tok_b = tok[:max_L - 1] + [eos_id]
-            typ_b = typ[:max_L - 1] + [1]
+        if tok_b[-1] != eos_id:          # always ensure termination token present
+            tok_b = tok_b[:max_L - 1] + [eos_id]
+            typ_b = typ_b[:max_L - 1] + [1]
         L = len(tok_b)
         seq_lens[b] = L
         if L > 1:
@@ -214,13 +214,14 @@ class ARDecoder(nn.Module):
         self.node_head = nn.Linear(d_model, self.node_vocab)
         self.edge_head = nn.Linear(d_model, self.edge_vocab)
 
-        # torch.compile the two hot paths:
-        #   - transformer: teacher-forced training forward (static shapes, compiles cleanly)
-        #   - _kv_step:    inner sampling loop (~742 calls per sample); dynamic=True because
-        #                  the KV-cache sequence dimension grows by 1 at every step
+        # torch.compile the training transformer forward (static shapes, compiles cleanly).
+        # _kv_step is intentionally NOT compiled as an instance attribute: doing so would
+        # bypass the compiled self.transformer (OptimizedModule proxies .layers to the
+        # original module), and storing a compiled callable as self._kv_step breaks
+        # nn.Module.to(device) / load_state_dict since it is not a registered parameter
+        # or buffer (issue N2).
         if hasattr(torch, 'compile'):
             self.transformer = torch.compile(self.transformer, fullgraph=False)
-            self._kv_step    = torch.compile(self._kv_step, dynamic=True, fullgraph=False)
 
     # ------------------------------------------------------------------
     # Internal: build transformer input embeddings
@@ -434,11 +435,14 @@ class ARDecoder(nn.Module):
         d = self.d_model
         num_layers = len(self.transformer.layers)
 
-        # Pre-allocate KV buffers: (B, max_tf_len, d) per layer — written in-place
-        # at each step, eliminating O(L) tensor allocations from torch.cat (issue 3.1)
-        K_bufs = [torch.zeros(B, self.max_tf_len, d, device=device)
+        # Pre-allocate KV buffers with max_tf_len + 1 slots:
+        #   slot 0      = z prefix
+        #   slots 1..max_seq_len = up to max_seq_len graph tokens
+        # Allocating exactly max_tf_len would cause slots max_seq_len-1 and
+        # max_seq_len to alias onto slot max_tf_len-1 (issue N1).
+        K_bufs = [torch.zeros(B, self.max_tf_len + 1, d, device=device)
                   for _ in range(num_layers)]
-        V_bufs = [torch.zeros(B, self.max_tf_len, d, device=device)
+        V_bufs = [torch.zeros(B, self.max_tf_len + 1, d, device=device)
                   for _ in range(num_layers)]
 
         # Per-molecule state
@@ -516,8 +520,9 @@ class ARDecoder(nn.Module):
             if all(finished):
                 break
 
-            # Embed the new token at position step+1 and run KV step
-            pos = min(step + 1, self.max_tf_len - 1)
+            # Embed the new token at position step+1 and run KV step.
+            # No clamping needed: buffers have max_tf_len+1 slots (0..max_seq_len).
+            pos = step + 1
             tok_emb = torch.zeros(B, 1, d, device=device)
             n_mask = (new_types == 1)
             e_mask = (new_types == 2)
