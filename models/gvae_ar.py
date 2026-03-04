@@ -285,19 +285,20 @@ class ARDecoder(nn.Module):
 
         full_emb = self._embed(z, input_tokens, input_types)  # (B, max_L, d)
 
-        # Causal mask (upper triangular → attend to self and past only)
-        causal_mask = torch.triu(
-            torch.ones(max_L, max_L, device=device, dtype=torch.bool), diagonal=1
-        )
+        # Key-padding mask: -inf at positions t >= seq_lens[b], 0 elsewhere
+        # (float additive, matching the float causal mask to avoid PyTorch warnings)
+        # position 0 is z (never padded); input at pos t corresponds to seq[t-1]
+        pos = torch.arange(max_L, device=device).unsqueeze(0)  # (1, max_L)
+        kpm = torch.zeros(B, max_L, device=device).masked_fill_(
+            pos >= seq_lens.unsqueeze(1), float('-inf'))        # (B, max_L)
 
-        # Key-padding mask: True at positions t ≥ seq_lens[b]
-        # (position 0 is z—never padded; input at pos t corresponds to seq[t-1])
-        pos  = torch.arange(max_L, device=device).unsqueeze(0)     # (1, max_L)
-        kpm  = pos >= seq_lens.unsqueeze(1)                         # (B, max_L)
+        # Float additive causal mask — triggers SDPA / Flash Attention
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            max_L, device=device)                               # (max_L, max_L)
 
-        h = self.transformer(full_emb, mask=causal_mask,
-                             src_key_padding_mask=kpm,
-                             is_causal=False)                       # (B, max_L, d)
+        h = self.transformer(full_emb,
+                             mask=causal_mask,
+                             src_key_padding_mask=kpm)               # (B, max_L, d)
 
         # Compute loss: select positions by type, apply appropriate head
         node_mask = (target_types == 1)  # (B, max_L)
@@ -353,11 +354,10 @@ class ARDecoder(nn.Module):
 
         full_emb = self._embed(z, tok_t, type_t)   # (1, L_in+1, d)
         seq_L = full_emb.size(1)
-        causal = torch.triu(
-            torch.ones(seq_L, seq_L, device=device, dtype=torch.bool), diagonal=1
-        )
-        h = self.transformer(full_emb, mask=causal, is_causal=False)  # (1, L_in+1, d)
-        return h[:, -1, :]                                              # (1, d)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            seq_L, device=device)
+        h = self.transformer(full_emb, mask=causal_mask)  # (1, L_in+1, d)
+        return h[:, -1, :]                                # (1, d)
 
     @torch.no_grad()
     def sample_smiles(self, z: torch.Tensor, atom_decoder: dict,
@@ -365,109 +365,120 @@ class ARDecoder(nn.Module):
                       temperature: float = 1.0) -> list:
         """Autoregressively sample molecules from latent vectors.
 
-        Parameters
-        ----------
-        z              : (B, latent_dim) – sampled from N(0, I)
-        atom_decoder   : {class_idx: atomic_num}
-        charge_decoder : {class_idx: formal_charge} or None
-        valency_mask   : if True, masks chemically invalid bond choices
-        temperature    : sampling temperature (1.0 = no rescaling)
-
-        Returns
-        -------
-        list of B SMILES strings (None where sanitization failed)
+        All B molecules are decoded in parallel: one transformer forward per
+        step rather than one per (molecule × step).  This gives a large
+        throughput improvement at evaluation time.
         """
+        return self._sample_batch(z, atom_decoder, charge_decoder,
+                                  valency_mask, temperature)
+
+    @torch.no_grad()
+    def _sample_batch(self, z: torch.Tensor, atom_decoder: dict, charge_decoder,
+                      valency_mask: bool, temperature: float) -> list:
+        """Batch-parallel AR sampling: one transformer call per step."""
         B = z.size(0)
-        results = []
-        for b in range(B):
-            smi = self._sample_one(z[b:b + 1], atom_decoder, charge_decoder,
-                                   valency_mask, temperature)
-            results.append(smi)
-        return results
+        device = z.device
+        T = max(temperature, 1e-6)
 
-    def _sample_one(self, z1, atom_decoder, charge_decoder,
-                    valency_mask: bool, temperature: float):
-        """Sample a single molecule.  Returns SMILES or None."""
-        seq_tokens, seq_types = [], []
-        atoms      = []   # list of (atomic_num, fc, max_val)
-        val_used   = []   # current valence per atom
-        bonds      = {}   # (i, j) → rdkit bond type (i > j)
+        # Per-molecule Python state (all lists of length B)
+        seq_tokens      = [[] for _ in range(B)]
+        seq_types       = [[] for _ in range(B)]
+        atoms           = [[] for _ in range(B)]   # (atomic_num, fc, max_val)
+        val_used        = [[] for _ in range(B)]
+        bonds           = [{} for _ in range(B)]
+        edges_remaining = [0]     * B
+        current_atom_i  = [0]     * B
+        finished        = [False] * B
 
-        # State machine: after placing atom i we need i edge tokens
-        edges_remaining = 0   # edges left for the current new atom
-        current_atom_i  = 0   # index (0-based) of atom currently getting edges
+        for step in range(self.max_seq_len):
+            if all(finished):
+                break
 
-        max_steps = self.max_seq_len
-        for _ in range(max_steps):
-            last_h = self._step(z1, seq_tokens, seq_types)   # (1, d)
-
-            if edges_remaining == 0:
-                # ---- NEXT TOKEN IS A NODE ----
-                logits = self.node_head(last_h)[0] / max(temperature, 1e-6)  # (V_node,)
-                logits[0] = float('-inf')  # never predict padding class (index 0)
-                token = int(torch.multinomial(F.softmax(logits, dim=-1), 1).item())
-
-                if token == self.eos_id:
-                    break
-
-                seq_tokens.append(token)
-                seq_types.append(1)
-
-                cls_idx   = token - 1                               # 0-indexed class
-                atomic_num = atom_decoder.get(cls_idx, 6)
-                fc = 0
-                if charge_decoder is not None:
-                    fc = charge_decoder.get(cls_idx, 0)
-                base_val  = _MAX_VALENCE.get(atomic_num, 4)
-                if fc > 0:
-                    base_val += 1
-                elif fc < 0:
-                    base_val = max(base_val - 1, 0)
-
-                atoms.append((atomic_num, fc, base_val))
-                val_used.append(0)
-                current_atom_i  = len(atoms) - 1
-                edges_remaining = current_atom_i   # need edges to atoms 0..i-1
-
+            # All sequences are exactly `step` tokens long — no padding needed
+            if step == 0:
+                tok_t  = torch.zeros(B, 0, dtype=torch.long, device=device)
+                type_t = torch.zeros(B, 0, dtype=torch.long, device=device)
             else:
-                # ---- NEXT TOKEN IS AN EDGE ----
-                target_j = current_atom_i - edges_remaining  # which prior atom
-                logits = self.edge_head(last_h)[0] / max(temperature, 1e-6)  # (V_edge,)
+                tok_t  = torch.tensor(seq_tokens, dtype=torch.long, device=device)  # (B, step)
+                type_t = torch.tensor(seq_types,  dtype=torch.long, device=device)
 
-                if valency_mask:
-                    for b_type in range(1, self.edge_vocab):
-                        order = _BOND_ORDER.get(b_type, 1)
-                        if (val_used[current_atom_i] + order > atoms[current_atom_i][2] or
-                                val_used[target_j] + order > atoms[target_j][2]):
-                            logits[b_type] = float('-inf')
+            full_emb = self._embed(z, tok_t, type_t)              # (B, step+1, d)
+            seq_L    = full_emb.size(1)
+            causal_mask = nn.Transformer.generate_square_subsequent_mask(
+                seq_L, device=device)
+            last_h   = self.transformer(full_emb, mask=causal_mask)[:, -1, :]  # (B, d)
 
-                token = int(torch.multinomial(F.softmax(logits, dim=-1), 1).item())
-                seq_tokens.append(token)
-                seq_types.append(2)
+            node_logits_all = self.node_head(last_h) / T          # (B, V_node)
+            edge_logits_all = self.edge_head(last_h) / T          # (B, V_edge)
+            node_logits_all[:, 0] = float('-inf')                 # never predict padding
 
-                if token > 0:
-                    order = _BOND_ORDER.get(token, 1)
-                    val_used[current_atom_i] += order
-                    val_used[target_j]       += order
-                    bonds[(current_atom_i, target_j)] = _get_rdkit_bond(token)
+            for b in range(B):
+                if finished[b]:
+                    # Append dummy to keep all sequences the same length
+                    seq_tokens[b].append(self.eos_id)
+                    seq_types[b].append(1)
+                    continue
 
-                edges_remaining -= 1
+                if edges_remaining[b] == 0:
+                    # ---- NODE TOKEN ----
+                    token = int(torch.multinomial(
+                        F.softmax(node_logits_all[b], dim=-1), 1).item())
+                    seq_tokens[b].append(token)
+                    seq_types[b].append(1)
+                    if token == self.eos_id:
+                        finished[b] = True
+                        continue
+                    cls_idx    = token - 1
+                    atomic_num = atom_decoder.get(cls_idx, 6)
+                    fc = charge_decoder.get(cls_idx, 0) if charge_decoder is not None else 0
+                    base_val   = _MAX_VALENCE.get(atomic_num, 4)
+                    if fc > 0:
+                        base_val += 1
+                    elif fc < 0:
+                        base_val = max(base_val - 1, 0)
+                    atoms[b].append((atomic_num, fc, base_val))
+                    val_used[b].append(0)
+                    current_atom_i[b]  = len(atoms[b]) - 1
+                    edges_remaining[b] = current_atom_i[b]
 
-        # ---- Build RDKit molecule ----
+                else:
+                    # ---- EDGE TOKEN ----
+                    logits = edge_logits_all[b].clone()
+                    if valency_mask:
+                        ci = current_atom_i[b]
+                        tj = ci - edges_remaining[b]
+                        for b_type in range(1, self.edge_vocab):
+                            order = _BOND_ORDER.get(b_type, 1)
+                            if (val_used[b][ci] + order > atoms[b][ci][2] or
+                                    val_used[b][tj] + order > atoms[b][tj][2]):
+                                logits[b_type] = float('-inf')
+                    token = int(torch.multinomial(F.softmax(logits, dim=-1), 1).item())
+                    seq_tokens[b].append(token)
+                    seq_types[b].append(2)
+                    if token > 0:
+                        ci = current_atom_i[b]
+                        tj = ci - edges_remaining[b]
+                        order = _BOND_ORDER.get(token, 1)
+                        val_used[b][ci] += order
+                        val_used[b][tj] += order
+                        bonds[b][(ci, tj)] = _get_rdkit_bond(token)
+                    edges_remaining[b] -= 1
+
+        return [self._build_mol(atoms[b], bonds[b]) for b in range(B)]
+
+    def _build_mol(self, atoms: list, bonds: dict):
+        """Build and sanitize an RDKit molecule from decoded atoms and bonds."""
         if not atoms:
             return None
-
         mol = Chem.RWMol()
         for atomic_num, fc, _ in atoms:
             at = Chem.Atom(atomic_num)
             if fc != 0:
                 at.SetFormalCharge(fc)
             mol.AddAtom(at)
-
         for (i, j), bond_type in bonds.items():
             if not mol.GetBondBetweenAtoms(i, j):
                 mol.AddBond(i, j, bond_type)
-
         try:
             result = Chem.SanitizeMol(mol, catchErrors=True)
             if result != Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
