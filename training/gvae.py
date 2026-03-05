@@ -69,6 +69,11 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         total_prop_gnorm += prop_gnorm
         n_batches += 1
 
+        prop_param_ids = ({id(p) for p in model.prop_head.parameters()}
+                         if mc.prop_pred and getattr(model, 'prop_head', None) else set())
+        main_params = [p for p in model.parameters() if id(p) not in prop_param_ids]
+        torch.nn.utils.clip_grad_norm_(main_params, 5.0)
+
         optimizer.step()
         global_step += 1
 

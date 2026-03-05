@@ -350,7 +350,12 @@ class ARDecoder(nn.Module):
                    + e_w * self.edge_emb(edge_idx)
                    + self.type_emb(input_types))                        # (B, L-1, d)
 
-        z_emb = self.z_proj(z).unsqueeze(1) + self.type_emb.weight[0]
+        z_vec = self.z_proj(z)                                         # (B, d_model)
+        z_emb = z_vec.unsqueeze(1) + self.type_emb.weight[0]
+
+        # Inject z as a residual at every token position so the decoder
+        # cannot ignore z (prevents posterior collapse / latent variable dropout).
+        tok_emb = tok_emb + z_vec.unsqueeze(1)
 
         full = torch.cat([z_emb, tok_emb], dim=1)                      # (B, L, d)
         full = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
@@ -360,12 +365,21 @@ class ARDecoder(nn.Module):
     # Training forward (teacher-forced, fully parallel)
     # ------------------------------------------------------------------
 
-    def forward(self, z, input_tokens, target_tokens, target_types, seq_lens):
+    def forward(self, z, input_tokens, target_tokens, target_types, seq_lens,
+                context_dropout: float = 0.0):
         max_L  = target_tokens.size(1)
         device = z.device
 
         input_types = target_types[:, :max_L - 1]
-        full_emb    = self._embed(z, input_tokens, input_types)
+
+        # Context dropout: randomly replace a fraction of input tokens with 0
+        # (the padding/mask index).  This prevents the decoder from relying
+        # purely on sequential context and forces it to use z.
+        inp = input_tokens
+        if context_dropout > 0.0 and self.training:
+            drop_mask = torch.rand_like(inp, dtype=torch.float) < context_dropout
+            inp = inp.masked_fill(drop_mask, 0)
+        full_emb    = self._embed(z, inp, input_types)
 
         # No key-padding mask needed: padding always appears after EOS so the
         # causal mask already prevents real tokens from attending to pad positions.
@@ -483,7 +497,8 @@ class ARDecoder(nn.Module):
         V_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
 
         # ── Position 0: z prefix ──────────────────────────────────────────
-        z_emb  = (self.z_proj(z).unsqueeze(1)
+        z_vec  = self.z_proj(z)                                        # (B, d_model)
+        z_emb  = (z_vec.unsqueeze(1)
                   + self.type_emb(torch.zeros(B, 1, dtype=torch.long, device=device))
                   + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device)))
         last_h = self.transformer.step(z_emb, K_bufs, V_bufs, t=0)  # (B, d)
@@ -579,6 +594,7 @@ class ARDecoder(nn.Module):
                 + e_w * self.edge_emb(tok_safe.clamp(0, self.edge_vocab - 1))
                 + self.type_emb(type_safe)
                 + self.pos_emb(torch.full((B,), pos, dtype=torch.long, device=device))
+                + z_vec  # residual z injection — mirrors training path
             ).unsqueeze(1)
             last_h = self.transformer.step(tok_emb, K_bufs, V_bufs, t=pos)
 
@@ -639,13 +655,15 @@ class GraphVAEAR(nn.Module):
                  ar_d_model: int = 256, ar_n_heads: int = 8,
                  ar_n_layers: int = 4, ar_d_ff: int = 512,
                  ar_dropout: float = 0.1,
-                 prop_pred: bool = False):
+                 prop_pred: bool = False,
+                 context_dropout: float = 0.0):
         super().__init__()
 
         self.max_atoms         = max_atoms
         self.latent_dim        = latent_dim
         self.num_node_features = num_node_features
         self.num_edge_features = num_edge_features
+        self.context_dropout   = context_dropout
 
         # ---- Encoder ----
         self.encoder = GINEConvEncoder(num_node_features, num_edge_features,
@@ -691,7 +709,8 @@ class GraphVAEAR(nn.Module):
         """
         mu, logvar = self.encode(x, edge_index, edge_attr, batch)
         z = self.reparameterize(mu, logvar)
-        recon_loss = self.decoder(z, input_tokens, target_tokens, target_types, seq_lens)
+        recon_loss = self.decoder(z, input_tokens, target_tokens, target_types, seq_lens,
+                                  context_dropout=self.context_dropout)
         return recon_loss, mu, logvar
 
     def sample_smiles(self, z, atom_decoder_dict=None, charge_decoder=None,
@@ -744,13 +763,15 @@ class GraphVAEARNF(nn.Module):
                  ar_d_model: int = 256, ar_n_heads: int = 8,
                  ar_n_layers: int = 4, ar_d_ff: int = 512,
                  ar_dropout: float = 0.1,
-                 prop_pred: bool = False):
+                 prop_pred: bool = False,
+                 context_dropout: float = 0.0):
         super().__init__()
 
         self.max_atoms        = max_atoms
         self.latent_dim        = latent_dim
         self.num_node_features = num_node_features
         self.num_edge_features = num_edge_features
+        self.context_dropout   = context_dropout
 
         # ---- Encoder ----
         self.encoder = GINEConvEncoder(num_node_features, num_edge_features,
@@ -805,7 +826,8 @@ class GraphVAEARNF(nn.Module):
         mu, logvar = self.encode(x, edge_index, edge_attr, batch)
         z0 = self.reparameterize(mu, logvar)
         zK, sum_log_det = self.flow(z0)
-        recon_loss = self.decoder(zK, input_tokens, target_tokens, target_types, seq_lens)
+        recon_loss = self.decoder(zK, input_tokens, target_tokens, target_types, seq_lens,
+                                  context_dropout=self.context_dropout)
         return recon_loss, mu, logvar, z0, zK, sum_log_det
 
     def sample_smiles(self, z, atom_decoder_dict=None, charge_decoder=None,

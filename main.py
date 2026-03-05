@@ -32,8 +32,9 @@ def parse_args() -> Config:
                         help='Attach a property prediction head (plogP, QED, SA) to GVAE/GVAE_NF')
     parser.add_argument('--prop_weight',        type=float, default=5.0,
                         help='γ: property loss weight at full scale (default 5.0)')
-    parser.add_argument('--prop_warmup_epochs', type=int,   default=8,
-                        help='Epochs before property loss starts ramping up (default 8)')
+    parser.add_argument('--prop_warmup_epochs', type=int,   default=None,
+                        help='Epochs before property loss starts ramping up '
+                             '(default: 8 for GVAE/NF, 0 for AR models)')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
     config.gvae.weight_decay = args.weight_decay
@@ -45,16 +46,21 @@ def parse_args() -> Config:
     if args.prop_pred:
         config.gvae.prop_pred          = True
         config.gvae.prop_weight        = args.prop_weight
-        config.gvae.prop_warmup_epochs = args.prop_warmup_epochs
         config.gvae_nf.prop_pred          = True
         config.gvae_nf.prop_weight        = args.prop_weight
-        config.gvae_nf.prop_warmup_epochs = args.prop_warmup_epochs
         config.gvae_ar.prop_pred          = True
         config.gvae_ar.prop_weight        = args.prop_weight
-        config.gvae_ar.prop_warmup_epochs = args.prop_warmup_epochs
         config.gvae_ar_nf.prop_pred          = True
         config.gvae_ar_nf.prop_weight        = args.prop_weight
-        config.gvae_ar_nf.prop_warmup_epochs = args.prop_warmup_epochs
+        # Only override per-model warmup defaults when user explicitly passes the flag.
+        # GVAE/NF default=8 (latent space forms well before prop gradients needed).
+        # AR models default=0 (context_dropout forces z to be useful from epoch 1,
+        # so property gradients should shape z while it forms).
+        if args.prop_warmup_epochs is not None:
+            config.gvae.prop_warmup_epochs        = args.prop_warmup_epochs
+            config.gvae_nf.prop_warmup_epochs     = args.prop_warmup_epochs
+            config.gvae_ar.prop_warmup_epochs     = args.prop_warmup_epochs
+            config.gvae_ar_nf.prop_warmup_epochs  = args.prop_warmup_epochs
     return config
 
 
@@ -127,6 +133,7 @@ def train(config: Config):
             ar_d_ff=config.gvae_ar.ar_d_ff,
             ar_dropout=config.gvae_ar.ar_dropout,
             prop_pred=config.gvae_ar.prop_pred,
+            context_dropout=config.gvae_ar.context_dropout,
         ).to(device)
     elif config.model == 'GVAE_AR_NF':
         model = GraphVAEARNF(
@@ -142,6 +149,7 @@ def train(config: Config):
             ar_d_ff=config.gvae_ar_nf.ar_d_ff,
             ar_dropout=config.gvae_ar_nf.ar_dropout,
             prop_pred=config.gvae_ar_nf.prop_pred,
+            context_dropout=config.gvae_ar_nf.context_dropout,
         ).to(device)
     else:
         model = FRATTVAE(
@@ -286,7 +294,7 @@ def train(config: Config):
                 break
 
     model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-    evaluate_model(model, config, device, metadata)
+    evaluate_model(model, config, device, metadata, val_loader=val_loader)
 
 def main():
     config = parse_args()

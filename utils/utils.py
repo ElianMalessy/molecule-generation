@@ -111,7 +111,9 @@ class GVAEARConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 5.0
-    prop_warmup_epochs: int = 8      # epoch 8→13 ramp; at ep13 KL≈5.6 nats (~3 spare)
+    prop_warmup_epochs: int = 0      # no warmup — context_dropout forces z to be useful from
+                                     # epoch 1, so property gradients can shape z as it forms
+    context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
 
 
 @dataclass
@@ -141,7 +143,9 @@ class GVAEARNFConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 5.0
-    prop_warmup_epochs: int = 8      # epoch 8→13 ramp; at ep13 KL≈6.4 nats (~5 spare)
+    prop_warmup_epochs: int = 0      # no warmup — context_dropout forces z to be useful from
+                                     # epoch 1, so property gradients can shape z as it forms
+    context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
 
 
 @dataclass

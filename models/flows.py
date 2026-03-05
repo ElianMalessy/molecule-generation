@@ -45,6 +45,7 @@ class IAFStep(nn.Module):
 
     def forward(self, z):
         m, s = self.made(z)
+        s = s.clamp(-5.0, 5.0)  # prevent log_det collapse / explosion
         gate = torch.sigmoid(s)
         z_new = gate * z + (1.0 - gate) * m
         log_det = torch.log(gate + 1e-8).sum(dim=-1)
