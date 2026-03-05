@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from models.gvae import GraphVAENF, gvae_loss, gvae_nf_loss, gvae_prepare_batch
 from utils.utils import Config, kl_capacity
-from utils.properties import prop_gamma, normalise_props
+from utils.properties import normalise_props
 
 
 def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
@@ -23,7 +23,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
     n_batches = 0
     use_nf = isinstance(model, GraphVAENF)
     mc     = config.gvae_nf if use_nf else config.gvae
-    gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
+    gamma  = mc.prop_weight
     desc   = "Train GVAE-NF" if use_nf else "Train GVAE"
 
     for data in tqdm(loader, desc=desc, leave=False):
@@ -96,7 +96,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAENF)
     mc     = config.gvae_nf if use_nf else config.gvae
-    gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
+    gamma  = mc.prop_weight
     desc   = "Val GVAE-NF" if use_nf else "Val GVAE"
 
     for data in tqdm(loader, desc=desc, leave=False):

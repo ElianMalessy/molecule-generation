@@ -170,29 +170,3 @@ def normalise_props(props: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) 
 def denormalise_props(props_z: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     """Inverse Z-score transform."""
     return props_z * std.to(props_z.device) + mean.to(props_z.device)
-
-
-# ---------------------------------------------------------------------------
-# γ schedule: delayed ramp for property loss weight
-# ---------------------------------------------------------------------------
-
-def prop_gamma(epoch: int, warmup_epochs: int, gamma_max: float,
-               ramp_epochs: int = 5) -> float:
-    """
-    Property loss weight schedule:
-      - 0 for the first `warmup_epochs` epochs (let the VAE learn topology first)
-      - linearly ramps from 0 → gamma_max over the next `ramp_epochs` epochs
-      - holds at gamma_max thereafter
-
-    Args:
-        epoch:         Current (1-based) epoch number.
-        warmup_epochs: Number of epochs with γ = 0.
-        gamma_max:     Final weight value.
-        ramp_epochs:   Number of epochs for the linear ramp (default 5).
-    """
-    if epoch <= warmup_epochs:
-        return 0.0
-    if ramp_epochs <= 0:
-        return gamma_max
-    frac = min(1.0, (epoch - warmup_epochs) / ramp_epochs)
-    return frac * gamma_max

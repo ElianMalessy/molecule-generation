@@ -286,14 +286,20 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
     Reconstruction accuracy on the validation set.
 
     For each model: encode validation molecules to μ (no noise), decode back,
-    then compare canonical SMILES to the original.
+    then compare non-isomeric canonical SMILES to the original.
 
-    GVAE / GVAE_NF   — flat MLP decode from μ.  References from get_smiles_list,
-                       index-aligned with the val loader (shuffle=False).
-    GVAE_AR / NF     — autoregressive decode from μ.  Same alignment.
-    FRATTVAE         — sequential_decode from μ (reparameterize returns μ in eval mode).
-                       References from metadata['val_smiles'] (stored during preprocessing).
-                       Returns None when the metadata key is absent (old cache).
+    GVAE / GVAE_NF / GVAE_AR / GVAE_AR_NF
+        Ground-truth SMILES come from batch.smiles (stored in each PyG Data
+        object at dataset-construction time).  This is the only reliable
+        approach: an external list indexed by n_total would break for MOSES
+        (max_atoms filtering drops molecules → misalignment) and is fragile
+        for ZINC (PyG cache vs. smiles_*.txt may differ in ordering).
+        Comparison uses isomericSmiles=False because the graph VAE encodes
+        atom type and bond order but not chirality or double-bond geometry;
+        the decoder can never reproduce @/@@ or /\\ markers.
+    FRATTVAE
+        References from metadata['val_smiles'] (stored during preprocessing).
+        Returns None when the metadata key is absent (delete cache to regen).
     """
     model.eval()
 
@@ -304,8 +310,6 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                         'GVAE_AR_NF': config.gvae_ar_nf}[config.model]
         atom_decoder = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
         charge_dec   = None if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
-        val_split    = 'test' if config.dataset == 'MOSES' else 'val'
-        ref_smiles   = get_smiles_list(config.dataset, val_split)
 
         n_correct = 0
         n_total   = 0
@@ -317,22 +321,34 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                 x_in, edge_index, edge_attr, batch_idx, _, _ = gvae_prepare_batch(
                     batch, device, gc.max_atoms)
                 mu, _logvar = model.encode(x_in, edge_index, edge_attr, batch_idx)
-                # For AR models use T=0.0 (clamped to 1e-6 inside the sampler = argmax)
-                # so exact reconstruction can be measured. Flat decoders use argmax internally.
+                # T=0.0 → greedy argmax for AR models (see _sample_batch).
+                # Flat decoders ignore temperature; argmax is always used.
                 recon_T = 0.0 if config.model in ('GVAE_AR', 'GVAE_AR_NF') else 1.0
                 decoded = model.sample_smiles(mu, atom_decoder, charge_dec,
                                               valency_mask=gc.valency_mask,
                                               temperature=recon_T)
-                batch_size  = mu.size(0)
-                refs        = ref_smiles[n_total: n_total + batch_size]
 
-                for pred, ref in zip(decoded, refs):
+                # Ground-truth SMILES travel with the batch (batch.smiles is a list[str]
+                # set at dataset construction time, same molecules the encoder just saw).
+                # This avoids any index-alignment assumption between the DataLoader and
+                # an external SMILES list (which breaks for MOSES where max_atoms
+                # filtering drops molecules, and is fragile for ZINC if the smiles
+                # cache and PyG cache were built from different sources).
+                ref_smiles_batch = batch.smiles  # list[str], len == batch.num_graphs
+
+                for pred, ref in zip(decoded, ref_smiles_batch):
                     ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None
                     pred_mol = Chem.MolFromSmiles(pred) if pred else None
                     if ref_mol and pred_mol:
-                        if Chem.MolToSmiles(ref_mol) == Chem.MolToSmiles(pred_mol):
+                        # Strip isomeric / stereo markers: the graph VAE encodes atom
+                        # type and bond order but not chirality or double-bond geometry,
+                        # so the decoder can never reproduce @/@@ or /\ markers.
+                        # Comparing non-isomeric SMILES gives a fair structural match.
+                        ref_smi  = Chem.MolToSmiles(ref_mol,  isomericSmiles=False)
+                        pred_smi = Chem.MolToSmiles(pred_mol, isomericSmiles=False)
+                        if ref_smi == pred_smi:
                             n_correct += 1
-                n_total += batch_size
+                n_total += batch.num_graphs
                 if n_total >= n_recon:
                     break
         return n_correct / max(1, n_total)
@@ -530,8 +546,8 @@ def _parse_args():
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--checkpoint', type=str, default=None,
                        help='Path to a specific best.pth to evaluate')
-    group.add_argument('--all', action='store_true', default=True,
-                       help='Evaluate all checkpoints found under checkpoints/ (default)')
+    group.add_argument('--all', action='store_true', default=False,
+                       help='Evaluate all checkpoints found under checkpoints/')
     parser.add_argument('--model',   type=str, choices=['GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF', 'FRATTVAE'], default=None,
                         help='Filter to a specific model (used with --all)')
     parser.add_argument('--dataset', type=str, choices=['ZINC', 'MOSES'],    default=None,

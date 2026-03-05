@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from models.gvae_ar import GraphVAEARNF, gvae_ar_loss, gvae_ar_nf_loss
 from utils.utils import Config, kl_capacity
-from utils.properties import prop_gamma, normalise_props
+from utils.properties import normalise_props
 
 
 def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: int,
@@ -27,7 +27,7 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
     n_batches = 0
     use_nf = isinstance(model, GraphVAEARNF)
     mc     = config.gvae_ar_nf if use_nf else config.gvae_ar
-    gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
+    gamma  = mc.prop_weight
     desc   = "Train GVAE_AR_NF" if use_nf else "Train GVAE_AR"
 
     for batch_data in tqdm(loader, desc=desc, leave=False):
@@ -111,7 +111,7 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAEARNF)
     mc     = config.gvae_ar_nf if use_nf else config.gvae_ar
-    gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
+    gamma  = mc.prop_weight
     desc   = "Val GVAE_AR_NF" if use_nf else "Val GVAE_AR"
 
     for batch_data in tqdm(loader, desc=desc, leave=False):

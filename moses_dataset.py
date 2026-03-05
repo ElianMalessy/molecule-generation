@@ -67,6 +67,7 @@ class MosesPyGDataset(InMemoryDataset):
             edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous() if edge_indices else torch.empty((2, 0), dtype=torch.long)
             edge_attr = torch.tensor(edge_attrs, dtype=torch.long) if edge_attrs else torch.empty((0, 1), dtype=torch.long)
                 
-            data_list.append(Data(x=x, edge_index=edge_index, edge_attr=edge_attr))
+            data_list.append(Data(x=x, edge_index=edge_index, edge_attr=edge_attr,
+                                  smiles=Chem.MolToSmiles(mol, isomericSmiles=False)))
             
         self.save(data_list, self.processed_paths[0])

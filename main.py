@@ -8,7 +8,6 @@ from models.gvae import GraphVAE, GraphVAENF
 from models.gvae_ar import GraphVAEAR, GraphVAEARNF
 from models.frattvae import FRATTVAE
 from utils.utils import Config, get_dataloaders, set_seed
-from utils.properties import prop_gamma
 from training import (train_epoch_gvae, val_epoch_gvae,
                       train_epoch_gvae_ar, val_epoch_gvae_ar,
                       train_epoch_frattvae, val_epoch_frattvae)
@@ -28,14 +27,9 @@ def parse_args() -> Config:
     parser.add_argument('--valency_mask', action='store_true',
                         help='Enable valency masking during GVAE decoding')
     # Joint property prediction
-    parser.add_argument('--prop_pred',          action='store_true',
+    parser.add_argument('--prop_pred', action='store_true',
                         help='Attach a property prediction head (plogP, QED, SA) to GVAE/GVAE_NF')
-    parser.add_argument('--prop_weight',        type=float, default=None,
-                        help='γ: property loss weight at full scale '
-                             '(default: 5.0 for GVAE/NF, 1.0 for AR models)')
-    parser.add_argument('--prop_warmup_epochs', type=int,   default=None,
-                        help='Epochs before property loss starts ramping up '
-                             '(default: 8 for GVAE/NF, 0 for AR models)')
+    parser.add_argument('--prop_weight', type=float, default=None, help='property loss weight')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
     config.gvae.weight_decay = args.weight_decay
@@ -49,24 +43,13 @@ def parse_args() -> Config:
         config.gvae_nf.prop_pred          = True
         config.gvae_ar.prop_pred          = True
         config.gvae_ar_nf.prop_pred          = True
-        # Only override per-model weight/warmup defaults when user explicitly passes the flag.
-        # All models default to warmup=0: prop_gamma still ramps over 5 epochs from 0→max.
-        # GVAE/NF: prop_weight=5.0 (prop is ~0.4% of ~64 nats total loss at convergence)
-        # AR models: prop_weight=0.1 (proportional: same ~0.4% of ~0.086 nats backbone)
+        # Override per-model weight defaults only when the flag is explicitly passed.
+        # GVAE/NF: 5.0  |  GVAE_AR: 1.0  |  GVAE_AR_NF: 0.1
         if args.prop_weight is not None:
             config.gvae.prop_weight        = args.prop_weight
             config.gvae_nf.prop_weight     = args.prop_weight
             config.gvae_ar.prop_weight     = args.prop_weight
             config.gvae_ar_nf.prop_weight  = args.prop_weight
-        # Only override per-model warmup defaults when user explicitly passes the flag.
-        # GVAE/NF default=8 (latent space forms well before prop gradients needed).
-        # AR models default=0 (context_dropout forces z to be useful from epoch 1,
-        # so property gradients should shape z while it forms).
-        if args.prop_warmup_epochs is not None:
-            config.gvae.prop_warmup_epochs        = args.prop_warmup_epochs
-            config.gvae_nf.prop_warmup_epochs     = args.prop_warmup_epochs
-            config.gvae_ar.prop_warmup_epochs     = args.prop_warmup_epochs
-            config.gvae_ar_nf.prop_warmup_epochs  = args.prop_warmup_epochs
     return config
 
 
@@ -207,9 +190,7 @@ def train(config: Config):
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
         logger.info(f"Valency masking: {'ON' if mc.valency_mask else 'OFF'}")
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF') and mc.prop_pred:
-        logger.info(f"Joint property prediction: γ={mc.prop_weight}, "
-                    f"warmup={mc.prop_warmup_epochs} epochs, "
-                    f"ramp=5 epochs (plogP / QED / SA)")
+        logger.info(f"Joint property prediction: γ={mc.prop_weight} (constant, plogP / QED / SA)")
 
     global_step, best_val_loss, counter = 0, float('inf'), 0
 
@@ -223,12 +204,8 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            # ckpt_loss always includes prop at full γ so the checkpoint metric
-            # is consistent from epoch 1 — prevents saving a warmup-era checkpoint
-            # that looks optimal only because prop loss hasn't been added yet.
-            gamma_now = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
-            ckpt_loss = (val_l + (mc.prop_weight - gamma_now) * val_raw_prop
-                         if mc.prop_pred else val_l)
+            # ckpt_loss includes prop (gamma is constant, already baked into val_l)
+            ckpt_loss = val_l
             train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}  grad={train_prop_gnorm:.2e}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
@@ -248,12 +225,8 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            # ckpt_loss always includes prop at full γ so the checkpoint metric
-            # is consistent from epoch 1 — prevents saving a warmup-era checkpoint
-            # that looks optimal only because prop loss hasn't been added yet.
-            gamma_now = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
-            ckpt_loss = (val_l + (mc.prop_weight - gamma_now) * val_raw_prop
-                         if mc.prop_pred else val_l)
+            # ckpt_loss includes prop (gamma is constant, already baked into val_l)
+            ckpt_loss = val_l
             train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}  grad={train_prop_gnorm:.2e}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"

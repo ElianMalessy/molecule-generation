@@ -54,9 +54,7 @@ class GVAEConfig:
     valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
-    prop_weight: float = 5.0         # γ: property loss weight at full scale
-    prop_warmup_epochs: int = 0      # no warmup needed: prop is ~0.4% of GVAE total loss
-                                     # even at epoch 1, so early gradients don't dominate
+    prop_weight: float = 1.0         # γ: property loss weight (constant)
 
 
 @dataclass
@@ -82,8 +80,7 @@ class GVAENFConfig:
     valency_mask: bool = False
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 5.0
-    prop_warmup_epochs: int = 0      # same as GVAEConfig: prop is <0.4% of total loss
+    prop_weight: float = 0.1         # γ: property loss weight (constant)
 
 
 @dataclass
@@ -111,12 +108,13 @@ class GVAEARConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.1         # proportional to GVAE: GVAE prop≈0.4% of total loss
-                                     # at convergence (5.0×0.05/64.5). AR backbone≈0.086
-                                     # nats → same fraction ⇒ prop_weight≈0.017; round to
-                                     # 0.1 (Occam's razor; gives ~1.6% at convergence).
-    prop_warmup_epochs: int = 0      # no warmup: gamma ramps 0→0.1 over 5 epochs anyway;
-                                     # context_dropout forces z to be useful from epoch 1
+    prop_weight: float = 1.0         # γ: property loss weight (constant).
+                                     # GVAE_AR collapses to the free_bits floor (KL=2.56)
+                                     # by epoch 2; the IAF in GVAE_AR_NF prevents this by
+                                     # keeping effective KL ~5.3 nats. Without the flow,
+                                     # weight=0.1 is too weak to force the encoder to encode
+                                     # property info before collapse. 1.0 provides enough
+                                     # gradient to prevent the collapse.
     context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
 
 
@@ -146,9 +144,9 @@ class GVAEARNFConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.1         # same reasoning as GVAEARConfig
-    prop_warmup_epochs: int = 0      # no warmup: gamma ramps 0→0.1 over 5 epochs anyway;
-                                     # context_dropout forces z to be useful from epoch 1
+    prop_weight: float = 0.1         # γ: property loss weight (constant).
+                                     # IAF keeps effective KL ~5.3 nats → encoder stays
+                                     # informative from epoch 1, so 0.1 is sufficient.
     context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
 
 
