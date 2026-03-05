@@ -26,32 +26,16 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def cyclical_beta(step: int, total_steps: int, beta_max: float,
-                  n_cycles: int = 4, ratio: float = 0.5) -> float:
-    """Cyclical β schedule (Fu et al., 2019).
-
-    Divides training into n_cycles equal windows. Within each window the first
-    `ratio` fraction linearly ramps β from 0 → beta_max; the remainder holds
-    β at beta_max. This forces the encoder to stay active across cycles.
-    """
-    cycle_len = max(total_steps / n_cycles, 1)
-    t = step % cycle_len
-    ramp_end = cycle_len * ratio
-    if t < ramp_end:
-        return beta_max * t / ramp_end
-    return beta_max
-
-
-def kl_capacity(step: int, capacity_max: float, capacity_steps: int) -> float:
-    """Linear ramp of KL capacity target from 0 → capacity_max over capacity_steps.
+def kl_capacity(step: int, capacity_max: float, anneal_steps: int) -> float:
+    """Linear ramp of KL capacity target from 0 → capacity_max over anneal_steps, then holds.
 
     The loss becomes kl_weight * |KL − C| so the model is penalised equally
     for being above OR below the target, preventing both collapse and
     over-regularisation early in training.
     """
-    if capacity_steps <= 0:
+    if anneal_steps <= 0:
         return capacity_max
-    return min(capacity_max * step / capacity_steps, capacity_max)
+    return min(capacity_max * step / anneal_steps, capacity_max)
 
 
 @dataclass
@@ -64,12 +48,9 @@ class GVAEConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.3
-    kl_anneal_steps: int = 100000    # total steps over which cycles run
-    kl_cycles: int = 4              # number of β cycles (Fu et al., 2019)
-    kl_anneal_ratio: float = 0.5    # fraction of each cycle spent ramping up
-    free_bits: float = 0.02         # min KL per latent dim (nats); 0.02×128=2.56 nats total
+    kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
+    free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
     kl_capacity_max: float = 25.0   # target KL ceiling (nats); ramps from 0
-    kl_capacity_steps: int = 150000 # steps to ramp capacity to max
     valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
@@ -92,11 +73,9 @@ class GVAENFConfig:
                                     # consistent. The IAF log-det already adds to
                                     # kl_flow, so 0.3 gives slightly more KL pressure
                                     # than GVAE — no need to raise the weight further.
-    kl_anneal_steps: int = 100000    # total steps over which cycles run
-    kl_cycles: int = 4
-    kl_anneal_ratio: float = 0.5
-    kl_capacity_max: float = 25.0   # NF: capacity only (no per-dim free bits)
-    kl_capacity_steps: int = 150000
+    kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
+    free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
+    kl_capacity_max: float = 25.0   # NF: same ceiling as GVAE (weak MLP decoder is the bottleneck)
     num_flows: int = 4               # number of IAF steps
     flow_hidden_dim: int = 256       # hidden dim of each MADE inside IAF
     valency_mask: bool = False
@@ -116,13 +95,10 @@ class GVAEARConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.05
-    kl_anneal_steps: int = 100000
-    kl_cycles: int = 4
-    kl_anneal_ratio: float = 0.5
-    free_bits: float = 0.02         # min KL per latent dim (nats); 0.02×128=2.56 nats total
-    kl_capacity_max: float = 20.0   # AR decoder is powerful; lower ceiling than GVAE
-    kl_capacity_steps: int = 150000
+    kl_weight: float = 1.0
+    kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
+    free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
+    kl_capacity_max: float = 25.0
     valency_mask: bool = False
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
@@ -146,12 +122,10 @@ class GVAEARNFConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.05
-    kl_anneal_steps: int = 100000
-    kl_cycles: int = 4
-    kl_anneal_ratio: float = 0.5
-    kl_capacity_max: float = 20.0   # NF: capacity only
-    kl_capacity_steps: int = 150000
+    kl_weight: float = 1.0
+    kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
+    free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
+    kl_capacity_max: float = 35.0   # NF can use a higher ceiling (flow adds expressivity)
     num_flows: int = 4
     flow_hidden_dim: int = 256
     valency_mask: bool = False
@@ -360,6 +334,9 @@ def get_dataloaders(config: Config, logger):
             'frag_ecfps':     train_data['frag_ecfps'],
             'ndummys':        train_data['ndummys'],
             'freq_label':     train_data['freq_label'],
+            # valid_smiles from the val split: aligned with val_loader (shuffle=False).
+            # None if the cache pre-dates this field (delete cache to regenerate).
+            'val_smiles':     val_data.get('valid_smiles'),
         }
         return train_loader, val_loader, metadata
 

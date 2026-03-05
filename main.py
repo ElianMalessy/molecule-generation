@@ -7,7 +7,7 @@ import argparse
 from models.gvae import GraphVAE, GraphVAENF
 from models.gvae_ar import GraphVAEAR, GraphVAEARNF
 from models.frattvae import FRATTVAE
-from utils.utils import Config, get_dataloaders, set_seed, cyclical_beta
+from utils.utils import Config, get_dataloaders, set_seed
 from training import (train_epoch_gvae, val_epoch_gvae,
                       train_epoch_gvae_ar, val_epoch_gvae_ar,
                       train_epoch_frattvae, val_epoch_frattvae)
@@ -31,8 +31,8 @@ def parse_args() -> Config:
                         help='Attach a property prediction head (plogP, QED, SA) to GVAE/GVAE_NF')
     parser.add_argument('--prop_weight',        type=float, default=1.0,
                         help='γ: property loss weight at full scale (default 1.0)')
-    parser.add_argument('--prop_warmup_epochs', type=int,   default=15,
-                        help='Epochs before property loss starts ramping up (default 15)')
+    parser.add_argument('--prop_warmup_epochs', type=int,   default=3,
+                        help='Epochs before property loss starts ramping up (default 3)')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
     config.gvae.weight_decay = args.weight_decay
@@ -87,19 +87,14 @@ def train(config: Config):
     steps_per_epoch = len(train_loader)
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
         mc = config.gvae if config.model == 'GVAE' else config.gvae_nf if config.model == 'GVAE_NF' else config.gvae_ar if config.model == 'GVAE_AR' else config.gvae_ar_nf
-        one_cycle_steps = mc.kl_anneal_steps / mc.kl_cycles
-        kl_anneal_epoch = -(-int(one_cycle_steps) // steps_per_epoch)
-        # Patience = 2 full cycles so the model must fail to improve across two
-        # complete β ramp-up/hold sequences before stopping.  One cycle is the
-        # minimum but can be unlucky; two gives the model a chance to recover
-        # across a full second annealing cycle.
-        mc.patience = 2 * kl_anneal_epoch
-        logger.info(f"Cyclical β: {mc.kl_cycles} cycles over {mc.kl_anneal_steps} steps "
-                    f"(1 cycle = {kl_anneal_epoch} epochs, ramp ratio = {mc.kl_anneal_ratio}, "
-                    f"patience = {mc.patience} epochs)")
+        kl_anneal_epoch = -(-mc.kl_anneal_steps // steps_per_epoch)  # ceil
+        fb_info  = (f", free_bits_per_dim={mc.free_bits_per_dim}"
+                    if getattr(mc, 'free_bits_per_dim', 0.0) > 0 else "")
+        logger.info(f"KL: β={mc.kl_weight} (constant), capacity 0→{mc.kl_capacity_max} "
+                    f"over {mc.kl_anneal_steps} steps ({kl_anneal_epoch} epochs)"
+                    f"{fb_info} | patience = {mc.patience} epochs after ramp")
     else:
         mc = config.frattvae
-        kl_anneal_epoch = 0  # not used for FRATTVAE
 
     if config.model == 'GVAE':
         model = GraphVAE(
@@ -184,7 +179,8 @@ def train(config: Config):
         logger.info(f"Valency masking: {'ON' if mc.valency_mask else 'OFF'}")
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF') and mc.prop_pred:
         logger.info(f"Joint property prediction: γ={mc.prop_weight}, "
-                    f"warmup={mc.prop_warmup_epochs} epochs (plogP / QED / SA)")
+                    f"warmup={mc.prop_warmup_epochs} epochs, "
+                    f"ramp=5 epochs (plogP / QED / SA)")
 
     global_step, best_val_loss, counter = 0, float('inf'), 0
 
@@ -244,30 +240,23 @@ def train(config: Config):
 
         scheduler.step()
 
-        # Only save checkpoints when β is at (or near) its maximum within the
-        # current cycle.  Saving at β≈0 (cycle reset) produces checkpoints with
-        # near-zero KL pressure — the posterior is poorly aligned with N(0,I),
-        # which tankes FCD even if total val_loss looks low.
+        # Only count patience and allow early stopping after KL annealing ends.
+        # During the ramp the model is still under-regularised and val_loss
+        # improvements are not meaningful for convergence decisions.
         if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
-            current_beta = cyclical_beta(global_step, mc.kl_anneal_steps,
-                                         mc.kl_weight, mc.kl_cycles, mc.kl_anneal_ratio)
-            beta_mature = current_beta >= mc.kl_weight * 0.9
+            annealing_done = global_step >= mc.kl_anneal_steps
         else:
-            beta_mature = True  # FRATTVAE has a fixed small kl_weight, no cycling
+            annealing_done = True
 
-        if beta_mature and ckpt_loss < best_val_loss:
+        if ckpt_loss < best_val_loss:
             best_val_loss = ckpt_loss
             counter = 0
             torch.save(model.state_dict(), checkpoint_path)
             logger.info("New best model saved.")
         else:
-            # Only count patience during beta-mature epochs: during the ramp-up
-            # phase the model cannot save regardless, so those epochs shouldn't
-            # consume patience budget.
-            if beta_mature or config.model == 'FRATTVAE':
+            if annealing_done:
                 counter += 1
-            early_stop_ok = (epoch > kl_anneal_epoch) if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF') else True
-            if early_stop_ok and counter >= mc.patience:
+            if annealing_done and counter >= mc.patience:
                 logger.info(f"Early stopping triggered at epoch {epoch}")
                 break
 

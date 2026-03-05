@@ -15,22 +15,24 @@ from models.frattvae.utils.mask import create_mask
 from utils.utils import Config, get_dataloaders, get_smiles_list
 from utils.constants import MOSES_ATOM_DECODER, ZINC_ATOM_DECODER, ZINC_CHARGE_DECODER
 
-from rdkit import RDLogger
+from rdkit import Chem, RDLogger
 RDLogger.DisableLog('rdApp.*')
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def evaluate_model(model, config: Config, device, metadata):
+def evaluate_model(model, config: Config, device, metadata, val_loader=None):
     """
     Run prior-sampling benchmarks for a trained model.
 
     Args:
-        model:    Trained GraphVAE, GraphVAENF, or FRATTVAE (already on `device`).
-        config:   Config object (model, dataset, latent dims, etc.).
-        device:   torch.device.
-        metadata: Dict returned by get_dataloaders.
+        model:      Trained GraphVAE, GraphVAENF, or FRATTVAE (already on `device`).
+        config:     Config object (model, dataset, latent dims, etc.).
+        device:     torch.device.
+        metadata:   Dict returned by get_dataloaders.
+        val_loader: Optional validation DataLoader used to compute reconstruction rate
+                    (only used for GVAE and GVAE_NF; ignored for AR/FRATTVAE).
     """
     model.eval()
 
@@ -38,6 +40,15 @@ def evaluate_model(model, config: Config, device, metadata):
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
         atom_decoder   = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
         charge_decoder = None               if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
+
+    # ------------------------------------------------------------------
+    # Reconstruction rate (encode val set → decode from μ → compare)
+    # ------------------------------------------------------------------
+    recon_rate = None
+    if val_loader is not None:
+        recon_rate = _compute_recon_rate(model, val_loader, config, device, metadata)
+        if recon_rate is not None:
+            logger.info(f"Reconstruction rate (μ-decode on val set): {recon_rate:.4f}")
 
     # ------------------------------------------------------------------
     # Prior sampling + benchmark suite
@@ -121,9 +132,10 @@ def evaluate_model(model, config: Config, device, metadata):
         )
         # Pass the full generated list (including None/invalid) so the benchmarker
         # can compute validity metrics correctly.  Pre-filtering would inflate valid_fraction.
-        metrics = benchmarker.benchmark(generated_smiles)
-        _log_metrics_table(metrics, logger)
-        _save_metrics(metrics, config)
+        metrics    = benchmarker.benchmark(generated_smiles)
+        prop_stats = _compute_property_stats(valid_smiles)
+        _log_metrics_table(metrics, logger, recon_rate=recon_rate, prop_stats=prop_stats)
+        _save_metrics(metrics, config, recon_rate=recon_rate, prop_stats=prop_stats)
     except KeyboardInterrupt:
         logger.warning("Benchmarking interrupted by user.")
     except Exception as e:
@@ -148,28 +160,34 @@ def _run_key(config: Config) -> str:
     return '/'.join(parts[:2]) + ('+' + '+'.join(parts[2:]) if len(parts) > 2 else '')
 
 
-def _log_metrics_table(metrics: dict, log):
+def _log_metrics_table(metrics: dict, log,
+                       recon_rate=None, prop_stats: dict | None = None):
     """Pretty-print benchmark metrics as an aligned table."""
     v    = metrics.get('validity', {})
     fcd  = metrics.get('fcd', {})
     mos  = metrics.get('moses', {})
+    ps   = prop_stats or {}
 
     rows = [
         # (label, value, fmt)
-        ('Validity',               v.get('valid_fraction'),                        '.4f'),
-        ('Uniqueness',             v.get('unique_fraction_of_valids'),              '.4f'),
-        ('Novelty',                v.get('unique_and_novel_fraction_of_valids'),    '.4f'),
-        ('Valid & Unique',         v.get('valid_and_unique_fraction'),              '.4f'),
-        ('Valid & Unique & Novel', v.get('valid_and_unique_and_novel_fraction'),    '.4f'),
-        ('FCD',                    fcd.get('fcd'),                                  '.4f'),
-        ('FCD (normalised)',       fcd.get('fcd_normalized'),                       '.4f'),
-        ('KL score',               metrics.get('kl_score'),                         '.4f'),
-        ('MOSES filters pass',     mos.get('fraction_passing_moses_filters'),       '.4f'),
-        ('SNN',                    mos.get('snn_score'),                             '.4f'),
-        ('IntDiv',                 mos.get('IntDiv'),                                '.4f'),
-        ('IntDiv2',                mos.get('IntDiv2'),                               '.4f'),
-        ('Scaffold similarity',    mos.get('scaffolds_similarity'),                  '.4f'),
-        ('Fragment similarity',    mos.get('fragment_similarity'),                   '.4f'),
+        # ── Primary academic metrics ──────────────────────────────────
+        ('Recon',       recon_rate,                                         '.4f'),
+        ('Similar',     mos.get('snn_score'),                               '.4f'),
+        ('Valid',       v.get('valid_fraction'),                            '.4f'),
+        ('Unique',      v.get('unique_fraction_of_valids'),                 '.4f'),
+        ('Novelty',     v.get('unique_and_novel_fraction_of_valids'),       '.4f'),
+        ('FCD',         fcd.get('fcd'),                                     '.4f'),
+        ('KL-Div.',     metrics.get('kl_score'),                            '.4f'),
+        ('logP',        ps.get('logP'),                                     '.4f'),
+        ('QED',         ps.get('QED'),                                      '.4f'),
+        ('NP',          ps.get('NP'),                                       '.4f'),
+        ('SA',          ps.get('SA'),                                       '.4f'),
+        # ── Additional distribution / diversity metrics ───────────────
+        ('IntDiv',      mos.get('IntDiv'),                                  '.4f'),
+        ('IntDiv2',     mos.get('IntDiv2'),                                 '.4f'),
+        ('MOSES filt.', mos.get('fraction_passing_moses_filters'),          '.4f'),
+        ('Fragment sim.',mos.get('fragment_similarity'),                    '.4f'),
+        ('Scaffold sim.',mos.get('scaffolds_similarity'),                   '.4f'),
     ]
 
     col_w = max(len(r[0]) for r in rows)
@@ -186,7 +204,9 @@ def _log_metrics_table(metrics: dict, log):
     log.info(sep)
 
 
-def _save_metrics(metrics: dict, config: Config, scores_path: str = 'checkpoints/scores.json'):
+def _save_metrics(metrics: dict, config: Config,
+                  recon_rate=None, prop_stats: dict | None = None,
+                  scores_path: str = 'checkpoints/scores.json'):
     """Append / update results in a shared scores.json keyed by run identifier."""
     os.makedirs(os.path.dirname(scores_path), exist_ok=True)
 
@@ -197,32 +217,172 @@ def _save_metrics(metrics: dict, config: Config, scores_path: str = 'checkpoints
         scores = {}
 
     key = _run_key(config)
-
     v   = metrics.get('validity', {})
     fcd = metrics.get('fcd', {})
     mos = metrics.get('moses', {})
+    ps  = prop_stats or {}
 
     scores[key] = {
-        'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
-        'validity':              v.get('valid_fraction'),
-        'uniqueness':            v.get('unique_fraction_of_valids'),
-        'novelty':               v.get('unique_and_novel_fraction_of_valids'),
-        'valid_unique':          v.get('valid_and_unique_fraction'),
-        'valid_unique_novel':    v.get('valid_and_unique_and_novel_fraction'),
-        'fcd':                   fcd.get('fcd'),
-        'fcd_normalized':        fcd.get('fcd_normalized'),
-        'kl_score':              metrics.get('kl_score'),
-        'moses_filters':         mos.get('fraction_passing_moses_filters'),
-        'snn':                   mos.get('snn_score'),
-        'intdiv':                mos.get('IntDiv'),
-        'intdiv2':               mos.get('IntDiv2'),
-        'scaffold_sim':          mos.get('scaffolds_similarity'),
-        'fragment_sim':          mos.get('fragment_similarity'),
+        'timestamp':     datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+        # Primary metrics (table order)
+        'recon':         recon_rate,
+        'snn':           mos.get('snn_score'),
+        'validity':      v.get('valid_fraction'),
+        'uniqueness':    v.get('unique_fraction_of_valids'),
+        'novelty':       v.get('unique_and_novel_fraction_of_valids'),
+        'fcd':           fcd.get('fcd'),
+        'kl_score':      metrics.get('kl_score'),
+        'logP':          ps.get('logP'),
+        'QED':           ps.get('QED'),
+        'NP':            ps.get('NP'),
+        'SA':            ps.get('SA'),
+        # Distribution / diversity extras
+        'intdiv':        mos.get('IntDiv'),
+        'intdiv2':       mos.get('IntDiv2'),
+        'moses_filters': mos.get('fraction_passing_moses_filters'),
+        'fragment_sim':  mos.get('fragment_similarity'),
+        'scaffold_sim':  mos.get('scaffolds_similarity'),
     }
 
     with open(scores_path, 'w') as f:
         json.dump(scores, f, indent=2)
     logger.info(f"Scores saved → {scores_path}  (key: '{key}')")
+
+
+def _compute_property_stats(valid_smiles: list[str]) -> dict:
+    """
+    Compute mean molecular properties over the valid generated molecules.
+
+    Returns a dict with keys: logP, QED, SA, NP.
+    All are means over the valid generated set (comparable to reference
+    dataset means for a quick distribution sanity-check).
+    """
+    from rdkit.Chem import Descriptors
+    from rdkit.Chem import QED as rdkit_QED
+    from rdkit.Contrib.SA_Score import sascorer
+    from rdkit.Contrib.NP_Score import npscorer
+
+    np_model = npscorer.readNPModel()
+
+    logPs, qeds, sas, nps = [], [], [], []
+    for smi in valid_smiles:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        logPs.append(Descriptors.MolLogP(mol))
+        qeds.append(rdkit_QED.qed(mol))
+        sas.append(sascorer.calculateScore(mol))
+        nps.append(npscorer.scoreMol(mol, np_model))
+
+    def _mean(lst):
+        return float(sum(lst) / len(lst)) if lst else None
+
+    return {'logP': _mean(logPs), 'QED': _mean(qeds), 'SA': _mean(sas), 'NP': _mean(nps)}
+
+
+def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
+                        n_recon: int = 1000):
+    """
+    Reconstruction accuracy on the validation set.
+
+    For each model: encode validation molecules to μ (no noise), decode back,
+    then compare canonical SMILES to the original.
+
+    GVAE / GVAE_NF   — flat MLP decode from μ.  References from get_smiles_list,
+                       index-aligned with the val loader (shuffle=False).
+    GVAE_AR / NF     — autoregressive decode from μ.  Same alignment.
+    FRATTVAE         — sequential_decode from μ (reparameterize returns μ in eval mode).
+                       References from metadata['val_smiles'] (stored during preprocessing).
+                       Returns None when the metadata key is absent (old cache).
+    """
+    model.eval()
+
+    if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
+        gc           = {'GVAE':   config.gvae,
+                        'GVAE_NF': config.gvae_nf,
+                        'GVAE_AR': config.gvae_ar,
+                        'GVAE_AR_NF': config.gvae_ar_nf}[config.model]
+        atom_decoder = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
+        charge_dec   = None if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
+        val_split    = 'test' if config.dataset == 'MOSES' else 'val'
+        ref_smiles   = get_smiles_list(config.dataset, val_split)
+
+        n_correct = 0
+        n_total   = 0
+        with torch.no_grad():
+            for batch_raw in val_loader:
+                # AR loader yields (PyGBatch, input_tok, target_tok, types, lens);
+                # flat loaders yield the PyGBatch directly.
+                batch = batch_raw[0] if isinstance(batch_raw, (tuple, list)) else batch_raw
+                x_in, edge_index, edge_attr, batch_idx, _, _ = gvae_prepare_batch(
+                    batch, device, gc.max_atoms)
+                mu, _logvar = model.encode(x_in, edge_index, edge_attr, batch_idx)
+                decoded     = model.sample_smiles(mu, atom_decoder, charge_dec,
+                                                  valency_mask=gc.valency_mask)
+                batch_size  = mu.size(0)
+                refs        = ref_smiles[n_total: n_total + batch_size]
+
+                for pred, ref in zip(decoded, refs):
+                    ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None
+                    pred_mol = Chem.MolFromSmiles(pred) if pred else None
+                    if ref_mol and pred_mol:
+                        if Chem.MolToSmiles(ref_mol) == Chem.MolToSmiles(pred_mol):
+                            n_correct += 1
+                n_total += batch_size
+                if n_total >= n_recon:
+                    break
+        return n_correct / max(1, n_total)
+
+    elif config.model == 'FRATTVAE':
+        ref_smiles = metadata.get('val_smiles')
+        if not ref_smiles:
+            logger.warning(
+                "metadata['val_smiles'] not available — delete the FRATTVAE cache "
+                "and re-run to enable reconstruction evaluation."
+            )
+            return None
+
+        from models.frattvae.utils.mask import create_mask
+        frag_ecfps = metadata['frag_ecfps'].to(device)
+        ndummys    = metadata['ndummys'].to(device)
+        model.set_labels(metadata['uni_fragments'])
+
+        n_correct = 0
+        n_total   = 0
+        with torch.no_grad():
+            for frag_indices, positions, _ in val_loader:
+                B, L    = frag_indices.shape
+                fi      = frag_indices.to(device)
+                pos     = positions.to(device=device, dtype=torch.float32)
+                features = frag_ecfps[fi.flatten()].reshape(B, L, -1)
+
+                # Build encoder padding mask (identical to training)
+                idx_with_root = torch.cat([
+                    torch.full((B, 1), -1, device=device), fi
+                ], dim=1)
+                _, _, src_pad_mask, _ = create_mask(idx_with_root, idx_with_root, pad_idx=0)
+
+                # encode() uses μ in eval mode (reparameterize returns μ when not training)
+                z, _mu, _lv = model.encode(features, pos, src_pad_mask=src_pad_mask)
+                decoded = model.sequential_decode(
+                    z, frag_ecfps, ndummys,
+                    max_nfrags=config.frattvae.max_nfrags,
+                    asSmiles=True,
+                )
+                refs = ref_smiles[n_total: n_total + B]
+
+                for pred, ref in zip(decoded, refs):
+                    ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None
+                    pred_mol = Chem.MolFromSmiles(pred) if pred else None
+                    if ref_mol and pred_mol:
+                        if Chem.MolToSmiles(ref_mol) == Chem.MolToSmiles(pred_mol):
+                            n_correct += 1
+                n_total += B
+                if n_total >= n_recon:
+                    break
+        return n_correct / max(1, n_total)
+
+    return None
 
 
 def _build_model(config: Config, metadata, device):
@@ -358,7 +518,7 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
     model.load_state_dict(state)
     logger.info(f"Loaded weights from {checkpoint}")
 
-    evaluate_model(model, config, device, metadata)
+    evaluate_model(model, config, device, metadata, val_loader)
 
 
 def _parse_args():

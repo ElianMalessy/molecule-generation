@@ -96,12 +96,21 @@ def build_frattvae_dataset(
         # Migrate old float32 position caches to int8 to reduce RAM by 4x.
         # Positions are binary (0/1) so int8 is lossless.
         ds = result['dataset']
+        needs_resave = False
         if ds.positions and ds.positions[0].dtype != torch.int8:
             logger.info("Converting positions to int8 (one-time migration)...")
             ds.positions = [p.to(torch.int8) for p in ds.positions]
+            needs_resave = True
+        # Migrate old caches that pre-date valid_smiles tracking.
+        # Cannot recover the exact filtered list without re-running decomposition, so set None.
+        # The key will be populated on the next full cache rebuild.
+        if 'valid_smiles' not in result:
+            result['valid_smiles'] = None
+            needs_resave = True
+        if needs_resave:
             with open(cache_path, 'wb') as f:
                 pickle.dump(result, f)
-            logger.info("Cache updated with int8 positions.")
+            logger.info("Cache updated.")
         return result
 
     logger.info(f"Preprocessing {len(smiles_list)} molecules for FRATTVAE ({split_name})...")
@@ -170,12 +179,17 @@ def build_frattvae_dataset(
     prop = torch.zeros(len(frag_indices_list), 1)   # placeholder; no property prediction
     dataset = ListDataset(list(frag_indices_list), list(positions_list_i8), prop)
 
+    # Keep the filtered smiles aligned with the dataset so reconstruction evaluation
+    # can compare decoded outputs to the original molecules.
+    valid_filtered_smiles = [s for s, ok in zip(smiles_list, valid_mask) if ok]
+
     result = {
         'dataset': dataset,
         'uni_fragments': uni_fragments,
         'frag_ecfps': frag_ecfps,
         'ndummys': ndummys,
         'freq_label': freq_label,
+        'valid_smiles': valid_filtered_smiles,
     }
 
     with open(cache_path, 'wb') as f:
