@@ -425,29 +425,62 @@ class ARDecoder(nn.Module):
     @torch.no_grad()
     def _sample_batch(self, z: torch.Tensor, atom_decoder: dict, charge_decoder,
                       valency_mask: bool, temperature: float) -> list:
-        """KV-cached parallel AR sampling.
+        """KV-cached parallel AR sampling — fully vectorised per-step logic.
 
-        Attention cost per step is O(t) (one query against t cached keys),
-        giving O(L²) total vs O(L³) for the full-sequence-rerun approach.
-        KV projections are written into pre-allocated buffers in-place,
-        so there are no per-step tensor allocations.
+        The original per-molecule Python loop (O(B) Python iters per step) is
+        replaced by batched tensor operations — two multinomial calls and a
+        single (B, edge_vocab) broadcast for valency masking.  Python overhead
+        per step is now O(1) rather than O(B), giving a large speedup for the
+        ~300–700 sequential steps required per batch.
         """
         B        = z.size(0)
         device   = z.device
         T        = max(temperature, 1e-6)
         d        = self.d_model
         n_layers = len(self.transformer.layers)
+        M        = self.max_atoms
 
-        # Pre-allocate K/V buffers: one (B, max_tf_len, d) pair per layer.
+        # ── Precompute per-class lookup tables (CPU → device, done once) ──
+        # cls_idx = token − 1,  range [0, eos_id − 1]
+        n_cls = self.eos_id
+        anum_arr   = torch.zeros(n_cls, dtype=torch.long)
+        fc_arr     = torch.zeros(n_cls, dtype=torch.long)
+        maxval_arr = torch.zeros(n_cls, dtype=torch.long)
+        for cls_idx in range(n_cls):
+            an = atom_decoder.get(cls_idx, 6)
+            fc = charge_decoder.get(cls_idx, 0) if charge_decoder else 0
+            bv = _MAX_VALENCE.get(an, 4)
+            if fc > 0:    bv += 1
+            elif fc < 0:  bv = max(bv - 1, 0)
+            anum_arr[cls_idx]   = an
+            fc_arr[cls_idx]     = fc
+            maxval_arr[cls_idx] = bv
+        anum_lut   = anum_arr.to(device)     # (n_cls,)
+        fc_lut     = fc_arr.to(device)       # (n_cls,)
+        maxval_lut = maxval_arr.to(device)   # (n_cls,)
+
+        # bond_order_lut[bt] = valence units consumed by bond type bt
+        bo_arr = torch.ones(self.edge_vocab, dtype=torch.long)
+        for k, v in _BOND_ORDER.items():
+            if k < self.edge_vocab:
+                bo_arr[k] = v
+        bond_order_lut = bo_arr.to(device)   # (edge_vocab,)
+
+        # ── Per-molecule state tensors ─────────────────────────────────────
+        edges_remaining = torch.zeros(B, dtype=torch.long, device=device)
+        current_atom_i  = torch.zeros(B, dtype=torch.long, device=device)
+        n_atoms         = torch.zeros(B, dtype=torch.long, device=device)
+        finished        = torch.zeros(B, dtype=torch.bool, device=device)
+        val_used        = torch.zeros(B, M, dtype=torch.long, device=device)
+        base_val_t      = torch.zeros(B, M, dtype=torch.long, device=device)
+        atom_anum_t     = torch.zeros(B, M, dtype=torch.long, device=device)
+        atom_fc_t       = torch.zeros(B, M, dtype=torch.long, device=device)
+        bonds_t         = torch.zeros(B, M, M, dtype=torch.long, device=device)
+        bidx            = torch.arange(B, device=device)
+
+        # ── Pre-allocate K/V buffers ───────────────────────────────────────
         K_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
         V_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
-
-        atoms           = [[] for _ in range(B)]
-        val_used        = [[] for _ in range(B)]
-        bonds           = [{} for _ in range(B)]
-        edges_remaining = [0]     * B
-        current_atom_i  = [0]     * B
-        finished        = [False] * B
 
         # ── Position 0: z prefix ──────────────────────────────────────────
         z_emb  = (self.z_proj(z).unsqueeze(1)
@@ -456,84 +489,116 @@ class ARDecoder(nn.Module):
         last_h = self.transformer.step(z_emb, K_bufs, V_bufs, t=0)  # (B, d)
 
         for step in range(self.max_seq_len - 1):
-            if all(finished):
+            if finished.all():
                 break
 
             node_logits = self.node_head(last_h) / T   # (B, node_vocab)
             edge_logits = self.edge_head(last_h) / T   # (B, edge_vocab)
             node_logits[:, 0] = float('-inf')           # never predict padding index
 
+            active    = ~finished
+            edge_mode = active & (edges_remaining > 0)
+            node_mode = active & (edges_remaining == 0)
+
             new_toks  = torch.full((B,), self.eos_id, dtype=torch.long, device=device)
             new_types = torch.ones(B, dtype=torch.long, device=device)
 
-            for b in range(B):
-                if finished[b]:
-                    continue
+            # ── Edge sampling ────────────────────────────────────────────
+            if edge_mode.any():
+                el = edge_logits.clone()
+                if valency_mask:
+                    ci        = current_atom_i.clamp(0, M - 1)
+                    tj        = (current_atom_i - edges_remaining).clamp(0, M - 1)
+                    ci_used   = val_used.gather(1, ci.unsqueeze(1)).squeeze(1)    # (B,)
+                    ci_maxval = base_val_t.gather(1, ci.unsqueeze(1)).squeeze(1)  # (B,)
+                    tj_used   = val_used.gather(1, tj.unsqueeze(1)).squeeze(1)    # (B,)
+                    tj_maxval = base_val_t.gather(1, tj.unsqueeze(1)).squeeze(1)  # (B,)
+                    # Broadcast once: (B, 1) op (1, edge_vocab) → (B, edge_vocab)
+                    orders    = bond_order_lut.unsqueeze(0)                        # (1, V)
+                    ci_exceed = (ci_used.unsqueeze(1) + orders) > ci_maxval.unsqueeze(1)
+                    tj_exceed = (tj_used.unsqueeze(1) + orders) > tj_maxval.unsqueeze(1)
+                    invalid   = edge_mode.unsqueeze(1) & (ci_exceed | tj_exceed)  # (B, V)
+                    invalid[:, 0] = False   # no-bond (0) is always structurally valid
+                    el.masked_fill_(invalid, float('-inf'))
+                # Rows where every bond type is masked → force no-bond
+                all_inf      = ~el.isfinite().any(dim=-1)                         # (B,)
+                el_safe      = el.clone()
+                el_safe[all_inf & edge_mode, 0] = 0.0
+                probs_e      = F.softmax(el_safe, dim=-1).clamp(min=0)
+                sampled_e    = torch.multinomial(probs_e, 1).squeeze(1)
+                sampled_e    = torch.where(all_inf & edge_mode,
+                                           torch.zeros_like(sampled_e), sampled_e)
+                new_toks     = torch.where(edge_mode, sampled_e, new_toks)
+                new_types    = torch.where(edge_mode,
+                                           torch.full_like(new_types, 2), new_types)
 
-                if edges_remaining[b] == 0:
-                    token        = int(torch.multinomial(F.softmax(node_logits[b], dim=-1), 1).item())
-                    new_toks[b]  = token
-                    new_types[b] = 1
-                    if token == self.eos_id:
-                        finished[b] = True
-                    else:
-                        cls_idx    = token - 1
-                        atomic_num = atom_decoder.get(cls_idx, 6)
-                        fc         = charge_decoder.get(cls_idx, 0) if charge_decoder else 0
-                        base_val   = _MAX_VALENCE.get(atomic_num, 4)
-                        if fc > 0:   base_val += 1
-                        elif fc < 0: base_val = max(base_val - 1, 0)
-                        atoms[b].append((atomic_num, fc, base_val))
-                        val_used[b].append(0)
-                        current_atom_i[b]  = len(atoms[b]) - 1
-                        edges_remaining[b] = current_atom_i[b]
-                else:
-                    logits = edge_logits[b].clone()
-                    if valency_mask:
-                        ci = current_atom_i[b]
-                        tj = ci - edges_remaining[b]
-                        for bt in range(1, self.edge_vocab):
-                            order = _BOND_ORDER.get(bt, 1)
-                            if (val_used[b][ci] + order > atoms[b][ci][2] or
-                                    val_used[b][tj] + order > atoms[b][tj][2]):
-                                logits[bt] = float('-inf')
-                    token = (0 if not logits.isfinite().any()
-                             else int(torch.multinomial(F.softmax(logits, dim=-1), 1).item()))
-                    new_toks[b]  = token
-                    new_types[b] = 2
-                    if token > 0:
-                        ci = current_atom_i[b]; tj = ci - edges_remaining[b]
-                        order = _BOND_ORDER.get(token, 1)
-                        val_used[b][ci] += order; val_used[b][tj] += order
-                        bonds[b][(ci, tj)] = _get_rdkit_bond(token)
-                    edges_remaining[b] -= 1
+            # ── Node / EOS sampling ──────────────────────────────────────
+            if node_mode.any():
+                probs_n   = F.softmax(node_logits, dim=-1).clamp(min=0)
+                sampled_n = torch.multinomial(probs_n, 1).squeeze(1)
+                new_toks  = torch.where(node_mode, sampled_n, new_toks)
+                new_types = torch.where(node_mode, torch.ones_like(new_types), new_types)
 
-            # After the per-b sampling loop, before embedding:
-            if all(finished):
-                break
+            # ── State updates ────────────────────────────────────────────
+            just_finished = node_mode & (new_toks == self.eos_id)
+            finished      = finished | just_finished
 
-            # Mask out finished molecules: use a zero embedding so their
-            # KV writes are inert (they will never be queried again).
-            active = torch.tensor([not f for f in finished], device=device)  # (B,)
-            # Zero-out new_toks/new_types for finished molecules so their
-            # embeddings are zero — safe arbitrary value, never read again.
-            new_toks  = new_toks  * active
-            new_types = new_types * active
+            placed_atom = node_mode & ~just_finished
+            if placed_atom.any():
+                b_pa     = bidx[placed_atom]
+                na_safe  = n_atoms[placed_atom].clamp(0, M - 1)
+                cls_safe = (new_toks[placed_atom] - 1).clamp(0)
+                atom_anum_t[b_pa, na_safe] = anum_lut[cls_safe]
+                atom_fc_t  [b_pa, na_safe] = fc_lut  [cls_safe]
+                base_val_t [b_pa, na_safe] = maxval_lut[cls_safe]
+                n_atoms         = n_atoms + placed_atom.long()
+                current_atom_i  = torch.where(placed_atom, n_atoms - 1, current_atom_i)
+                edges_remaining = torch.where(placed_atom, n_atoms - 1, edges_remaining)
 
-            # Embed sampled tokens and advance the KV cache.
-            # pos = step + 1: valid range 1..max_seq_len ⊂ 0..max_tf_len-1.
-            pos = step + 1
-            n_w = (new_types == 1).to(dtype=z.dtype).unsqueeze(-1)  # (B, 1)
-            e_w = (new_types == 2).to(dtype=z.dtype).unsqueeze(-1)
+            placed_bond = edge_mode & (new_toks > 0)
+            if placed_bond.any():
+                b_pb  = bidx[placed_bond]
+                ci_pb = current_atom_i[placed_bond].clamp(0, M - 1)
+                tj_pb = (current_atom_i[placed_bond] - edges_remaining[placed_bond]).clamp(0, M - 1)
+                bonds_t[b_pb, ci_pb, tj_pb] = new_toks[placed_bond]
+                orders = bond_order_lut[new_toks[placed_bond]]
+                val_used[b_pb, ci_pb] += orders
+                val_used[b_pb, tj_pb] += orders
+
+            edges_remaining = torch.where(edge_mode, edges_remaining - 1, edges_remaining)
+
+            # ── KV cache advance ─────────────────────────────────────────
+            active_l  = (~finished).long()
+            tok_safe  = new_toks  * active_l
+            type_safe = new_types * active_l
+            n_w = (type_safe == 1).to(dtype=z.dtype).unsqueeze(-1)
+            e_w = (type_safe == 2).to(dtype=z.dtype).unsqueeze(-1)
+            pos     = step + 1
             tok_emb = (
-                n_w * self.node_emb(new_toks.clamp(0, self.node_vocab - 1))
-                + e_w * self.edge_emb(new_toks.clamp(0, self.edge_vocab - 1))
-                + self.type_emb(new_types)
+                n_w * self.node_emb(tok_safe.clamp(0, self.node_vocab - 1))
+                + e_w * self.edge_emb(tok_safe.clamp(0, self.edge_vocab - 1))
+                + self.type_emb(type_safe)
                 + self.pos_emb(torch.full((B,), pos, dtype=torch.long, device=device))
-            ).unsqueeze(1)                                           # (B, 1, d)
+            ).unsqueeze(1)
             last_h = self.transformer.step(tok_emb, K_bufs, V_bufs, t=pos)
 
-        return [self._build_mol(atoms[b], bonds[b]) for b in range(B)]
+        # ── Build RDKit molecules from tensor state (CPU) ─────────────────
+        n_atoms_list  = n_atoms.cpu().tolist()
+        anum_list     = atom_anum_t.cpu().tolist()
+        fc_list       = atom_fc_t.cpu().tolist()
+        bonds_list    = bonds_t.cpu().tolist()
+        results = []
+        for b in range(B):
+            na    = int(n_atoms_list[b])
+            atoms = [(int(anum_list[b][i]), int(fc_list[b][i]), None) for i in range(na)]
+            bonds = {}
+            for i in range(na):
+                for j in range(i):
+                    bt = int(bonds_list[b][i][j])
+                    if bt > 0:
+                        bonds[(i, j)] = _get_rdkit_bond(bt)
+            results.append(self._build_mol(atoms, bonds))
+        return results
 
     def _build_mol(self, atoms: list, bonds: dict):
         """Build and sanitize an RDKit molecule from decoded atoms and bonds."""
