@@ -30,10 +30,10 @@ def parse_args() -> Config:
     # Joint property prediction
     parser.add_argument('--prop_pred',          action='store_true',
                         help='Attach a property prediction head (plogP, QED, SA) to GVAE/GVAE_NF')
-    parser.add_argument('--prop_weight',        type=float, default=1.0,
-                        help='γ: property loss weight at full scale (default 1.0)')
-    parser.add_argument('--prop_warmup_epochs', type=int,   default=3,
-                        help='Epochs before property loss starts ramping up (default 3)')
+    parser.add_argument('--prop_weight',        type=float, default=5.0,
+                        help='γ: property loss weight at full scale (default 5.0)')
+    parser.add_argument('--prop_warmup_epochs', type=int,   default=8,
+                        help='Epochs before property loss starts ramping up (default 8)')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
     config.gvae.weight_decay = args.weight_decay
@@ -166,9 +166,22 @@ def train(config: Config):
         # Paper uses constant lr throughout — no scheduler
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
     else:
-        # All GVAE variants: AdamW + cosine schedule derived from mc
-        optimizer = torch.optim.AdamW(model.parameters(),
-                                      lr=mc.lr, weight_decay=mc.weight_decay,
+        # All GVAE variants: AdamW + cosine schedule.
+        # The prop head gets its own higher LR (3× backbone) to counteract the
+        # Adam second-moment asymmetry: the backbone's v_t is built up from strong
+        # reconstruction + KL gradients, so the prop-to-encoder signal (rank-3)
+        # is suppressed by sqrt(v_backbone) unless we raise its effective LR.
+        # A separate param group gives the head a fresh v_t and its own LR.
+        prop_params    = (list(model.prop_head.parameters())
+                          if mc.prop_pred and getattr(model, 'prop_head', None) is not None
+                          else [])
+        prop_param_ids = {id(p) for p in prop_params}
+        backbone_params = [p for p in model.parameters() if id(p) not in prop_param_ids]
+        param_groups = [{'params': backbone_params, 'lr': mc.lr}]
+        if prop_params:
+            param_groups.append({'params': prop_params, 'lr': mc.lr * 3})
+        optimizer = torch.optim.AdamW(param_groups,
+                                      weight_decay=mc.weight_decay,
                                       fused=device.type == 'cuda')
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=mc.epochs)
 

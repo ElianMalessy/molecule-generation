@@ -19,6 +19,8 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                      prop_mean=None, prop_std=None):
     model.train()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
+    total_prop_gnorm = 0.0
+    n_batches = 0
     use_nf = isinstance(model, GraphVAENF)
     mc     = config.gvae_nf if use_nf else config.gvae
     gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)

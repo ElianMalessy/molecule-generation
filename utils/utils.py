@@ -54,8 +54,8 @@ class GVAEConfig:
     valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
-    prop_weight: float = 1.0         # γ: property loss weight at full scale
-    prop_warmup_epochs: int = 3      # epochs before γ starts ramping up
+    prop_weight: float = 5.0         # γ: property loss weight at full scale
+    prop_warmup_epochs: int = 8      # epochs before γ starts ramping up
 
 
 @dataclass
@@ -81,8 +81,8 @@ class GVAENFConfig:
     valency_mask: bool = False
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 1.0
-    prop_warmup_epochs: int = 3
+    prop_weight: float = 5.0
+    prop_warmup_epochs: int = 8
 
 
 @dataclass
@@ -110,7 +110,7 @@ class GVAEARConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 1.0
+    prop_weight: float = 5.0
     prop_warmup_epochs: int = 8      # epoch 8→13 ramp; at ep13 KL≈5.6 nats (~3 spare)
 
 
@@ -140,7 +140,7 @@ class GVAEARNFConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 1.0
+    prop_weight: float = 5.0
     prop_warmup_epochs: int = 8      # epoch 8→13 ramp; at ep13 KL≈6.4 nats (~5 spare)
 
 
