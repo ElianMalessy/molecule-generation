@@ -223,7 +223,10 @@ class GraphVAE(nn.Module):
         return self.prop_head(mu)
 
     def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None,
-                      valency_mask=True):
+                      valency_mask=True, temperature=1.0):
+        # temperature is accepted for API compatibility with AR models but is
+        # unused — the flat MLP decoder always decodes via argmax (np.argmax
+        # in decode_to_smiles), so there is no stochasticity to control.
         node_logits, edge_logits = self.decode(z)
         node_np = node_logits.detach().cpu().float().numpy()
         edge_np = edge_logits.detach().cpu().float().numpy()
@@ -306,7 +309,10 @@ class GraphVAENF(nn.Module):
         return self.prop_head(mu)
 
     def sample_smiles(self, z, atom_decoder_dict={}, charge_decoder=None,
-                      valency_mask=True):
+                      valency_mask=True, temperature=1.0):
+        # temperature is accepted for API compatibility with AR models but is
+        # unused — the flat MLP decoder always decodes via argmax (np.argmax
+        # in decode_to_smiles), so there is no stochasticity to control.
         # z ~ N(0, I) is already zK — the prior is p(zK) = N(0, I).
         # Do NOT pass z through the flow; that maps N(0,I) → flow(N(0,I))
         # which is out-of-distribution for the decoder.

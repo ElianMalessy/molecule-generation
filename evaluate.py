@@ -317,8 +317,12 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                 x_in, edge_index, edge_attr, batch_idx, _, _ = gvae_prepare_batch(
                     batch, device, gc.max_atoms)
                 mu, _logvar = model.encode(x_in, edge_index, edge_attr, batch_idx)
-                decoded     = model.sample_smiles(mu, atom_decoder, charge_dec,
-                                                  valency_mask=gc.valency_mask)
+                # For AR models use T=0.0 (clamped to 1e-6 inside the sampler = argmax)
+                # so exact reconstruction can be measured. Flat decoders use argmax internally.
+                recon_T = 0.0 if config.model in ('GVAE_AR', 'GVAE_AR_NF') else 1.0
+                decoded = model.sample_smiles(mu, atom_decoder, charge_dec,
+                                              valency_mask=gc.valency_mask,
+                                              temperature=recon_T)
                 batch_size  = mu.size(0)
                 refs        = ref_smiles[n_total: n_total + batch_size]
 

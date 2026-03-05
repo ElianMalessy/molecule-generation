@@ -353,10 +353,6 @@ class ARDecoder(nn.Module):
         z_vec = self.z_proj(z)                                         # (B, d_model)
         z_emb = z_vec.unsqueeze(1) + self.type_emb.weight[0]
 
-        # Inject z as a residual at every token position so the decoder
-        # cannot ignore z (prevents posterior collapse / latent variable dropout).
-        tok_emb = tok_emb + z_vec.unsqueeze(1)
-
         full = torch.cat([z_emb, tok_emb], dim=1)                      # (B, L, d)
         full = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
         return full
@@ -449,7 +445,10 @@ class ARDecoder(nn.Module):
         """
         B        = z.size(0)
         device   = z.device
-        T        = max(temperature, 1e-6)
+        # temperature=0 (or very small) → use argmax (avoids softmax(logits/ε)
+        # overflow when ε→0 and logits are large).
+        greedy   = temperature <= 0.0
+        T        = 1.0 if greedy else temperature
         d        = self.d_model
         n_layers = len(self.transformer.layers)
         M        = self.max_atoms
@@ -539,8 +538,13 @@ class ARDecoder(nn.Module):
                 all_inf      = ~el.isfinite().any(dim=-1)                         # (B,)
                 el_safe      = el.clone()
                 el_safe[all_inf & edge_mode, 0] = 0.0
-                probs_e      = F.softmax(el_safe, dim=-1).clamp(min=0)
-                sampled_e    = torch.multinomial(probs_e, 1).squeeze(1)
+                # node_logits / edge_logits were already divided by T at the
+                # top of the loop, so just take argmax or softmax directly.
+                if greedy:
+                    sampled_e = el_safe.argmax(dim=-1)              # (B,) true argmax
+                else:
+                    probs_e   = F.softmax(el_safe, dim=-1).clamp(min=0)
+                    sampled_e = torch.multinomial(probs_e, 1).squeeze(1)
                 sampled_e    = torch.where(all_inf & edge_mode,
                                            torch.zeros_like(sampled_e), sampled_e)
                 new_toks     = torch.where(edge_mode, sampled_e, new_toks)
@@ -549,8 +553,11 @@ class ARDecoder(nn.Module):
 
             # ── Node / EOS sampling ──────────────────────────────────────
             if node_mode.any():
-                probs_n   = F.softmax(node_logits, dim=-1).clamp(min=0)
-                sampled_n = torch.multinomial(probs_n, 1).squeeze(1)
+                if greedy:
+                    sampled_n = node_logits.argmax(dim=-1)          # (B,) true argmax
+                else:
+                    probs_n   = F.softmax(node_logits, dim=-1).clamp(min=0)
+                    sampled_n = torch.multinomial(probs_n, 1).squeeze(1)
                 new_toks  = torch.where(node_mode, sampled_n, new_toks)
                 new_types = torch.where(node_mode, torch.ones_like(new_types), new_types)
 
@@ -594,7 +601,6 @@ class ARDecoder(nn.Module):
                 + e_w * self.edge_emb(tok_safe.clamp(0, self.edge_vocab - 1))
                 + self.type_emb(type_safe)
                 + self.pos_emb(torch.full((B,), pos, dtype=torch.long, device=device))
-                + z_vec  # residual z injection — mirrors training path
             ).unsqueeze(1)
             last_h = self.transformer.step(tok_emb, K_bufs, V_bufs, t=pos)
 

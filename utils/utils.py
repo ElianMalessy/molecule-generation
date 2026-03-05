@@ -55,7 +55,8 @@ class GVAEConfig:
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
     prop_weight: float = 5.0         # γ: property loss weight at full scale
-    prop_warmup_epochs: int = 8      # epochs before γ starts ramping up
+    prop_warmup_epochs: int = 0      # no warmup needed: prop is ~0.4% of GVAE total loss
+                                     # even at epoch 1, so early gradients don't dominate
 
 
 @dataclass
@@ -82,7 +83,7 @@ class GVAENFConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 5.0
-    prop_warmup_epochs: int = 8
+    prop_warmup_epochs: int = 0      # same as GVAEConfig: prop is <0.4% of total loss
 
 
 @dataclass
@@ -110,9 +111,12 @@ class GVAEARConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 5.0
-    prop_warmup_epochs: int = 0      # no warmup — context_dropout forces z to be useful from
-                                     # epoch 1, so property gradients can shape z as it forms
+    prop_weight: float = 0.1         # proportional to GVAE: GVAE prop≈0.4% of total loss
+                                     # at convergence (5.0×0.05/64.5). AR backbone≈0.086
+                                     # nats → same fraction ⇒ prop_weight≈0.017; round to
+                                     # 0.1 (Occam's razor; gives ~1.6% at convergence).
+    prop_warmup_epochs: int = 0      # no warmup: gamma ramps 0→0.1 over 5 epochs anyway;
+                                     # context_dropout forces z to be useful from epoch 1
     context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
 
 
@@ -142,9 +146,9 @@ class GVAEARNFConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 5.0
-    prop_warmup_epochs: int = 0      # no warmup — context_dropout forces z to be useful from
-                                     # epoch 1, so property gradients can shape z as it forms
+    prop_weight: float = 0.1         # same reasoning as GVAEARConfig
+    prop_warmup_epochs: int = 0      # no warmup: gamma ramps 0→0.1 over 5 epochs anyway;
+                                     # context_dropout forces z to be useful from epoch 1
     context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
 
 

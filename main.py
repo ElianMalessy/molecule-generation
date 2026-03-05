@@ -30,8 +30,9 @@ def parse_args() -> Config:
     # Joint property prediction
     parser.add_argument('--prop_pred',          action='store_true',
                         help='Attach a property prediction head (plogP, QED, SA) to GVAE/GVAE_NF')
-    parser.add_argument('--prop_weight',        type=float, default=5.0,
-                        help='γ: property loss weight at full scale (default 5.0)')
+    parser.add_argument('--prop_weight',        type=float, default=None,
+                        help='γ: property loss weight at full scale '
+                             '(default: 5.0 for GVAE/NF, 1.0 for AR models)')
     parser.add_argument('--prop_warmup_epochs', type=int,   default=None,
                         help='Epochs before property loss starts ramping up '
                              '(default: 8 for GVAE/NF, 0 for AR models)')
@@ -45,13 +46,18 @@ def parse_args() -> Config:
         config.gvae_ar_nf.valency_mask = True
     if args.prop_pred:
         config.gvae.prop_pred          = True
-        config.gvae.prop_weight        = args.prop_weight
         config.gvae_nf.prop_pred          = True
-        config.gvae_nf.prop_weight        = args.prop_weight
         config.gvae_ar.prop_pred          = True
-        config.gvae_ar.prop_weight        = args.prop_weight
         config.gvae_ar_nf.prop_pred          = True
-        config.gvae_ar_nf.prop_weight        = args.prop_weight
+        # Only override per-model weight/warmup defaults when user explicitly passes the flag.
+        # All models default to warmup=0: prop_gamma still ramps over 5 epochs from 0→max.
+        # GVAE/NF: prop_weight=5.0 (prop is ~0.4% of ~64 nats total loss at convergence)
+        # AR models: prop_weight=0.1 (proportional: same ~0.4% of ~0.086 nats backbone)
+        if args.prop_weight is not None:
+            config.gvae.prop_weight        = args.prop_weight
+            config.gvae_nf.prop_weight     = args.prop_weight
+            config.gvae_ar.prop_weight     = args.prop_weight
+            config.gvae_ar_nf.prop_weight  = args.prop_weight
         # Only override per-model warmup defaults when user explicitly passes the flag.
         # GVAE/NF default=8 (latent space forms well before prop gradients needed).
         # AR models default=0 (context_dropout forces z to be useful from epoch 1,
