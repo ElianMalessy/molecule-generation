@@ -57,6 +57,16 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                     loss = loss + gamma * raw_prop_loss
 
         loss.backward()
+
+        # Prop head gradient norm (0.0 during warmup when head not in loss)
+        prop_gnorm = 0.0
+        if mc.prop_pred and gamma > 0 and getattr(model, 'prop_head', None) is not None:
+            sq = [p.grad.detach().norm().item() ** 2
+                  for p in model.prop_head.parameters() if p.grad is not None]
+            prop_gnorm = sum(sq) ** 0.5 if sq else 0.0
+        total_prop_gnorm += prop_gnorm
+        n_batches += 1
+
         optimizer.step()
         global_step += 1
 
@@ -67,7 +77,9 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         total_raw_prop += raw_prop_loss.item()           * data.num_graphs
 
     n = len(loader.dataset)
-    return total_loss / n, total_recon / n, total_kl / n, total_prop / n, total_raw_prop / n, global_step
+    return (total_loss / n, total_recon / n, total_kl / n,
+            total_prop / n, total_raw_prop / n,
+            total_prop_gnorm / max(1, n_batches), global_step)
 
 
 @torch.no_grad()

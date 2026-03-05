@@ -96,9 +96,11 @@ class GVAEARConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 1.0
-    kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
+    kl_anneal_steps: int = 60_000    # same ramp rate as before (0.00025 nats/step); reaches
+                                     # C_max at ~35 epochs then holds — AR decoder needs less
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
-    kl_capacity_max: float = 25.0
+    kl_capacity_max: float = 15.0    # AR decoder reconstructs at ~3.5 nats; 15 nats gives
+                                     # ~11.5 spare for property-correlated encoding
     valency_mask: bool = False
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
@@ -109,7 +111,7 @@ class GVAEARConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 1.0
-    prop_warmup_epochs: int = 3
+    prop_warmup_epochs: int = 8      # epoch 8→13 ramp; at ep13 KL≈5.6 nats (~3 spare)
 
 
 @dataclass
@@ -123,9 +125,10 @@ class GVAEARNFConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 1.0
-    kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
+    kl_anneal_steps: int = 57_000    # same ramp rate as original (0.000351 nats/step); reaches
+                                     # C_max at ~33 epochs — NF improves posterior quality, not qty
     free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
-    kl_capacity_max: float = 35.0   # NF can use a higher ceiling (flow adds expressivity)
+    kl_capacity_max: float = 20.0    # NF: 20 nats sufficient; AR context handles local structure
     num_flows: int = 4
     flow_hidden_dim: int = 256
     valency_mask: bool = False
@@ -138,7 +141,7 @@ class GVAEARNFConfig:
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 1.0
-    prop_warmup_epochs: int = 3
+    prop_warmup_epochs: int = 8      # epoch 8→13 ramp; at ep13 KL≈6.4 nats (~5 spare)
 
 
 @dataclass

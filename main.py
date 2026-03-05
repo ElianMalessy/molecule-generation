@@ -168,7 +168,8 @@ def train(config: Config):
     else:
         # All GVAE variants: AdamW + cosine schedule derived from mc
         optimizer = torch.optim.AdamW(model.parameters(),
-                                      lr=mc.lr, weight_decay=mc.weight_decay)
+                                      lr=mc.lr, weight_decay=mc.weight_decay,
+                                      fused=device.type == 'cuda')
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=mc.epochs)
 
     frag_ecfps = metadata.get('frag_ecfps')
@@ -189,7 +190,7 @@ def train(config: Config):
     for epoch in range(1, mc.epochs + 1):
         ep_kw = dict(epoch=epoch, prop_mean=prop_mean, prop_std=prop_std)
         if config.model in ('GVAE', 'GVAE_NF'):
-            train_l, train_recon, train_kl, train_prop, train_raw_prop, global_step = train_epoch_gvae(
+            train_l, train_recon, train_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae(
@@ -201,7 +202,7 @@ def train(config: Config):
             gamma_now = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
             ckpt_loss = (val_l + (mc.prop_weight - gamma_now) * val_raw_prop
                          if mc.prop_pred else val_l)
-            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}  grad={train_prop_gnorm:.2e}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
                               if mc.prop_pred else "")
@@ -212,9 +213,9 @@ def train(config: Config):
             logger.info(
                 f"Epoch {epoch:03d} "
                 f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
-                f"{val_prop_str}")
+                f"{val_prop_str}  [ckpt={ckpt_loss:.4f}]")
         elif config.model in ('GVAE_AR', 'GVAE_AR_NF'):
-            train_l, train_recon, train_kl, train_prop, train_raw_prop, global_step = train_epoch_gvae_ar(
+            train_l, train_recon, train_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae_ar(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
@@ -226,7 +227,7 @@ def train(config: Config):
             gamma_now = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
             ckpt_loss = (val_l + (mc.prop_weight - gamma_now) * val_raw_prop
                          if mc.prop_pred else val_l)
-            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}  grad={train_prop_gnorm:.2e}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
                               if mc.prop_pred else "")
@@ -237,7 +238,7 @@ def train(config: Config):
             logger.info(
                 f"Epoch {epoch:03d} "
                 f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
-                f"{val_prop_str}")
+                f"{val_prop_str}  [ckpt={ckpt_loss:.4f}]")
         else:
             train_l, train_label, train_kl, global_step = train_epoch_frattvae(
                 model, optimizer, train_loader, config, global_step, device,
