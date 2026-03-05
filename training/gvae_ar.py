@@ -23,6 +23,8 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                         prop_mean=None, prop_std=None):
     model.train()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
+    total_prop_gnorm = 0.0
+    n_batches = 0
     use_nf = isinstance(model, GraphVAEARNF)
     mc     = config.gvae_ar_nf if use_nf else config.gvae_ar
     gamma  = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
