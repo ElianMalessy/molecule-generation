@@ -65,7 +65,17 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                     loss = loss + gamma * raw_prop_loss
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        # Clip encoder+decoder only.  The prop head has a tiny gradient norm relative
+        # to the AR Transformer decoder (many more tokens → much larger total norm).
+        # Clipping all parameters together scales prop head gradients to near-zero,
+        # preventing the property head from learning.  Clip just the main backbone.
+        prop_param_ids = (
+            {id(p) for p in model.prop_head.parameters()}
+            if (mc.prop_pred and getattr(model, 'prop_head', None) is not None)
+            else set()
+        )
+        main_params = [p for p in model.parameters() if id(p) not in prop_param_ids]
+        torch.nn.utils.clip_grad_norm_(main_params, 5.0)
         optimizer.step()
         global_step += 1
 

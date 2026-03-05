@@ -8,6 +8,7 @@ from models.gvae import GraphVAE, GraphVAENF
 from models.gvae_ar import GraphVAEAR, GraphVAEARNF
 from models.frattvae import FRATTVAE
 from utils.utils import Config, get_dataloaders, set_seed
+from utils.properties import prop_gamma
 from training import (train_epoch_gvae, val_epoch_gvae,
                       train_epoch_gvae_ar, val_epoch_gvae_ar,
                       train_epoch_frattvae, val_epoch_frattvae)
@@ -194,7 +195,12 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            ckpt_loss = val_l
+            # ckpt_loss always includes prop at full γ so the checkpoint metric
+            # is consistent from epoch 1 — prevents saving a warmup-era checkpoint
+            # that looks optimal only because prop loss hasn't been added yet.
+            gamma_now = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
+            ckpt_loss = (val_l + (mc.prop_weight - gamma_now) * val_raw_prop
+                         if mc.prop_pred else val_l)
             train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
@@ -214,7 +220,12 @@ def train(config: Config):
             val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            ckpt_loss = val_l
+            # ckpt_loss always includes prop at full γ so the checkpoint metric
+            # is consistent from epoch 1 — prevents saving a warmup-era checkpoint
+            # that looks optimal only because prop loss hasn't been added yet.
+            gamma_now = prop_gamma(epoch, mc.prop_warmup_epochs, mc.prop_weight)
+            ckpt_loss = (val_l + (mc.prop_weight - gamma_now) * val_raw_prop
+                         if mc.prop_pred else val_l)
             train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
