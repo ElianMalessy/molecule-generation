@@ -203,6 +203,36 @@ class PropsDataset(torch.utils.data.Dataset):
         return data
 
 
+class ZINCWithSmiles(torch.utils.data.Dataset):
+    """
+    Wraps the PyG ZINC dataset to inject a `data.smiles` field.
+
+    PyG ZINC stores only graph tensors (x, edge_attr, edge_index, y) and
+    carries no SMILES string.  We read the pre-built smiles_*.txt files
+    (same source, same ordering — no filtering is applied to ZINC) and
+    attach the string at index i as data.smiles.
+
+    Both PropsDataset and ar_collate_fn propagate the field correctly:
+    PropsDataset uses data.clone() (copies all Data attributes) and
+    Batch.from_data_list collects string fields into a list on the batch.
+    """
+    def __init__(self, base_dataset, smiles_list: list):
+        assert len(base_dataset) == len(smiles_list), (
+            f"ZINC dataset length ({len(base_dataset)}) ≠ "
+            f"smiles list length ({len(smiles_list)})"
+        )
+        self.base   = base_dataset
+        self.smiles = smiles_list
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        data = self.base[idx].clone()
+        data.smiles = self.smiles[idx]
+        return data
+
+
 class NormalizeZINCBonds(BaseTransform):
     """
     ZINC bonds are naturally 1, 2, 3, 4.
@@ -247,6 +277,10 @@ def get_dataloaders(config: Config, logger):
             train_dataset = ZINC(root='data/ZINC', subset=False, split='train', pre_transform=transform)
             val_dataset = ZINC(root='data/ZINC', subset=False, split='val', pre_transform=transform)
             num_node_features, num_edge_features = 29, 5
+            # Inject SMILES strings so batch.smiles is available for recon evaluation.
+            # PyG ZINC applies no filtering, so index i maps 1:1 to smiles_*.txt line i.
+            train_dataset = ZINCWithSmiles(train_dataset, get_smiles_list('ZINC', 'train'))
+            val_dataset   = ZINCWithSmiles(val_dataset,   get_smiles_list('ZINC', 'val'))
         else:
             train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=gc.max_atoms)
             val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=gc.max_atoms)
