@@ -277,10 +277,6 @@ def get_dataloaders(config: Config, logger):
             train_dataset = ZINC(root='data/ZINC', subset=False, split='train', pre_transform=transform)
             val_dataset = ZINC(root='data/ZINC', subset=False, split='val', pre_transform=transform)
             num_node_features, num_edge_features = 29, 5
-            # Inject SMILES strings so batch.smiles is available for recon evaluation.
-            # PyG ZINC applies no filtering, so index i maps 1:1 to smiles_*.txt line i.
-            train_dataset = ZINCWithSmiles(train_dataset, get_smiles_list('ZINC', 'train'))
-            val_dataset   = ZINCWithSmiles(val_dataset,   get_smiles_list('ZINC', 'val'))
         else:
             train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=gc.max_atoms)
             val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=gc.max_atoms)

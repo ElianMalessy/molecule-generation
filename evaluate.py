@@ -280,6 +280,34 @@ def _compute_property_stats(valid_smiles: list[str]) -> dict:
     return {'logP': _mean(logPs), 'QED': _mean(qeds), 'SA': _mean(sas), 'NP': _mean(nps)}
 
 
+def _graph_targets_to_smiles(target_nodes, target_edges, max_atoms,
+                             atom_decoder, charge_decoder, valency_mask):
+    """Convert dense integer target tensors to SMILES strings.
+
+    target_nodes : (B, max_atoms) int  — 0 = padding, 1..K = atom class
+    target_edges : (B, max_atoms, max_atoms) int  — 0 = no bond, 1..E = bond type
+
+    Returns list[str or None] of length B.  Uses the same decode_to_smiles
+    path as model predictions so the comparison is apples-to-apples.
+    Never relies on external SMILES files (no index-alignment assumption).
+    """
+    from models.gvae import decode_to_smiles
+    import numpy as np
+    tn = target_nodes.cpu().numpy()          # (B, max_atoms)
+    te = target_edges.cpu().numpy()          # (B, max_atoms, max_atoms)
+    n_node = int(tn.max()) + 1
+    n_edge = max(int(te.max()) + 1, 5)       # ≥5 to cover all ZINC bond types
+    results = []
+    for i in range(len(tn)):
+        # numpy fancy indexing: eye[int_array] = one-hot rows in one shot
+        nf = np.eye(n_node, dtype=np.float32)[tn[i]]   # (max_atoms, n_node)
+        ef = np.eye(n_edge, dtype=np.float32)[te[i]]   # (max_atoms, max_atoms, n_edge)
+        results.append(
+            decode_to_smiles(nf, ef, max_atoms, atom_decoder, charge_decoder, valency_mask)
+        )
+    return results
+
+
 def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                         n_recon: int = 1000):
     """
@@ -289,17 +317,16 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
     then compare non-isomeric canonical SMILES to the original.
 
     GVAE / GVAE_NF / GVAE_AR / GVAE_AR_NF
-        Ground-truth SMILES come from batch.smiles (stored in each PyG Data
-        object at dataset-construction time).  This is the only reliable
-        approach: an external list indexed by n_total would break for MOSES
-        (max_atoms filtering drops molecules → misalignment) and is fragile
-        for ZINC (PyG cache vs. smiles_*.txt may differ in ordering).
-        Comparison uses isomericSmiles=False because the graph VAE encodes
-        atom type and bond order but not chirality or double-bond geometry;
-        the decoder can never reproduce @/@@ or /\\ markers.
+        Ground-truth SMILES are derived from the batch's dense target tensors
+        (target_nodes, target_edges) via the same decode_to_smiles path used
+        for model predictions.  This avoids any external-list alignment
+        assumption: PyG ZINC and smiles_val.txt come from different sources
+        with different orderings.  Both ref and pred use isomericSmiles=False
+        since the graph VAE encodes atom type and bond order only.
     FRATTVAE
-        References from metadata['val_smiles'] (stored during preprocessing).
-        Returns None when the metadata key is absent (delete cache to regen).
+        References from metadata['val_smiles'] (stored during preprocessing,
+        aligned with the val dataset, shuffle=False).  Returns None when the
+        metadata key is absent (delete the FRATTVAE cache to regenerate).
     """
     model.eval()
 
@@ -318,8 +345,8 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                 # AR loader yields (PyGBatch, input_tok, target_tok, types, lens);
                 # flat loaders yield the PyGBatch directly.
                 batch = batch_raw[0] if isinstance(batch_raw, (tuple, list)) else batch_raw
-                x_in, edge_index, edge_attr, batch_idx, _, _ = gvae_prepare_batch(
-                    batch, device, gc.max_atoms)
+                x_in, edge_index, edge_attr, batch_idx, target_nodes, target_edges = \
+                    gvae_prepare_batch(batch, device, gc.max_atoms)
                 mu, _logvar = model.encode(x_in, edge_index, edge_attr, batch_idx)
                 # T=0.0 → greedy argmax for AR models (see _sample_batch).
                 # Flat decoders ignore temperature; argmax is always used.
@@ -328,13 +355,12 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                                               valency_mask=gc.valency_mask,
                                               temperature=recon_T)
 
-                # Ground-truth SMILES travel with the batch (batch.smiles is a list[str]
-                # set at dataset construction time, same molecules the encoder just saw).
-                # This avoids any index-alignment assumption between the DataLoader and
-                # an external SMILES list (which breaks for MOSES where max_atoms
-                # filtering drops molecules, and is fragile for ZINC if the smiles
-                # cache and PyG cache were built from different sources).
-                ref_smiles_batch = batch.smiles  # list[str], len == batch.num_graphs
+                # Ground-truth SMILES from the batch's dense target tensors.
+                # valency_mask=False for the reference: decode the true graph
+                # exactly as stored without imposing valency constraints.
+                ref_smiles_batch = _graph_targets_to_smiles(
+                    target_nodes, target_edges, gc.max_atoms,
+                    atom_decoder, charge_dec, valency_mask=False)
 
                 for pred, ref in zip(decoded, ref_smiles_batch):
                     ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None
@@ -395,7 +421,8 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                     ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None
                     pred_mol = Chem.MolFromSmiles(pred) if pred else None
                     if ref_mol and pred_mol:
-                        if Chem.MolToSmiles(ref_mol) == Chem.MolToSmiles(pred_mol):
+                        if (Chem.MolToSmiles(ref_mol, isomericSmiles=False) ==
+                                Chem.MolToSmiles(pred_mol, isomericSmiles=False)):
                             n_correct += 1
                 n_total += B
                 if n_total >= n_recon:
