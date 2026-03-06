@@ -282,6 +282,13 @@ class ARDecoder(nn.Module):
         # for this highly structured sequence where position encodes atom index)
         self.pos_emb = nn.Embedding(self.max_tf_len, d_model)
 
+        # Learned BOS token used at position 0 in place of a graph token.
+        # Every position is then uniformly: E_token + E_type + E_pos + z_proj(z),
+        # so z acts as a homogeneous global condition added exactly once per position.
+        # Initialised to zeros so the network learns the BOS signal from scratch
+        # without any implicit magnitude bias.
+        self.bos_emb = nn.Parameter(torch.zeros(1, 1, d_model))
+
         # Dual output heads
         self.node_head = nn.Linear(d_model, self.node_vocab)
         self.edge_head = nn.Linear(d_model, self.edge_vocab)
@@ -301,7 +308,11 @@ class ARDecoder(nn.Module):
 
     def _embed(self, z: torch.Tensor, input_tokens: torch.Tensor,
                input_types: torch.Tensor) -> torch.Tensor:
-        """Build full embedding sequence [z_prefix | graph_tokens].
+        """Build full embedding sequence [BOS | graph_tokens] with z-broadcast.
+
+        Every position is uniformly: E_token + E_type + E_pos + z_proj(z).
+        Position 0 uses a learned BOS embedding (self.bos_emb) instead of a
+        graph token, so z is added exactly once at every position — never doubled.
 
         node_emb / edge_emb are kept in the computation graph via weighted sum.
         The previous scatter-write approach (tok_emb[mask] = emb(...)) severed
@@ -315,18 +326,21 @@ class ARDecoder(nn.Module):
         # so out-of-vocabulary indices for the "wrong" table are harmless.
         node_idx = input_tokens.clamp(0, self.node_vocab - 1)
         edge_idx = input_tokens.clamp(0, self.edge_vocab - 1)
-        n_w = (input_types == 1).to(dtype=z.dtype).unsqueeze(-1)  # (B, L, 1)
+        n_w = (input_types == 1).to(dtype=z.dtype).unsqueeze(-1)  # (B, L-1, 1)
         e_w = (input_types == 2).to(dtype=z.dtype).unsqueeze(-1)
 
         tok_emb = (n_w * self.node_emb(node_idx)
                    + e_w * self.edge_emb(edge_idx)
                    + self.type_emb(input_types))                        # (B, L-1, d)
 
-        z_vec = self.z_proj(z)                                         # (B, d_model)
-        z_emb = z_vec.unsqueeze(1) + self.type_emb.weight[0]
+        # BOS at position 0: learned token + type-0 embedding (same type slot as
+        # before; type 0 = BOS/prefix, disambiguated from node=1 and edge=2).
+        bos = self.bos_emb.expand(B, -1, -1) + self.type_emb.weight[0]  # (B, 1, d)
 
-        full = torch.cat([z_emb, tok_emb], dim=1)                      # (B, L, d)
-        full = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
+        full  = torch.cat([bos, tok_emb], dim=1)                      # (B, L, d)
+        full  = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
+        z_vec = self.z_proj(z)                                         # (B, d_model)
+        full  = full + z_vec.unsqueeze(1)  # z-broadcast: +1× z at every position
         return full
 
     # ------------------------------------------------------------------
@@ -469,11 +483,14 @@ class ARDecoder(nn.Module):
         K_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
         V_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
 
-        # ── Position 0: z prefix ──────────────────────────────────────────
-        z_vec  = self.z_proj(z)                                        # (B, d_model)
-        z_emb  = (z_vec.unsqueeze(1)
-                  + self.type_emb(torch.zeros(B, 1, dtype=torch.long, device=device))
-                  + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device)))
+        # ── Position 0: BOS + z ──────────────────────────────────────────
+        # Mirrors _embed exactly: bos_emb + type_emb[0] + pos_emb[0] + z_proj(z).
+        # z is added exactly once — no doubling artifact.
+        z_vec   = self.z_proj(z)                                       # (B, d_model)
+        z_emb   = (self.bos_emb.expand(B, 1, -1)
+                   + self.type_emb.weight[0]                           # type 0 = BOS
+                   + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device))
+                   + z_vec.unsqueeze(1))                               # (B, 1, d_model)
         last_h = self.transformer.step(z_emb, K_bufs, V_bufs, t=0)  # (B, d)
 
         for step in range(self.max_seq_len - 1):
@@ -575,6 +592,7 @@ class ARDecoder(nn.Module):
                 + e_w * self.edge_emb(tok_safe.clamp(0, self.edge_vocab - 1))
                 + self.type_emb(type_safe)
                 + self.pos_emb(torch.full((B,), pos, dtype=torch.long, device=device))
+                + z_vec                                              # z-broadcast at every step
             ).unsqueeze(1)
             last_h = self.transformer.step(tok_emb, K_bufs, V_bufs, t=pos)
 
