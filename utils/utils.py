@@ -115,7 +115,10 @@ class GVAEARConfig:
                                      # weight=0.1 is too weak to force the encoder to encode
                                      # property info before collapse. 1.0 provides enough
                                      # gradient to prevent the collapse.
-    context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
+    context_dropout: float = 0.35   # fraction of input tokens replaced with 0 during training.
+                                     # At 0.15 the decoder retains 85 % sequential context and
+                                     # learns to ignore z — encoder μ collapses to one mode.
+                                     # 0.35 forces the decoder to use z for structural decisions.
 
 
 @dataclass
@@ -147,7 +150,7 @@ class GVAEARNFConfig:
     prop_weight: float = 0.1         # γ: property loss weight (constant).
                                      # IAF keeps effective KL ~5.3 nats → encoder stays
                                      # informative from epoch 1, so 0.1 is sufficient.
-    context_dropout: float = 0.15   # fraction of input tokens replaced with 0 during training
+    context_dropout: float = 0.35   # see GVAEARConfig for reasoning; same value applies.
 
 
 @dataclass
@@ -306,6 +309,30 @@ def get_dataloaders(config: Config, logger):
             logger.info(f"Node class weights (\u221a(cnt_C/cnt)) \u2014 "
                         f"C: {w[1]:.3f}  O: {w[2]:.3f}  N: {w[3]:.3f}  "
                         f"max_rare: {w[1:].max():.2f}")
+
+        # Compute edge class weights for GVAE / GVAE_NF (flat decoder only).
+        # Within valid atom pairs, ~90 % are no-bond; unweighted CE defaults to
+        # predicting no-bond everywhere → disconnected chains instead of ring systems.
+        # Identical fix to node weights: anchor no-bond at 1.0, amplify each bond
+        # type by sqrt(cnt_no_bond / cnt_bond), capped at 10×.
+        if (config.model in ('GVAE', 'GVAE_NF')
+                and hasattr(train_dataset, '_data')
+                and hasattr(train_dataset, 'slices')
+                and 'x' in train_dataset.slices):
+            raw_e   = train_dataset._data.edge_attr.squeeze(-1).long() + 1  # 1-indexed bond types
+            ebinc   = torch.bincount(raw_e, minlength=num_edge_features).float()[:num_edge_features]
+            bcnt    = ebinc / 2.0          # undirected: each bond stored twice
+            # Number of valid (real×real) upper-triangle pairs across all training molecules
+            sizes   = (train_dataset.slices['x'][1:] - train_dataset.slices['x'][:-1]).long()
+            n_pairs = float((sizes * (sizes - 1) // 2).sum().item())
+            n_no_bond = max(n_pairs - bcnt[1:].sum().item(), 1.0)
+            ew      = torch.ones(num_edge_features)
+            ew[1:]  = (n_no_bond / bcnt[1:].clamp(min=1.0)).sqrt().clamp(max=10.0)
+            ew[0]   = 1.0   # anchor no-bond
+            metadata['edge_class_weights'] = ew
+            logger.info(f"Edge class weights (\u221a(cnt_no_bond/cnt)) \u2014 "
+                        f"no_bond: {ew[0]:.3f}  "
+                        + "  ".join(f"bond{i}: {ew[i]:.3f}" for i in range(1, num_edge_features)))
 
         if gc.prop_pred:
             from utils.constants import ZINC_ATOM_DECODER, ZINC_CHARGE_DECODER, MOSES_ATOM_DECODER

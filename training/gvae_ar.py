@@ -20,7 +20,8 @@ from utils.properties import normalise_props
 
 def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: int,
                         device, amp_dtype=None, epoch: int = 1,
-                        prop_mean=None, prop_std=None, node_class_weights=None):
+                        prop_mean=None, prop_std=None, node_class_weights=None,
+                        edge_class_weights=None):  # edge weights not used by AR (sequential decoder)
     model.train()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     total_prop_gnorm = 0.0
@@ -108,7 +109,8 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
 @torch.no_grad()
 def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                       device, amp_dtype=None, epoch: int = 1,
-                      prop_mean=None, prop_std=None, node_class_weights=None):
+                      prop_mean=None, prop_std=None, node_class_weights=None,
+                      edge_class_weights=None):  # edge weights not used by AR (sequential decoder)
     model.eval()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAEARNF)

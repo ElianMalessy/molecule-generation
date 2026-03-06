@@ -187,6 +187,7 @@ def train(config: Config):
     prop_mean  = metadata.get('prop_mean')   # None when prop_pred=False
     prop_std   = metadata.get('prop_std')
     node_class_weights = metadata.get('node_class_weights')  # None for AR / FRATTVAE / MOSES
+    edge_class_weights = metadata.get('edge_class_weights')  # None for AR / FRATTVAE / MOSES
 
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
         logger.info(f"Valency masking: {'ON' if mc.valency_mask else 'OFF'}")
@@ -198,7 +199,8 @@ def train(config: Config):
     logger.info(f"Starting training on {device}...")
     for epoch in range(1, mc.epochs + 1):
         ep_kw = dict(epoch=epoch, prop_mean=prop_mean, prop_std=prop_std,
-                     node_class_weights=node_class_weights)
+                     node_class_weights=node_class_weights,
+                     edge_class_weights=edge_class_weights)
         if config.model in ('GVAE', 'GVAE_NF'):
             train_l, train_recon, train_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae(
                 model, optimizer, train_loader, config, global_step, device,

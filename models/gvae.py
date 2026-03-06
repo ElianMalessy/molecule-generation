@@ -9,6 +9,7 @@ Shared utilities (PropertyHead, decode_to_smiles, valency tables,
 gvae_prepare_batch) are kept here because they are also imported by
 models/gvae_ar.py and the training code.
 """
+import collections
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -299,7 +300,7 @@ class GraphVAENF(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
-                     *, node_class_weights=None):
+                     *, node_class_weights=None, edge_class_weights=None):
     """Shared reconstruction CE loss for both flat-decoder variants.
 
     Node loss: CE over all N positions including padding (target class 0).
@@ -312,6 +313,12 @@ def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
         weights (1/√freq, normalised so mean real-class weight = 1).  Carbon
         (~70 % of ZINC atoms) gets weight < 1 while rare heteroatoms get > 1,
         amplifying their gradient so the decoder learns to predict them.
+
+    edge_class_weights: optional (num_edge_features,) 1-D tensor.  No-bond
+        (~90 % of valid pairs in ZINC) is anchored at 1.0; each bond type is
+        amplified by sqrt(cnt_no_bond / cnt_bond), capped at 10×.  Without
+        this, the edge decoder defaults to predicting no-bond everywhere,
+        producing disconnected chains instead of ring systems.
 
     Edge loss: CE only over valid atom–atom pairs; padding pairs are masked out.
     """
@@ -337,7 +344,10 @@ def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
 
     edge_ce = F.cross_entropy(
         edge_logits_triu.reshape(-1, edge_logits_triu.size(-1)),
-        target_triu.reshape(-1), reduction='none',
+        target_triu.reshape(-1),
+        weight=(edge_class_weights.to(edge_logits.device)
+                if edge_class_weights is not None else None),
+        reduction='none',
     ).view(batch_size, -1)
     edge_ce = edge_ce * pair_mask_triu.view(batch_size, -1)
     recon_edges = edge_ce.sum(dim=1).mean()
@@ -347,7 +357,7 @@ def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
 
 def gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
               mu, logvar, kl_weight, free_bits: float = 0.0, capacity: float = 0.0,
-              node_class_weights=None):
+              node_class_weights=None, edge_class_weights=None):
     """Standard VAE loss for GraphVAE.  Returns (total, recon, kl).
 
     free_bits: minimum KL per latent dimension (nats).  Prevents collapse by
@@ -355,9 +365,11 @@ def gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
     capacity:  target KL (nats).  Loss = kl_weight * |KL - capacity|, so the
       model is penalised equally for being above or below the target.
     node_class_weights: passed through to _flat_recon_loss (see docstring there).
+    edge_class_weights: passed through to _flat_recon_loss (see docstring there).
     """
     recon = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
-                             node_class_weights=node_class_weights)
+                             node_class_weights=node_class_weights,
+                             edge_class_weights=edge_class_weights)
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
@@ -368,7 +380,7 @@ def gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
 def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
                  mu, logvar, z0, zK, sum_log_det, kl_weight,
                  free_bits: float = 0.0, capacity: float = 0.0,
-                 node_class_weights=None):
+                 node_class_weights=None, edge_class_weights=None):
     """IAF-VAE loss for GraphVAENF.
 
     KL is computed via the change-of-variables formula:
@@ -377,11 +389,13 @@ def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
     free_bits: minimum KL per latent dimension applied to the base q0 term.
     capacity: target KL (nats).  Loss = kl_weight * |KL - capacity|.
     node_class_weights: passed through to _flat_recon_loss (see docstring there).
+    edge_class_weights: passed through to _flat_recon_loss (see docstring there).
 
     Returns (total, recon, kl_flow).
     """
     recon      = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
-                                  node_class_weights=node_class_weights)
+                                  node_class_weights=node_class_weights,
+                                  edge_class_weights=edge_class_weights)
     std        = (0.5 * logvar).exp()
     kl_per_dim = -0.5 * (logvar + ((z0 - mu) / (std + 1e-8)).pow(2)) + 0.5 * zK.pow(2)  # (B, D)
     if free_bits > 0:
@@ -394,8 +408,82 @@ def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
 # Batch preparation (shared with training code and gvae_ar.py)
 # ---------------------------------------------------------------------------
 
+
+def _bfs_reorder_dense(target_nodes: torch.Tensor,
+                       target_edges: torch.Tensor) -> tuple:
+    """Reorder atoms in dense (B, N) / (B, N, N) targets into BFS canonical order.
+
+    The encoder (GINEConv + global_add_pool) is permutation-invariant, so z is
+    identical regardless of atom ordering.  The flat MLP decoder is strictly
+    positional: without a consistent ordering the decoder must learn to map a
+    permutation-invariant z to an arbitrary positional assignment — an
+    ill-posed problem that prevents generalisation.
+
+    BFS order (start = highest-degree atom, ties broken by atom index) is the
+    same canonical scheme used by the AR decoder, giving both models the same
+    structural prior::
+
+        position 0 → most-connected atom (ring junction / backbone)
+        position 1..k → BFS-expanded neighbourhood
+
+    Runs on CPU (per-molecule graph is ~38 atoms — negligible overhead).
+    Returns reordered tensors on the original device.
+    """
+    tn = target_nodes.cpu().numpy().copy()   # (B, N)
+    te = target_edges.cpu().numpy().copy()   # (B, N, N)
+    B, N = tn.shape
+
+    for b in range(B):
+        n = int((tn[b] > 0).sum())
+        if n <= 1:
+            continue
+        adj = (te[b, :n, :n] > 0)
+        degrees = adj.sum(1)
+        start = int(degrees.argmax())
+
+        visited = [False] * n
+        order = []
+        q = collections.deque([start])
+        visited[start] = True
+        while q:
+            node = q.popleft()
+            order.append(node)
+            for nb in adj[node].nonzero()[0].tolist():
+                if not visited[nb]:
+                    visited[nb] = True
+                    q.append(nb)
+        # Disconnected atoms (rare in clean data)
+        for i in range(n):
+            if not visited[i]:
+                visited[i] = True
+                order.append(i)
+                q2 = collections.deque([i])
+                while q2:
+                    nd = q2.popleft()
+                    for nb in adj[nd].nonzero()[0].tolist():
+                        if not visited[nb]:
+                            visited[nb] = True
+                            q2.append(nb)
+                            order.append(nb)
+
+        perm = np.array(order, dtype=np.int64)
+        tn[b, :n]     = tn[b, perm]
+        te[b, :n, :n] = te[b][np.ix_(perm, perm)]
+
+    device = target_nodes.device
+    return (torch.from_numpy(tn).to(device),
+            torch.from_numpy(te).to(device))
+
+
 def gvae_prepare_batch(data, device, max_atoms):
-    """Move a PyG batch to device and build dense target tensors."""
+    """Move a PyG batch to device and build dense target tensors.
+
+    Atoms are reordered into BFS canonical order (same scheme as the AR
+    decoder) so the flat MLP decoder has a structurally consistent positional
+    assignment to learn from.  The encoder input (x_in, edge_index,
+    edge_attr_in) is unchanged — GINEConv + global_add_pool is
+    permutation-invariant and does not depend on atom ordering.
+    """
     data = data.to(device)
     x_in         = data.x.squeeze(-1) + 1
     edge_attr_in = data.edge_attr.squeeze(-1) + 1
@@ -404,4 +492,5 @@ def gvae_prepare_batch(data, device, max_atoms):
         data.edge_index, data.batch,
         edge_attr=edge_attr_in, max_num_nodes=max_atoms,
     ).squeeze(-1).long()
+    target_nodes, target_edges = _bfs_reorder_dense(target_nodes, target_edges)
     return x_in, data.edge_index, edge_attr_in, data.batch, target_nodes, target_edges
