@@ -80,7 +80,7 @@ class GVAENFConfig:
     valency_mask: bool = False
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.3         # γ: property loss weight (constant)
+    prop_weight: float = 0.6         # γ: property loss weight (constant)
 
 
 @dataclass
@@ -108,7 +108,7 @@ class GVAEARConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.3         # γ: property loss weight (constant).
+    prop_weight: float = 0.1         # γ: property loss weight (constant).
                                      # GVAE_AR collapses to the free_bits floor (KL=2.56)
                                      # by epoch 2; the IAF in GVAE_AR_NF prevents this by
                                      # keeping effective KL ~5.3 nats. Without the flow,

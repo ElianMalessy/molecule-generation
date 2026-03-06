@@ -92,6 +92,12 @@ def evaluate_model(model, config: Config, device, metadata, val_loader=None):
                 )
                 generated_smiles.extend(smiles_batch)
 
+    # Log first 16 generated samples before computing stats — lets us immediately
+    # spot pathological output (all carbons, repeating PAD tokens, zero diversity).
+    logger.info("--- Generated samples (first 16) ---")
+    for idx, smi in enumerate(generated_smiles[:16], 1):
+        logger.info(f"  [{idx:2d}] {smi if smi else 'None (invalid)'}")
+
     valid_smiles  = [s for s in generated_smiles if s]
     validity      = len(valid_smiles) / max(1, len(generated_smiles))
     unique_smiles = set(valid_smiles)
@@ -338,8 +344,9 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
         atom_decoder = MOSES_ATOM_DECODER if config.dataset == 'MOSES' else ZINC_ATOM_DECODER
         charge_dec   = None if config.dataset == 'MOSES' else ZINC_CHARGE_DECODER
 
-        n_correct = 0
-        n_total   = 0
+        n_correct    = 0
+        n_total      = 0
+        sample_pairs = []          # (ref_smi, pred_smi, match) — first 16 for display
         with torch.no_grad():
             for batch_raw in val_loader:
                 # AR loader yields (PyGBatch, input_tok, target_tok, types, lens);
@@ -372,6 +379,7 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                 for pred, ref in zip(decoded, ref_smiles_batch):
                     ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None
                     pred_mol = Chem.MolFromSmiles(pred) if pred else None
+                    match = False
                     if ref_mol and pred_mol:
                         # Strip isomeric / stereo markers: the graph VAE encodes atom
                         # type and bond order but not chirality or double-bond geometry,
@@ -379,11 +387,30 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                         # Comparing non-isomeric SMILES gives a fair structural match.
                         ref_smi  = Chem.MolToSmiles(ref_mol,  isomericSmiles=False)
                         pred_smi = Chem.MolToSmiles(pred_mol, isomericSmiles=False)
-                        if ref_smi == pred_smi:
+                        match = (ref_smi == pred_smi)
+                        if match:
                             n_correct += 1
+                    else:
+                        ref_smi  = ref  or 'None'
+                        pred_smi = pred or 'None'
+                    if len(sample_pairs) < 16:
+                        sample_pairs.append((ref_smi, pred_smi, match))
                 n_total += batch.num_graphs
                 if n_total >= n_recon:
                     break
+
+        # Log sample reconstruction pairs so we can quickly spot all-carbon / all-PAD output.
+        w = 52
+        sep = '+' + '-' * (w + 2) + '+' + '-' * (w + 2) + '+-------+'
+        logger.info("--- Sample reconstructions (first 16 from val set) ---")
+        logger.info(sep)
+        logger.info(f"| {'REF':<{w}} | {'PRED':<{w}} | MATCH |")
+        logger.info(sep)
+        for ref_s, pred_s, ok in sample_pairs:
+            tick = '  ✓    ' if ok else '  ✗    '
+            logger.info(f"| {ref_s[:w]:<{w}} | {pred_s[:w]:<{w}} |{tick}|")
+        logger.info(sep)
+
         return n_correct / max(1, n_total)
 
     elif config.model == 'FRATTVAE':
