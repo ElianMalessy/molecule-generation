@@ -16,7 +16,7 @@ from utils.properties import normalise_props
 
 def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                      device, amp_dtype=None, epoch: int = 1,
-                     prop_mean=None, prop_std=None):
+                     prop_mean=None, prop_std=None, node_class_weights=None):
     model.train()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     total_prop_gnorm = 0.0
@@ -41,6 +41,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, z0, zK, sum_log_det, kl_weight,
                     free_bits=mc.free_bits_per_dim, capacity=capacity,
+                    node_class_weights=node_class_weights,
                 )
             else:
                 node_logits, edge_logits, mu, logvar = \
@@ -48,6 +49,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                 loss, recon, kl = gvae_loss(
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, kl_weight, free_bits=mc.free_bits_per_dim, capacity=capacity,
+                    node_class_weights=node_class_weights,
                 )
 
             raw_prop_loss = torch.tensor(0.0, device=device)
@@ -91,7 +93,8 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
 
 @torch.no_grad()
 def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
-                   amp_dtype=None, epoch: int = 1, prop_mean=None, prop_std=None):
+                   amp_dtype=None, epoch: int = 1, prop_mean=None, prop_std=None,
+                   node_class_weights=None):
     model.eval()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAENF)
@@ -113,6 +116,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, z0, zK, sum_log_det, beta,
                     free_bits=mc.free_bits_per_dim, capacity=capacity,
+                    node_class_weights=node_class_weights,
                 )
             else:
                 node_logits, edge_logits, mu, logvar = \
@@ -120,6 +124,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
                 loss, recon, kl = gvae_loss(
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, beta, free_bits=mc.free_bits_per_dim, capacity=capacity,
+                    node_class_weights=node_class_weights,
                 )
 
             raw_prop_loss = torch.tensor(0.0, device=device)

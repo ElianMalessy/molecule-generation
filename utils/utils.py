@@ -80,7 +80,7 @@ class GVAENFConfig:
     valency_mask: bool = False
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.1         # γ: property loss weight (constant)
+    prop_weight: float = 0.3         # γ: property loss weight (constant)
 
 
 @dataclass
@@ -108,7 +108,7 @@ class GVAEARConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 1.0         # γ: property loss weight (constant).
+    prop_weight: float = 0.3         # γ: property loss weight (constant).
                                      # GVAE_AR collapses to the free_bits floor (KL=2.56)
                                      # by epoch 2; the IAF in GVAE_AR_NF prevents this by
                                      # keeping effective KL ~5.3 nats. Without the flow,
@@ -283,6 +283,29 @@ def get_dataloaders(config: Config, logger):
             num_node_features, num_edge_features = 9, 5
 
         metadata: dict = {'num_nodes': num_node_features, 'num_edges': num_edge_features}
+
+        # Compute class weights for node CE (all GVAE variants).
+        # ZINC's carbon class (~70 % of atoms) dominates unweighted CE, causing the
+        # decoder to default to all-carbon predictions.  We anchor C at weight=1.0
+        # and scale rarer classes by sqrt(cnt_C / cnt_class), capped at 10×.
+        # For GVAE_AR/GVAE_AR_NF: append EOS weight=1.0 at index num_node_features.
+        # EOS is the only termination signal — boosting it causes premature stops;
+        # suppressing it causes infinite loops — keep it neutral.
+        if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF') and hasattr(train_dataset, '_data'):
+            raw_x   = train_dataset._data.x.squeeze(-1).long() + 1  # 1-indexed; no padding in raw data
+            cnt     = torch.bincount(raw_x, minlength=num_node_features).float()
+            present = cnt > 0
+            max_cnt = cnt[present].max()                        # count of the most common class (C)
+            w       = torch.zeros(num_node_features)
+            w[present] = (max_cnt / cnt[present]).sqrt()        # C → 1.0, rare → > 1.0
+            w[1:] = w[1:].clamp(max=10.0)                      # cap at 10× to prevent training instability
+            w[0] = 1.0  # PAD slot (flat decoder: supervised; AR: unused index)
+            if config.model in ('GVAE_AR', 'GVAE_AR_NF'):
+                w = torch.cat([w, torch.ones(1)])  # EOS at index num_node_features
+            metadata['node_class_weights'] = w
+            logger.info(f"Node class weights (\u221a(cnt_C/cnt)) \u2014 "
+                        f"C: {w[1]:.3f}  O: {w[2]:.3f}  N: {w[3]:.3f}  "
+                        f"max_rare: {w[1:].max():.2f}")
 
         if gc.prop_pred:
             from utils.constants import ZINC_ATOM_DECODER, ZINC_CHARGE_DECODER, MOSES_ATOM_DECODER

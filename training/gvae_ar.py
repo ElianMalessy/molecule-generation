@@ -20,7 +20,7 @@ from utils.properties import normalise_props
 
 def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: int,
                         device, amp_dtype=None, epoch: int = 1,
-                        prop_mean=None, prop_std=None):
+                        prop_mean=None, prop_std=None, node_class_weights=None):
     model.train()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     total_prop_gnorm = 0.0
@@ -47,14 +47,16 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
             if use_nf:
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
-                    input_tokens, target_tokens, target_types, seq_lens)
+                    input_tokens, target_tokens, target_types, seq_lens,
+                    node_class_weights=node_class_weights)
                 loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
                                               kl_weight, free_bits=mc.free_bits_per_dim,
                                               capacity=capacity)
             else:
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
-                    input_tokens, target_tokens, target_types, seq_lens)
+                    input_tokens, target_tokens, target_types, seq_lens,
+                    node_class_weights=node_class_weights)
                 loss, _, kl = gvae_ar_loss(recon, mu, logvar, kl_weight,
                                            free_bits=mc.free_bits_per_dim, capacity=capacity)
 
@@ -106,7 +108,7 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
 @torch.no_grad()
 def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                       device, amp_dtype=None, epoch: int = 1,
-                      prop_mean=None, prop_std=None):
+                      prop_mean=None, prop_std=None, node_class_weights=None):
     model.eval()
     total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAEARNF)
@@ -130,14 +132,16 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
             if use_nf:
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
-                    input_tokens, target_tokens, target_types, seq_lens)
+                    input_tokens, target_tokens, target_types, seq_lens,
+                    node_class_weights=node_class_weights)
                 loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
                                               beta, free_bits=mc.free_bits_per_dim,
                                               capacity=capacity)
             else:
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
-                    input_tokens, target_tokens, target_types, seq_lens)
+                    input_tokens, target_tokens, target_types, seq_lens,
+                    node_class_weights=node_class_weights)
                 loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta,
                                            free_bits=mc.free_bits_per_dim, capacity=capacity)
 

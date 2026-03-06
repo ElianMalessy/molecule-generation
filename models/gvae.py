@@ -19,6 +19,7 @@ from rdkit import Chem
 
 from models.encoder import GINEConvEncoder
 from models.flows import InverseAutoregressiveFlow
+from utils.constants import MAX_VALENCE, BOND_ORDER, get_rdkit_bond
 
 
 # ---------------------------------------------------------------------------
@@ -49,39 +50,6 @@ class PropertyHead(nn.Module):
     def forward(self, mu: torch.Tensor) -> torch.Tensor:
         """Returns (B, 3) predicted [plogP_z, QED_z, SA_z] in normalised space."""
         return self.net(mu)
-
-
-# ---------------------------------------------------------------------------
-# Valency masking utilities (shared with gvae_ar.py)
-# ---------------------------------------------------------------------------
-
-# Maximum total bond order allowed per heavy atom type.
-# Charged atoms (+/-) are adjusted in the sampler.
-_MAX_VALENCE = {
-    1:  1,   # H
-    6:  4,   # C
-    7:  3,   # N  (N+ → 4)
-    8:  2,   # O  (O- → 1)
-    9:  1,   # F
-    15: 5,   # P
-    16: 6,   # S
-    17: 1,   # Cl
-    35: 1,   # Br
-    53: 1,   # I
-}
-
-# Valence units consumed per bond-type index.
-# Aromatic bonds are tracked as 1 (integer approximation).
-_BOND_ORDER = {0: 0, 1: 1, 2: 2, 3: 3, 4: 1}
-
-
-def _get_rdkit_bond(bond_idx):
-    return {
-        1: Chem.BondType.SINGLE,
-        2: Chem.BondType.DOUBLE,
-        3: Chem.BondType.TRIPLE,
-        4: Chem.BondType.AROMATIC,
-    }.get(bond_idx, Chem.BondType.SINGLE)
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +91,7 @@ def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
         idx = mol.AddAtom(rd_atom)
         node_idx_map[j] = idx
         running_val[j]  = 0
-        base = _MAX_VALENCE.get(atomic_num, 4)
+        base = MAX_VALENCE.get(atomic_num, 4)
         if fc > 0:
             base += 1
         elif fc < 0:
@@ -140,7 +108,7 @@ def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
             logits = edge_logits_np[j, k].copy()
             if valency_mask:
                 for b in range(1, num_bond_types):
-                    order = _BOND_ORDER.get(b, 1)
+                    order = BOND_ORDER.get(b, 1)
                     if (running_val[j] + order > max_valence[j] or
                             running_val[k] + order > max_valence[k]):
                         logits[b] = -np.inf
@@ -148,8 +116,8 @@ def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
             if bond_idx == 0:
                 continue
             if not mol.GetBondBetweenAtoms(node_idx_map[j], node_idx_map[k]):
-                mol.AddBond(node_idx_map[j], node_idx_map[k], _get_rdkit_bond(bond_idx))
-                order = _BOND_ORDER.get(bond_idx, 1)
+                mol.AddBond(node_idx_map[j], node_idx_map[k], get_rdkit_bond(bond_idx))
+                order = BOND_ORDER.get(bond_idx, 1)
                 running_val[j] += order
                 running_val[k] += order
 
@@ -330,7 +298,8 @@ class GraphVAENF(nn.Module):
 # Loss functions
 # ---------------------------------------------------------------------------
 
-def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges):
+def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
+                     *, node_class_weights=None):
     """Shared reconstruction CE loss for both flat-decoder variants.
 
     Node loss: CE over all N positions including padding (target class 0).
@@ -339,6 +308,11 @@ def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges):
     at decode time.  Without this, the decoder defaults to predicting carbon
     everywhere, producing 38-atom strings that never match the reference.
 
+    node_class_weights: optional (num_node_features,) 1-D tensor of per-class
+        weights (1/√freq, normalised so mean real-class weight = 1).  Carbon
+        (~70 % of ZINC atoms) gets weight < 1 while rare heteroatoms get > 1,
+        amplifying their gradient so the decoder learns to predict them.
+
     Edge loss: CE only over valid atom–atom pairs; padding pairs are masked out.
     """
     batch_size, N = target_nodes.shape
@@ -346,6 +320,8 @@ def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges):
     node_ce = F.cross_entropy(
         node_logits.reshape(-1, node_logits.size(-1)),
         target_nodes.reshape(-1),
+        weight=(node_class_weights.to(node_logits.device)
+                if node_class_weights is not None else None),
         reduction='none',          # no ignore_index: supervise padding → class 0
     ).view(batch_size, N)
     recon_nodes = node_ce.sum(dim=1).mean()
@@ -370,15 +346,18 @@ def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges):
 
 
 def gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
-              mu, logvar, kl_weight, free_bits: float = 0.0, capacity: float = 0.0):
+              mu, logvar, kl_weight, free_bits: float = 0.0, capacity: float = 0.0,
+              node_class_weights=None):
     """Standard VAE loss for GraphVAE.  Returns (total, recon, kl).
 
     free_bits: minimum KL per latent dimension (nats).  Prevents collapse by
       ensuring no dimension contributes less than this to the KL term.
     capacity:  target KL (nats).  Loss = kl_weight * |KL - capacity|, so the
       model is penalised equally for being above or below the target.
+    node_class_weights: passed through to _flat_recon_loss (see docstring there).
     """
-    recon = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges)
+    recon = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
+                             node_class_weights=node_class_weights)
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
@@ -388,7 +367,8 @@ def gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
 
 def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
                  mu, logvar, z0, zK, sum_log_det, kl_weight,
-                 free_bits: float = 0.0, capacity: float = 0.0):
+                 free_bits: float = 0.0, capacity: float = 0.0,
+                 node_class_weights=None):
     """IAF-VAE loss for GraphVAENF.
 
     KL is computed via the change-of-variables formula:
@@ -396,10 +376,12 @@ def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
 
     free_bits: minimum KL per latent dimension applied to the base q0 term.
     capacity: target KL (nats).  Loss = kl_weight * |KL - capacity|.
+    node_class_weights: passed through to _flat_recon_loss (see docstring there).
 
     Returns (total, recon, kl_flow).
     """
-    recon      = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges)
+    recon      = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
+                                  node_class_weights=node_class_weights)
     std        = (0.5 * logvar).exp()
     kl_per_dim = -0.5 * (logvar + ((z0 - mu) / (std + 1e-8)).pow(2)) + 0.5 * zK.pow(2)  # (B, D)
     if free_bits > 0:

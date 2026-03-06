@@ -1,6 +1,8 @@
 data/
 checkpoints/
 logs/
+_diag_ar.py
+_diag.py
 *.sh
 __pycache__
 *.pyc

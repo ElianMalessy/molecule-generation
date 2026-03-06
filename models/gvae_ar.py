@@ -1,27 +1,3 @@
-"""
-GraphVAE with a latent-conditioned autoregressive Transformer decoder (GVAE_AR).
-
-Decoder architecture
---------------------
-Molecules are serialized into a single 1-D sequence via BFS linearization:
-
-    S = [v₁,  v₂, e₂₁,  v₃, e₃₁, e₃₂,  v₄, …,  vₙ, eₙ₁…eₙₙ₋₁,  <EOS>]
-
-where vᵢ is the atom type (BFS step i) and eᵢⱼ is the bond type from atom i
-to the previously-generated atom j.
-
-For max_atoms=38 the maximum sequence length is 38 + 703 + 1 = 742 tokens.
-
-A GPT-style (decoder-only) causal Transformer is conditioned on the latent z by
-prepending z as a "prefix token" (projected to d_model).  The model sees:
-
-    Transformer input:  [z_proj,  v₁, v₂, e₂₁, …, eₙₙ₋₁]     length L
-    Transformer output: [h₀, h₁, h₂, h₃,  …, hₗ₋₁]            length L
-    Targets:            [v₁,  v₂, e₂₁,  …, eₙₙ₋₁,  <EOS>]     length L
-
-Two separate linear heads route each hidden state to either the atom vocabulary
-or the bond vocabulary depending on the deterministic token type at that position.
-"""
 import collections
 import torch
 import torch.nn as nn
@@ -30,12 +6,8 @@ from rdkit import Chem
 
 from models.encoder import GINEConvEncoder
 from models.flows import InverseAutoregressiveFlow
-from models.gvae import PropertyHead, decode_to_smiles, _MAX_VALENCE, _BOND_ORDER, _get_rdkit_bond
-
-
-# ---------------------------------------------------------------------------
-# BFS utilities
-# ---------------------------------------------------------------------------
+from models.gvae import PropertyHead, decode_to_smiles
+from utils.constants import MAX_VALENCE, BOND_ORDER, get_rdkit_bond
 
 def _bfs_order(adj_bin, n: int) -> list:
     """Return atom indices in BFS order starting from the highest-degree atom.
@@ -362,7 +334,7 @@ class ARDecoder(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, z, input_tokens, target_tokens, target_types, seq_lens,
-                context_dropout: float = 0.0):
+                context_dropout: float = 0.0, node_class_weights=None):
         max_L  = target_tokens.size(1)
         device = z.device
 
@@ -400,8 +372,10 @@ class ARDecoder(nn.Module):
         total_tokens = token_mask.sum()
         loss = torch.tensor(0.0, device=device)
         if n_mask.any():
+            node_w = (node_class_weights.to(device) if node_class_weights is not None else None)
             loss = loss + F.cross_entropy(
-                self.node_head(h_valid[n_mask]), tgt_valid[n_mask], reduction='sum')
+                self.node_head(h_valid[n_mask]), tgt_valid[n_mask],
+                weight=node_w, reduction='sum')
         if e_mask.any():
             loss = loss + F.cross_entropy(
                 self.edge_head(h_valid[e_mask]), tgt_valid[e_mask], reduction='sum')
@@ -462,7 +436,7 @@ class ARDecoder(nn.Module):
         for cls_idx in range(n_cls):
             an = atom_decoder.get(cls_idx, 6)
             fc = charge_decoder.get(cls_idx, 0) if charge_decoder else 0
-            bv = _MAX_VALENCE.get(an, 4)
+            bv = MAX_VALENCE.get(an, 4)
             if fc > 0:    bv += 1
             elif fc < 0:  bv = max(bv - 1, 0)
             anum_arr[cls_idx]   = an
@@ -474,7 +448,7 @@ class ARDecoder(nn.Module):
 
         # bond_order_lut[bt] = valence units consumed by bond type bt
         bo_arr = torch.ones(self.edge_vocab, dtype=torch.long)
-        for k, v in _BOND_ORDER.items():
+        for k, v in BOND_ORDER.items():
             if k < self.edge_vocab:
                 bo_arr[k] = v
         bond_order_lut = bo_arr.to(device)   # (edge_vocab,)
@@ -618,7 +592,7 @@ class ARDecoder(nn.Module):
                 for j in range(i):
                     bt = int(bonds_list[b][i][j])
                     if bt > 0:
-                        bonds[(i, j)] = _get_rdkit_bond(bt)
+                        bonds[(i, j)] = get_rdkit_bond(bt)
             results.append(self._build_mol(atoms, bonds))
         return results
 
@@ -702,7 +676,8 @@ class GraphVAEAR(nn.Module):
         return self.prop_head(mu)
 
     def forward(self, x, edge_index, edge_attr, batch,
-                input_tokens, target_tokens, target_types, seq_lens):
+                input_tokens, target_tokens, target_types, seq_lens,
+                node_class_weights=None):
         """Teacher-forced training forward pass.
 
         BFS sequences are pre-built by ar_collate_fn in DataLoader workers.
@@ -716,7 +691,8 @@ class GraphVAEAR(nn.Module):
         mu, logvar = self.encode(x, edge_index, edge_attr, batch)
         z = self.reparameterize(mu, logvar)
         recon_loss = self.decoder(z, input_tokens, target_tokens, target_types, seq_lens,
-                                  context_dropout=self.context_dropout)
+                                  context_dropout=self.context_dropout,
+                                  node_class_weights=node_class_weights)
         return recon_loss, mu, logvar
 
     def sample_smiles(self, z, atom_decoder_dict=None, charge_decoder=None,
@@ -815,7 +791,8 @@ class GraphVAEARNF(nn.Module):
         return self.prop_head(mu)
 
     def forward(self, x, edge_index, edge_attr, batch,
-                input_tokens, target_tokens, target_types, seq_lens):
+                input_tokens, target_tokens, target_types, seq_lens,
+                node_class_weights=None):
         """Teacher-forced training forward pass.
 
         BFS sequences are pre-built by ar_collate_fn in DataLoader workers.
@@ -833,7 +810,8 @@ class GraphVAEARNF(nn.Module):
         z0 = self.reparameterize(mu, logvar)
         zK, sum_log_det = self.flow(z0)
         recon_loss = self.decoder(zK, input_tokens, target_tokens, target_types, seq_lens,
-                                  context_dropout=self.context_dropout)
+                                  context_dropout=self.context_dropout,
+                                  node_class_weights=node_class_weights)
         return recon_loss, mu, logvar, z0, zK, sum_log_det
 
     def sample_smiles(self, z, atom_decoder_dict=None, charge_decoder=None,
