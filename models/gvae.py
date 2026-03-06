@@ -331,13 +331,22 @@ class GraphVAENF(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges):
-    """Shared reconstruction CE loss for both flat-decoder variants."""
+    """Shared reconstruction CE loss for both flat-decoder variants.
+
+    Node loss: CE over all N positions including padding (target class 0).
+    Removing ignore_index=0 ensures the decoder is trained to predict class 0
+    at empty (padding) positions — critical for correct molecule-size inference
+    at decode time.  Without this, the decoder defaults to predicting carbon
+    everywhere, producing 38-atom strings that never match the reference.
+
+    Edge loss: CE only over valid atom–atom pairs; padding pairs are masked out.
+    """
     batch_size, N = target_nodes.shape
 
     node_ce = F.cross_entropy(
         node_logits.reshape(-1, node_logits.size(-1)),
         target_nodes.reshape(-1),
-        ignore_index=0, reduction='none',
+        reduction='none',          # no ignore_index: supervise padding → class 0
     ).view(batch_size, N)
     recon_nodes = node_ce.sum(dim=1).mean()
 

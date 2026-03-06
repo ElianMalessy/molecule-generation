@@ -348,10 +348,17 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                 x_in, edge_index, edge_attr, batch_idx, target_nodes, target_edges = \
                     gvae_prepare_batch(batch, device, gc.max_atoms)
                 mu, _logvar = model.encode(x_in, edge_index, edge_attr, batch_idx)
+                # For NF models the decoder was trained on zK = flow(z0), not on
+                # the raw encoder mean μ.  Pass μ through the flow (no noise) to
+                # get the correct reconstruction latent zK before decoding.
+                if config.model in ('GVAE_NF', 'GVAE_AR_NF'):
+                    z_recon, _ = model.flow(mu)
+                else:
+                    z_recon = mu
                 # T=0.0 → greedy argmax for AR models (see _sample_batch).
                 # Flat decoders ignore temperature; argmax is always used.
                 recon_T = 0.0 if config.model in ('GVAE_AR', 'GVAE_AR_NF') else 1.0
-                decoded = model.sample_smiles(mu, atom_decoder, charge_dec,
+                decoded = model.sample_smiles(z_recon, atom_decoder, charge_dec,
                                               valency_mask=gc.valency_mask,
                                               temperature=recon_T)
 
@@ -558,7 +565,18 @@ def run_validation(dataset: str, model_name: str, checkpoint: str,
     config.gvae_ar.valency_mask = valency
     config.gvae_ar_nf.valency_mask = valency
 
-    _, val_loader, metadata = get_dataloaders(config, logger)
+    # Build data loader without triggering the property-cache computation.
+    # We need prop_pred=True only for *model architecture* (to load the checkpoint);
+    # the property cache is a training artefact and is not needed at eval time.
+    loader_config = Config(model=model_name, dataset=dataset,
+                           num_samples=num_samples, num_workers=num_workers)
+    if dataset == 'MOSES':
+        loader_config.gvae.max_atoms     = 30
+        loader_config.gvae_nf.max_atoms  = 30
+        loader_config.gvae_ar.max_atoms  = 30
+        loader_config.gvae_ar_nf.max_atoms = 30
+    # prop_pred stays False on loader_config → no property cache build
+    _, val_loader, metadata = get_dataloaders(loader_config, logger)
 
     model = _build_model(config, metadata, device)
     state = torch.load(checkpoint, map_location=device, weights_only=True)
