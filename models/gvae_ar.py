@@ -133,7 +133,20 @@ def build_ar_batch(target_nodes, target_edges, eos_id: int, abs_max_len: int):
 # ---------------------------------------------------------------------------
 
 class _CausalLayer(nn.Module):
-    """Pre-LN causal transformer layer.
+    """Pre-LN causal transformer layer with AdaLN-Zero conditioning.
+
+    Each layer norm is replaced by Adaptive Layer Normalization (AdaLN-Zero,
+    Peebles & Xie 2023).  A small linear projection from z_cond (already
+    projected to d_model by ARDecoder.z_proj) predicts scale (γ) and shift (β)
+    for both the attention and FFN sublayers:
+
+        AdaLN(x, z) = (1 + γ) ⊙ LN(x) + β
+
+    Zero-init of adaLN_proj means γ=0, β=0 at init, so training starts from
+    the same position as a standard Pre-LN transformer.  The gradient path from
+    the reconstruction loss to z passes through these projections at every
+    sublayer, giving z a direct O(1)-path gradient at every layer rather than
+    having to propagate back through all prior transformer layers.
 
     Explicit Q/K/V projections (vs. fused in_proj) give a clean public API
     for KV-cached inference — no private PyTorch internals required.
@@ -145,8 +158,10 @@ class _CausalLayer(nn.Module):
         assert d_model % n_heads == 0
         self.n_heads  = n_heads
         self.head_dim = d_model // n_heads
-        self.norm1    = nn.LayerNorm(d_model)
-        self.norm2    = nn.LayerNorm(d_model)
+        # elementwise_affine=False: AdaLN supplies its own scale/shift;
+        # the built-in γ/β would be redundant and waste parameters.
+        self.norm1    = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.norm2    = nn.LayerNorm(d_model, elementwise_affine=False)
         self.q_proj   = nn.Linear(d_model, d_model)
         self.k_proj   = nn.Linear(d_model, d_model)
         self.v_proj   = nn.Linear(d_model, d_model)
@@ -159,14 +174,34 @@ class _CausalLayer(nn.Module):
             nn.Dropout(dropout),
         )
         self.attn_drop = dropout
+        # AdaLN-Zero: project z_cond → (γ_attn, β_attn, γ_ff, β_ff).
+        # 4 × d_model outputs; zero-init → identity at the start of training.
+        self.adaLN_proj = nn.Linear(d_model, 4 * d_model)
+        nn.init.zeros_(self.adaLN_proj.weight)
+        nn.init.zeros_(self.adaLN_proj.bias)
 
     def _to_heads(self, t: torch.Tensor) -> torch.Tensor:
         """(B, L, d) → (B, n_heads, L, head_dim).  reshape handles non-contiguous slices."""
         B, L, _ = t.shape
         return t.reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def _adaln(self, x: torch.Tensor, z_cond: torch.Tensor,
+               gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+        """Apply AdaLN-Zero: (1 + γ) ⊙ LN(x) + β.
+
+        x      : (B, L, d_model)
+        gamma  : (B, d_model) — per-sequence scale shift (from adaLN_proj)
+        beta   : (B, d_model) — per-sequence bias   (from adaLN_proj)
+        Returns (B, L, d_model).
+        """
+        return (1 + gamma.unsqueeze(1)) * self.norm1(x) + beta.unsqueeze(1)
+
+    def forward(self, x: torch.Tensor, z_cond: torch.Tensor,
+                attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Full-sequence causal forward (teacher-forced training).
+
+        z_cond : (B, d_model) — z_proj(z), the projected latent vector.
+          adaLN_proj maps it to (γ_attn, β_attn, γ_ff, β_ff).
 
         attn_mask: optional boolean mask (B, 1, L, L) — True = attend, False = mask.
           When None (the common path), is_causal=True is passed to SDPA so
@@ -174,7 +209,8 @@ class _CausalLayer(nn.Module):
           Note: PyTorch SDPA disallows is_causal=True alongside attn_mask, so
           these two paths are mutually exclusive.
         """
-        h = self.norm1(x)
+        gamma_a, beta_a, gamma_f, beta_f = self.adaLN_proj(z_cond).chunk(4, dim=-1)  # each (B, d)
+        h = (1 + gamma_a.unsqueeze(1)) * self.norm1(x) + beta_a.unsqueeze(1)
         q, k, v = self._to_heads(self.q_proj(h)), self._to_heads(self.k_proj(h)), self._to_heads(self.v_proj(h))
         drop = self.attn_drop if self.training else 0.0
         if attn_mask is None:
@@ -182,24 +218,26 @@ class _CausalLayer(nn.Module):
         else:
             a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop)
         x    = x + self.out_proj(a.transpose(1, 2).contiguous().view_as(x))
-        x    = x + self.ff(self.norm2(x))
+        x    = x + self.ff((1 + gamma_f.unsqueeze(1)) * self.norm2(x) + beta_f.unsqueeze(1))
         return x
 
-    def step(self, x: torch.Tensor,
+    def step(self, x: torch.Tensor, z_cond: torch.Tensor,
              K_buf: torch.Tensor, V_buf: torch.Tensor, t: int) -> torch.Tensor:
         """Single-token causal step with in-place KV-cache writes.
 
         Parameters
         ----------
-        x     : (B, 1, d_model) – embedding of the current token
-        K_buf : (B, max_tf_len, d_model) – pre-allocated; mutated at column t
-        V_buf : (B, max_tf_len, d_model) – pre-allocated; mutated at column t
-        t     : absolute position of this token in the sequence
+        x      : (B, 1, d_model) – embedding of the current token
+        z_cond : (B, d_model)   – z_proj(z), same for all steps of one sample
+        K_buf  : (B, max_tf_len, d_model) – pre-allocated; mutated at column t
+        V_buf  : (B, max_tf_len, d_model) – pre-allocated; mutated at column t
+        t      : absolute position of this token in the sequence
 
         No causal mask is needed: the query is always the newest position and
         may legally attend to all t+1 entries in the cache.
         """
-        h = self.norm1(x)
+        gamma_a, beta_a, gamma_f, beta_f = self.adaLN_proj(z_cond).chunk(4, dim=-1)  # each (B, d)
+        h = (1 + gamma_a.unsqueeze(1)) * self.norm1(x) + beta_a.unsqueeze(1)
         K_buf[:, t : t + 1, :] = self.k_proj(h)          # write in-place — no allocation
         V_buf[:, t : t + 1, :] = self.v_proj(h)
         q = self._to_heads(self.q_proj(h))                 # (B, nh, 1, hd)
@@ -207,7 +245,7 @@ class _CausalLayer(nn.Module):
         v = self._to_heads(V_buf[:, : t + 1, :])
         a = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         x = x + self.out_proj(a.transpose(1, 2).contiguous().view_as(x))
-        x = x + self.ff(self.norm2(x))
+        x = x + self.ff((1 + gamma_f.unsqueeze(1)) * self.norm2(x) + beta_f.unsqueeze(1))
         return x                                           # (B, 1, d_model)
 
 
@@ -220,18 +258,21 @@ class _CausalTransformer(nn.Module):
             [_CausalLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, z_cond: torch.Tensor,
+                attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """z_cond : (B, d_model) — broadcast to every layer's AdaLN."""
         for layer in self.layers:
-            x = layer(x, attn_mask)
+            x = layer(x, z_cond, attn_mask)
         return x
 
-    def step(self, x: torch.Tensor,
+    def step(self, x: torch.Tensor, z_cond: torch.Tensor,
              K_bufs: list[torch.Tensor], V_bufs: list[torch.Tensor], t: int) -> torch.Tensor:
         """Run one token through every layer using the shared KV buffers.
+        z_cond : (B, d_model) — same for all steps of one sample.
         Returns (B, d_model) — the hidden state of the new token.
         """
         for i, layer in enumerate(self.layers):
-            x = layer.step(x, K_bufs[i], V_bufs[i], t)
+            x = layer.step(x, z_cond, K_bufs[i], V_bufs[i], t)
         return x[:, 0, :]
 
 # ---------------------------------------------------------------------------
@@ -307,7 +348,7 @@ class ARDecoder(nn.Module):
     # ------------------------------------------------------------------
 
     def _embed(self, z: torch.Tensor, input_tokens: torch.Tensor,
-               input_types: torch.Tensor) -> torch.Tensor:
+               input_types: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Build full embedding sequence [BOS | graph_tokens] with z-broadcast.
 
         Every position is uniformly: E_token + E_type + E_pos + z_proj(z).
@@ -341,7 +382,7 @@ class ARDecoder(nn.Module):
         full  = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
         z_vec = self.z_proj(z)                                         # (B, d_model)
         full  = full + z_vec.unsqueeze(1)  # z-broadcast: +1× z at every position
-        return full
+        return full, z_vec  # z_vec returned for AdaLN conditioning in transformer layers
 
     # ------------------------------------------------------------------
     # Training forward (teacher-forced, fully parallel)
@@ -361,14 +402,14 @@ class ARDecoder(nn.Module):
         if context_dropout > 0.0 and self.training:
             drop_mask = torch.rand_like(inp, dtype=torch.float) < context_dropout
             inp = inp.masked_fill(drop_mask, 0)
-        full_emb    = self._embed(z, inp, input_types)
+        full_emb, z_cond = self._embed(z, inp, input_types)
 
         # No key-padding mask needed: padding always appears after EOS so the
         # causal mask already prevents real tokens from attending to pad positions.
         # Pad-token hidden states are excluded from the loss by token_mask below,
         # so they never generate gradients.  Passing no mask lets SDPA use
         # is_causal=True internally, which enables FlashAttention.
-        h = self.transformer(full_emb)  # (B, max_L, d)
+        h = self.transformer(full_emb, z_cond)  # (B, max_L, d)
 
         token_mask = (target_types > 0)
         if not token_mask.any():
@@ -491,7 +532,7 @@ class ARDecoder(nn.Module):
                    + self.type_emb.weight[0]                           # type 0 = BOS
                    + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device))
                    + z_vec.unsqueeze(1))                               # (B, 1, d_model)
-        last_h = self.transformer.step(z_emb, K_bufs, V_bufs, t=0)  # (B, d)
+        last_h = self.transformer.step(z_emb, z_vec, K_bufs, V_bufs, t=0)  # (B, d)
 
         for step in range(self.max_seq_len - 1):
             if finished.all():
@@ -594,7 +635,7 @@ class ARDecoder(nn.Module):
                 + self.pos_emb(torch.full((B,), pos, dtype=torch.long, device=device))
                 + z_vec                                              # z-broadcast at every step
             ).unsqueeze(1)
-            last_h = self.transformer.step(tok_emb, K_bufs, V_bufs, t=pos)
+            last_h = self.transformer.step(tok_emb, z_vec, K_bufs, V_bufs, t=pos)
 
         # ── Build RDKit molecules from tensor state (CPU) ─────────────────
         n_atoms_list  = n_atoms.cpu().tolist()
