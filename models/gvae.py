@@ -9,7 +9,6 @@ Shared utilities (PropertyHead, decode_to_smiles, valency tables,
 gvae_prepare_batch) are kept here because they are also imported by
 models/gvae_ar.py and the training code.
 """
-import collections
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -409,80 +408,15 @@ def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
 # ---------------------------------------------------------------------------
 
 
-def _bfs_reorder_dense(target_nodes: torch.Tensor,
-                       target_edges: torch.Tensor) -> tuple:
-    """Reorder atoms in dense (B, N) / (B, N, N) targets into BFS canonical order.
-
-    The encoder (GINEConv + global_add_pool) is permutation-invariant, so z is
-    identical regardless of atom ordering.  The flat MLP decoder is strictly
-    positional: without a consistent ordering the decoder must learn to map a
-    permutation-invariant z to an arbitrary positional assignment — an
-    ill-posed problem that prevents generalisation.
-
-    BFS order (start = highest-degree atom, ties broken by atom index) is the
-    same canonical scheme used by the AR decoder, giving both models the same
-    structural prior::
-
-        position 0 → most-connected atom (ring junction / backbone)
-        position 1..k → BFS-expanded neighbourhood
-
-    Runs on CPU (per-molecule graph is ~38 atoms — negligible overhead).
-    Returns reordered tensors on the original device.
-    """
-    tn = target_nodes.cpu().numpy().copy()   # (B, N)
-    te = target_edges.cpu().numpy().copy()   # (B, N, N)
-    B, N = tn.shape
-
-    for b in range(B):
-        n = int((tn[b] > 0).sum())
-        if n <= 1:
-            continue
-        adj = (te[b, :n, :n] > 0)
-        degrees = adj.sum(1)
-        start = int(degrees.argmax())
-
-        visited = [False] * n
-        order = []
-        q = collections.deque([start])
-        visited[start] = True
-        while q:
-            node = q.popleft()
-            order.append(node)
-            for nb in adj[node].nonzero()[0].tolist():
-                if not visited[nb]:
-                    visited[nb] = True
-                    q.append(nb)
-        # Disconnected atoms (rare in clean data)
-        for i in range(n):
-            if not visited[i]:
-                visited[i] = True
-                order.append(i)
-                q2 = collections.deque([i])
-                while q2:
-                    nd = q2.popleft()
-                    for nb in adj[nd].nonzero()[0].tolist():
-                        if not visited[nb]:
-                            visited[nb] = True
-                            q2.append(nb)
-                            order.append(nb)
-
-        perm = np.array(order, dtype=np.int64)
-        tn[b, :n]     = tn[b, perm]
-        te[b, :n, :n] = te[b][np.ix_(perm, perm)]
-
-    device = target_nodes.device
-    return (torch.from_numpy(tn).to(device),
-            torch.from_numpy(te).to(device))
-
-
 def gvae_prepare_batch(data, device, max_atoms):
     """Move a PyG batch to device and build dense target tensors.
 
-    Atoms are reordered into BFS canonical order (same scheme as the AR
-    decoder) so the flat MLP decoder has a structurally consistent positional
-    assignment to learn from.  The encoder input (x_in, edge_index,
-    edge_attr_in) is unchanged — GINEConv + global_add_pool is
-    permutation-invariant and does not depend on atom ordering.
+    PyG's ZINC dataset stores atoms in RDKit canonical DFS order (the order
+    they appear in the canonical SMILES string).  This is already the most
+    consistent positional encoding available for the flat MLP decoder — similar
+    substructures land at similar positions across molecules.  No reordering
+    is applied.  The encoder inputs are unchanged; GINEConv + global_add_pool
+    is permutation-invariant.
     """
     data = data.to(device)
     x_in         = data.x.squeeze(-1) + 1
@@ -492,5 +426,4 @@ def gvae_prepare_batch(data, device, max_atoms):
         data.edge_index, data.batch,
         edge_attr=edge_attr_in, max_num_nodes=max_atoms,
     ).squeeze(-1).long()
-    target_nodes, target_edges = _bfs_reorder_dense(target_nodes, target_edges)
     return x_in, data.edge_index, edge_attr_in, data.batch, target_nodes, target_edges
