@@ -291,79 +291,102 @@ def _build_zinc250k_datasets(seed: int = 42):
     Returns (train_list, val_list) — plain Python lists of PyG Data objects.
     """
     os.makedirs('data/ZINC', exist_ok=True)
-    cache_train = os.path.join('data', 'ZINC', 'zinc250k_pyg_train.pt')
     # v2 suffix marks the standardized (molvs) cache; old v1 files are bypassed.
     cache_train = os.path.join('data', 'ZINC', 'zinc250k_pyg_train_v2.pt')
     cache_val   = os.path.join('data', 'ZINC', 'zinc250k_pyg_val_v2.pt')
 
-    if os.path.exists(cache_train) and os.path.exists(cache_val):
-        # Re-generate missing .txt files from the .pt cache so FRATTVAE's
-        # get_smiles_list() doesn't fail (the .pt files carry data.smiles).
+    def _load_cache():
+        """Load from cache, regenerating .txt side-files if absent."""
         txt_train = os.path.join('data', 'ZINC', 'smiles_train.txt')
         txt_val   = os.path.join('data', 'ZINC', 'smiles_val.txt')
+        train_list = torch.load(cache_train, weights_only=False)
+        val_list   = torch.load(cache_val,   weights_only=False)
         if not os.path.exists(txt_train) or not os.path.exists(txt_val):
             print("Regenerating smiles_*.txt from .pt cache…")
-            train_list = torch.load(cache_train, weights_only=False)
-            val_list   = torch.load(cache_val,   weights_only=False)
             with open(txt_train, 'w') as f:
                 f.write('\n'.join(d.smiles for d in train_list))
             with open(txt_val, 'w') as f:
                 f.write('\n'.join(d.smiles for d in val_list))
             print(f"Written {len(train_list)} train + {len(val_list)} val SMILES.")
-            return train_list, val_list
-        return torch.load(cache_train, weights_only=False), torch.load(cache_val, weights_only=False)
+        return train_list, val_list
 
-    print("Downloading ZINC250k from HuggingFace (edmanft/zinc250k)…")
-    from datasets import load_dataset
-    hf_ds      = load_dataset('edmanft/zinc250k', split='train')
-    all_smiles = list(hf_ds['smiles'])
+    # Fast path: cache already present — no lock needed.
+    if os.path.exists(cache_train) and os.path.exists(cache_val):
+        return _load_cache()
 
-    rng = random.Random(seed)
-    rng.shuffle(all_smiles)
-    n_train      = int(0.95 * len(all_smiles))
-    train_smiles = all_smiles[:n_train]
-    val_smiles   = all_smiles[n_train:]
+    # Slow path: build from scratch.  All SLURM array tasks start simultaneously,
+    # so we use an exclusive file lock to ensure only ONE task does the expensive
+    # build; the others wait and then load from the cache built by the winner.
+    import fcntl
+    lock_path = os.path.join('data', 'ZINC', 'zinc250k_build.lock')
+    with open(lock_path, 'w') as _lock_fh:
+        print(f"[PID {os.getpid()}] Waiting for dataset build lock…")
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX)   # blocks until no other process holds it
+        # Re-check: another process may have built the cache while we waited.
+        if os.path.exists(cache_train) and os.path.exists(cache_val):
+            print(f"[PID {os.getpid()}] Cache built by another process — loading.")
+            return _load_cache()
 
-    # Standardize SMILES with molvs (same pipeline as original FRATTVAE paper).
-    # ~0.8 % of molecules change: sulfinyl S(=O) → zwitterion [S+]([O-]).
-    # Both representations are in our atom/bond vocabulary, but standardizing
-    # ensures consistency with the paper's training distribution.
-    print("Standardizing SMILES with molvs…")
-    from rdkit import Chem as _Chem
-    from molvs import Standardizer as _Std
-    # molvs logs every rule application at INFO level; silence it.
-    import logging as _logging
-    for _lg in ('molvs', 'molvs.standardize', 'molvs.normalize', 'molvs.charge'):
-        _logging.getLogger(_lg).setLevel(_logging.ERROR)
-    _stand = _Std()
+        print(f"[PID {os.getpid()}] Building ZINC250k cache (this happens once)…")
 
-    def _std_smi(smi):
-        try:
-            mol = _Chem.MolFromSmiles(smi)
-            if mol is None:
+        print("Downloading ZINC250k from HuggingFace (edmanft/zinc250k)…")
+        from datasets import load_dataset
+        hf_ds      = load_dataset('edmanft/zinc250k', split='train')
+        all_smiles = list(hf_ds['smiles'])
+
+        rng = random.Random(seed)
+        rng.shuffle(all_smiles)
+        n_train      = int(0.95 * len(all_smiles))
+        train_smiles = all_smiles[:n_train]
+        val_smiles   = all_smiles[n_train:]
+
+        # Standardize SMILES with molvs (same pipeline as original FRATTVAE paper).
+        # ~0.8 % of molecules change: sulfinyl S(=O) → zwitterion [S+]([O-]).
+        # Both representations are in our atom/bond vocabulary, but standardizing
+        # ensures consistency with the paper's training distribution.
+        print("Standardizing SMILES with molvs…")
+        from rdkit import Chem as _Chem
+        from molvs import Standardizer as _Std
+        # molvs logs every rule application at INFO level; silence it.
+        import logging as _logging
+        for _lg in ('molvs', 'molvs.standardize', 'molvs.normalize', 'molvs.charge'):
+            _logging.getLogger(_lg).setLevel(_logging.ERROR)
+        _stand = _Std()
+
+        def _std_smi(smi):
+            try:
+                mol = _Chem.MolFromSmiles(smi)
+                if mol is None:
+                    return None
+                return _Chem.MolToSmiles(_stand.standardize(mol))
+            except Exception:
                 return None
-            return _Chem.MolToSmiles(_stand.standardize(mol))
-        except Exception:
-            return None
 
-    train_smiles = [s for raw in train_smiles if (s := _std_smi(raw)) is not None]
-    val_smiles   = [s for raw in val_smiles   if (s := _std_smi(raw)) is not None]
-    print(f"After standardization: {len(train_smiles)} train, {len(val_smiles)} val.")
+        train_smiles = [s for raw in train_smiles if (s := _std_smi(raw)) is not None]
+        val_smiles   = [s for raw in val_smiles   if (s := _std_smi(raw)) is not None]
+        print(f"After standardization: {len(train_smiles)} train, {len(val_smiles)} val.")
 
-    # Persist SMILES lists for FRATTVAE / quick re-use.
-    for fname, smi_list in [('smiles_train.txt', train_smiles),
-                             ('smiles_val.txt',   val_smiles)]:
-        with open(os.path.join('data', 'ZINC', fname), 'w') as f:
-            f.write('\n'.join(smi_list))
+        # Persist SMILES lists for FRATTVAE / quick re-use.
+        for fname, smi_list in [('smiles_train.txt', train_smiles),
+                                 ('smiles_val.txt',   val_smiles)]:
+            with open(os.path.join('data', 'ZINC', fname), 'w') as f:
+                f.write('\n'.join(smi_list))
 
-    print(f"Converting {len(train_smiles)} train + {len(val_smiles)} val SMILES → PyG…")
-    train_list = [d for s in train_smiles if (d := _smiles_to_pyg_data(s)) is not None]
-    val_list   = [d for s in val_smiles   if (d := _smiles_to_pyg_data(s)) is not None]
-    print(f"Converted: {len(train_list)} train, {len(val_list)} val molecules.")
+        print(f"Converting {len(train_smiles)} train + {len(val_smiles)} val SMILES → PyG…")
+        train_list = [d for s in train_smiles if (d := _smiles_to_pyg_data(s)) is not None]
+        val_list   = [d for s in val_smiles   if (d := _smiles_to_pyg_data(s)) is not None]
+        print(f"Converted: {len(train_list)} train, {len(val_list)} val molecules.")
 
-    torch.save(train_list, cache_train)
-    torch.save(val_list,   cache_val)
-    return train_list, val_list
+        # Save to temp files first, then atomically rename so that a concurrent
+        # reader never observes a partially-written cache.
+        tmp_train = cache_train + '.tmp'
+        tmp_val   = cache_val   + '.tmp'
+        torch.save(train_list, tmp_train)
+        torch.save(val_list,   tmp_val)
+        os.replace(tmp_train, cache_train)
+        os.replace(tmp_val,   cache_val)
+        # Lock is released when the `with` block exits.
+        return train_list, val_list
 
 
 def ar_collate_fn(data_list, *, max_atoms, eos_id, max_seq_len):
