@@ -3,40 +3,42 @@ from rdkit import Chem
 
 MOSES_ATOM_DECODER = {0: 6, 1: 7, 2: 8, 3: 9, 4: 16, 5: 17, 6: 35, 7: 1}
 
-# 1-indexed atom class (data stores 0-indexed; gvae_prepare_batch / ar_collate_fn
-# apply +1 before feeding to the model) → atomic number.
-# Classes 1-17 correspond to the 17 unique (atomic_num, formal_charge) pairs
+# 0-indexed atom class (matching _ZINC_ATOM_VOCAB in utils.py; data.x stores these
+# 0-indexed values directly).  decode_to_smiles and mol_from_data both look up
+# cls = atom_idx - 1 (after the +1 shift applied in training) → key range 0-16.
+# Classes 0-16 correspond to the 17 unique (atomic_num, formal_charge) pairs
 # in the ZINC250k (aspuru-guzik/chemical_vae 250k_rndm_zinc_drugs_clean_3.csv).
 ZINC_ATOM_DECODER = {
-    1:  6,   # C
-    2:  7,   # N
-    3:  8,   # O
-    4:  16,  # S
-    5:  9,   # F
-    6:  7,   # N+
-    7:  17,  # Cl
-    8:  8,   # O-
-    9:  35,  # Br
-    10: 7,   # N-
-    11: 53,  # I
-    12: 16,  # S-
-    13: 15,  # P
-    14: 8,   # O+
-    15: 16,  # S+
-    16: 6,   # C-
-    17: 15,  # P+
+    0:  6,   # C
+    1:  7,   # N
+    2:  8,   # O
+    3:  16,  # S
+    4:  9,   # F
+    5:  7,   # N+
+    6:  17,  # Cl
+    7:  8,   # O-
+    8:  35,  # Br
+    9:  7,   # N-
+    10: 53,  # I
+    11: 16,  # S-
+    12: 15,  # P
+    13: 8,   # O+
+    14: 16,  # S+
+    15: 6,   # C-
+    16: 15,  # P+
 }
 
 # Non-zero formal charges only; classes absent here have charge 0.
+# Keys are 0-indexed (matching ZINC_ATOM_DECODER above).
 ZINC_CHARGE_DECODER = {
-    6:  +1,  # N+
-    8:  -1,  # O-
-    10: -1,  # N-
-    12: -1,  # S-
-    14: +1,  # O+
-    15: +1,  # S+
-    16: -1,  # C-
-    17: +1,  # P+
+    5:  +1,  # N+
+    7:  -1,  # O-
+    9:  -1,  # N-
+    11: -1,  # S-
+    13: +1,  # O+
+    14: +1,  # S+
+    15: -1,  # C-
+    16: +1,  # P+
 }
 
 # ---------------------------------------------------------------------------

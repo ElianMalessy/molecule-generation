@@ -61,11 +61,13 @@ def compute_smiles_props(smiles: str) -> Optional[tuple[float, float, float]]:
 # Reconstruct RDKit mol from a PyG Data object
 # ---------------------------------------------------------------------------
 
+# Bond-type index encoding used in data.edge_attr (0-indexed, set by _smiles_to_pyg_data):
+#   0 = single, 1 = aromatic, 2 = double, 3 = triple
 _BOND_TYPE_MAP = {
     0: Chem.BondType.SINGLE,
-    1: Chem.BondType.DOUBLE,
-    2: Chem.BondType.TRIPLE,
-    3: Chem.BondType.AROMATIC,
+    1: Chem.BondType.AROMATIC,
+    2: Chem.BondType.DOUBLE,
+    3: Chem.BondType.TRIPLE,
 }
 
 

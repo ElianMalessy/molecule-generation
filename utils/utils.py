@@ -106,7 +106,7 @@ class GVAEARConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.1         # γ: property loss weight (constant).
+    prop_weight: float = 1.0         # γ: property loss weight (constant).
                                      # GVAE_AR collapses to the free_bits floor (KL=2.56)
                                      # by epoch 2; the IAF in GVAE_AR_NF prevents this by
                                      # keeping effective KL ~5.3 nats. Without the flow,
@@ -292,10 +292,26 @@ def _build_zinc250k_datasets(seed: int = 42):
     """
     os.makedirs('data/ZINC', exist_ok=True)
     cache_train = os.path.join('data', 'ZINC', 'zinc250k_pyg_train.pt')
-    cache_val   = os.path.join('data', 'ZINC', 'zinc250k_pyg_val.pt')
+    # v2 suffix marks the standardized (molvs) cache; old v1 files are bypassed.
+    cache_train = os.path.join('data', 'ZINC', 'zinc250k_pyg_train_v2.pt')
+    cache_val   = os.path.join('data', 'ZINC', 'zinc250k_pyg_val_v2.pt')
 
     if os.path.exists(cache_train) and os.path.exists(cache_val):
-        return torch.load(cache_train), torch.load(cache_val)
+        # Re-generate missing .txt files from the .pt cache so FRATTVAE's
+        # get_smiles_list() doesn't fail (the .pt files carry data.smiles).
+        txt_train = os.path.join('data', 'ZINC', 'smiles_train.txt')
+        txt_val   = os.path.join('data', 'ZINC', 'smiles_val.txt')
+        if not os.path.exists(txt_train) or not os.path.exists(txt_val):
+            print("Regenerating smiles_*.txt from .pt cache…")
+            train_list = torch.load(cache_train, weights_only=False)
+            val_list   = torch.load(cache_val,   weights_only=False)
+            with open(txt_train, 'w') as f:
+                f.write('\n'.join(d.smiles for d in train_list))
+            with open(txt_val, 'w') as f:
+                f.write('\n'.join(d.smiles for d in val_list))
+            print(f"Written {len(train_list)} train + {len(val_list)} val SMILES.")
+            return train_list, val_list
+        return torch.load(cache_train, weights_only=False), torch.load(cache_val, weights_only=False)
 
     print("Downloading ZINC250k from HuggingFace (edmanft/zinc250k)…")
     from datasets import load_dataset
@@ -307,6 +323,28 @@ def _build_zinc250k_datasets(seed: int = 42):
     n_train      = int(0.95 * len(all_smiles))
     train_smiles = all_smiles[:n_train]
     val_smiles   = all_smiles[n_train:]
+
+    # Standardize SMILES with molvs (same pipeline as original FRATTVAE paper).
+    # ~0.8 % of molecules change: sulfinyl S(=O) → zwitterion [S+]([O-]).
+    # Both representations are in our atom/bond vocabulary, but standardizing
+    # ensures consistency with the paper's training distribution.
+    print("Standardizing SMILES with molvs…")
+    from rdkit import Chem as _Chem
+    from molvs import Standardizer as _Std
+    _stand = _Std()
+
+    def _std_smi(smi):
+        try:
+            mol = _Chem.MolFromSmiles(smi)
+            if mol is None:
+                return None
+            return _Chem.MolToSmiles(_stand.standardize(mol))
+        except Exception:
+            return None
+
+    train_smiles = [s for raw in train_smiles if (s := _std_smi(raw)) is not None]
+    val_smiles   = [s for raw in val_smiles   if (s := _std_smi(raw)) is not None]
+    print(f"After standardization: {len(train_smiles)} train, {len(val_smiles)} val.")
 
     # Persist SMILES lists for FRATTVAE / quick re-use.
     for fname, smi_list in [('smiles_train.txt', train_smiles),
