@@ -2,12 +2,10 @@ import random
 import numpy as np
 import torch
 from functools import partial
-from torch_geometric.datasets import ZINC
-from torch_geometric.data import Batch
+from torch_geometric.data import Data, Batch
 from torch_geometric.utils import to_dense_batch, to_dense_adj
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.loader import DataLoader as PyGDataLoader
-from torch_geometric.transforms import BaseTransform
 
 import os
 import pandas as pd
@@ -86,15 +84,15 @@ class GVAENFConfig:
 @dataclass
 class GVAEARConfig:
     """GVAE with autoregressive Transformer decoder."""
-    batch_size: int = 128
+    batch_size: int = 256
     epochs: int = 1000
-    lr: float = 1e-3
+    lr: float = 2e-3
     weight_decay: float = 1e-4
-    patience: int = 10
+    patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 1.0
-    kl_anneal_steps: int = 60_000    # same ramp rate as before (0.00025 nats/step); reaches
+    kl_anneal_steps: int = 60_000    # 0.00025 nats/step; at batch=256 this covers ~70 epochs
                                      # C_max at ~35 epochs then holds — AR decoder needs less
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
     kl_capacity_max: float = 15.0    # AR decoder reconstructs at ~3.5 nats; 15 nats gives
@@ -126,15 +124,15 @@ class GVAEARConfig:
 @dataclass
 class GVAEARNFConfig:
     """GVAE_AR with IAF normalizing flow encoder."""
-    batch_size: int = 128
+    batch_size: int = 512
     epochs: int = 1000
-    lr: float = 1e-3
+    lr: float = 4e-3
     weight_decay: float = 1e-4
-    patience: int = 10
+    patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 1.0
-    kl_anneal_steps: int = 57_000    # same ramp rate as original (0.000351 nats/step); reaches
+    kl_anneal_steps: int = 57_000    # 0.000351 nats/step; at batch=256 covers ~66 epochs
                                      # C_max at ~33 epochs — NF improves posterior quality, not qty
     free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
     kl_capacity_max: float = 20.0    # NF: 20 nats sufficient; AR context handles local structure
@@ -160,7 +158,7 @@ class FRATTVAEConfig:
     batch_size: int = 2048           # paper: 2048
     epochs: int = 1000
     lr: float = 1e-4                 # paper: 1e-4
-    patience: int = 10
+    patience: int = 20
     latent_dim: int = 256            # paper: d_latent=256
     kl_weight: float = 0.0005        # paper: kl_w=0.0005
     depth: int = 32                  # paper: maxLength=32
@@ -208,45 +206,122 @@ class PropsDataset(torch.utils.data.Dataset):
         return data
 
 
-class ZINCWithSmiles(torch.utils.data.Dataset):
+
+
+# ---------------------------------------------------------------------------
+# ZINC250k dataset helpers
+# ---------------------------------------------------------------------------
+
+# (atomic_num, formal_charge) → 0-indexed atom class (0=C, …, 16=P+).
+# gvae_prepare_batch / ar_collate_fn apply +1 so the model sees classes 1-17.
+_ZINC_ATOM_VOCAB: dict = {
+    (6,   0):  0,  # C
+    (7,   0):  1,  # N
+    (8,   0):  2,  # O
+    (16,  0):  3,  # S
+    (9,   0):  4,  # F
+    (7,  +1):  5,  # N+
+    (17,  0):  6,  # Cl
+    (8,  -1):  7,  # O-
+    (35,  0):  8,  # Br
+    (7,  -1):  9,  # N-
+    (53,  0): 10,  # I
+    (16, -1): 11,  # S-
+    (15,  0): 12,  # P
+    (8,  +1): 13,  # O+
+    (16, +1): 14,  # S+
+    (6,  -1): 15,  # C-
+    (15, +1): 16,  # P+
+}
+
+
+def _smiles_to_pyg_data(smi: str):
+    """Convert a SMILES string to a PyG Data object.
+
+    Atom features (x): shape (N, 1), long, 0-indexed class 0-16.
+    Edge features (edge_attr): shape (2E, 1), long, 0-indexed:
+        0=single, 1=aromatic, 2=double, 3=triple.
+    Both directions stored (undirected graph convention).
+    Returns None if RDKit cannot parse the SMILES.
     """
-    Wraps the PyG ZINC dataset to inject a `data.smiles` field.
+    from rdkit import Chem
+    _bond_vocab = {
+        Chem.BondType.SINGLE:   0,
+        Chem.BondType.AROMATIC: 1,
+        Chem.BondType.DOUBLE:   2,
+        Chem.BondType.TRIPLE:   3,
+    }
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return None
+    # Re-parse canonical SMILES to get a consistent atom ordering.
+    mol = Chem.MolFromSmiles(Chem.MolToSmiles(mol))
+    if mol is None:
+        return None
 
-    PyG ZINC stores only graph tensors (x, edge_attr, edge_index, y) and
-    carries no SMILES string.  We read the pre-built smiles_*.txt files
-    (same source, same ordering — no filtering is applied to ZINC) and
-    attach the string at index i as data.smiles.
+    xs = [_ZINC_ATOM_VOCAB.get((a.GetAtomicNum(), a.GetFormalCharge()), 0)
+          for a in mol.GetAtoms()]
+    x = torch.tensor(xs, dtype=torch.long).unsqueeze(1)  # (N, 1)
 
-    Both PropsDataset and ar_collate_fn propagate the field correctly:
-    PropsDataset uses data.clone() (copies all Data attributes) and
-    Batch.from_data_list collects string fields into a list on the batch.
+    src, dst, ea = [], [], []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bt = _bond_vocab.get(bond.GetBondType(), 0)
+        src += [i, j]; dst += [j, i]; ea += [bt, bt]
+
+    if src:
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+        edge_attr  = torch.tensor(ea, dtype=torch.long).unsqueeze(1)  # (2E, 1)
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_attr  = torch.zeros((0, 1), dtype=torch.long)
+
+    data        = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+    data.smiles = Chem.MolToSmiles(mol)  # canonical
+    return data
+
+
+def _build_zinc250k_datasets(seed: int = 42):
+    """Download ZINC250k from HuggingFace, make a 95/5 train/val split, and
+    convert all molecules to PyG Data objects.  Results are cached as .pt files
+    so subsequent calls are instant.  The SMILES lists are also written to
+    smiles_train.txt / smiles_val.txt so FRATTVAE can reuse them via
+    get_smiles_list().
+
+    Returns (train_list, val_list) — plain Python lists of PyG Data objects.
     """
-    def __init__(self, base_dataset, smiles_list: list):
-        assert len(base_dataset) == len(smiles_list), (
-            f"ZINC dataset length ({len(base_dataset)}) ≠ "
-            f"smiles list length ({len(smiles_list)})"
-        )
-        self.base   = base_dataset
-        self.smiles = smiles_list
+    os.makedirs('data/ZINC', exist_ok=True)
+    cache_train = os.path.join('data', 'ZINC', 'zinc250k_pyg_train.pt')
+    cache_val   = os.path.join('data', 'ZINC', 'zinc250k_pyg_val.pt')
 
-    def __len__(self):
-        return len(self.base)
+    if os.path.exists(cache_train) and os.path.exists(cache_val):
+        return torch.load(cache_train), torch.load(cache_val)
 
-    def __getitem__(self, idx):
-        data = self.base[idx].clone()
-        data.smiles = self.smiles[idx]
-        return data
+    print("Downloading ZINC250k from HuggingFace (edmanft/zinc250k)…")
+    from datasets import load_dataset
+    hf_ds      = load_dataset('edmanft/zinc250k', split='train')
+    all_smiles = list(hf_ds['smiles'])
 
+    rng = random.Random(seed)
+    rng.shuffle(all_smiles)
+    n_train      = int(0.95 * len(all_smiles))
+    train_smiles = all_smiles[:n_train]
+    val_smiles   = all_smiles[n_train:]
 
-class NormalizeZINCBonds(BaseTransform):
-    """
-    ZINC bonds are naturally 1, 2, 3, 4.
-    We shift them to 0, 1, 2, 3 to match MOSES and 0-indexing standards.
-    """
-    def forward(self, data):
-        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
-            data.edge_attr = data.edge_attr - 1
-        return data
+    # Persist SMILES lists for FRATTVAE / quick re-use.
+    for fname, smi_list in [('smiles_train.txt', train_smiles),
+                             ('smiles_val.txt',   val_smiles)]:
+        with open(os.path.join('data', 'ZINC', fname), 'w') as f:
+            f.write('\n'.join(smi_list))
+
+    print(f"Converting {len(train_smiles)} train + {len(val_smiles)} val SMILES → PyG…")
+    train_list = [d for s in train_smiles if (d := _smiles_to_pyg_data(s)) is not None]
+    val_list   = [d for s in val_smiles   if (d := _smiles_to_pyg_data(s)) is not None]
+    print(f"Converted: {len(train_list)} train, {len(val_list)} val molecules.")
+
+    torch.save(train_list, cache_train)
+    torch.save(val_list,   cache_val)
+    return train_list, val_list
 
 
 def ar_collate_fn(data_list, *, max_atoms, eos_id, max_seq_len):
@@ -278,10 +353,10 @@ def get_dataloaders(config: Config, logger):
         gc = {'GVAE': config.gvae, 'GVAE_NF': config.gvae_nf,
               'GVAE_AR': config.gvae_ar, 'GVAE_AR_NF': config.gvae_ar_nf}[config.model]
         if config.dataset == 'ZINC':
-            transform = NormalizeZINCBonds()
-            train_dataset = ZINC(root='data/ZINC', subset=False, split='train', pre_transform=transform)
-            val_dataset = ZINC(root='data/ZINC', subset=False, split='val', pre_transform=transform)
-            num_node_features, num_edge_features = 29, 5
+            train_dataset, val_dataset = _build_zinc250k_datasets(seed=config.seed)
+            # 18 node slots: 0=pad, 1-17=atom classes (after +1 shift in training)
+            # 5 edge slots:  0=no-bond, 1=single, 2=aromatic, 3=double, 4=triple
+            num_node_features, num_edge_features = 18, 5
         else:
             train_dataset = MosesPyGDataset(root='data/MOSES', split='train', max_atoms=gc.max_atoms)
             val_dataset = MosesPyGDataset(root='data/MOSES', split='test', max_atoms=gc.max_atoms)
@@ -296,8 +371,11 @@ def get_dataloaders(config: Config, logger):
         # For GVAE_AR/GVAE_AR_NF: append EOS weight=1.0 at index num_node_features.
         # EOS is the only termination signal — boosting it causes premature stops;
         # suppressing it causes infinite loops — keep it neutral.
-        if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF') and hasattr(train_dataset, '_data'):
-            raw_x   = train_dataset._data.x.squeeze(-1).long() + 1  # 1-indexed; no padding in raw data
+        if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
+            if hasattr(train_dataset, '_data'):
+                raw_x = train_dataset._data.x.squeeze(-1).long() + 1
+            else:
+                raw_x = torch.cat([d.x.squeeze(-1) for d in train_dataset]).long() + 1
             cnt     = torch.bincount(raw_x, minlength=num_node_features).float()
             present = cnt > 0
             max_cnt = cnt[present].max()                        # count of the most common class (C)
@@ -320,15 +398,16 @@ def get_dataloaders(config: Config, logger):
         # predicting 0, achieving low CE without ever learning actual bond patterns.
         # Identical fix to node weights: anchor no-bond at 1.0, amplify each bond
         # type by sqrt(cnt_no_bond / cnt_bond), capped at 10×.
-        if (config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF')
-                and hasattr(train_dataset, '_data')
-                and hasattr(train_dataset, 'slices')
-                and 'x' in train_dataset.slices):
-            raw_e   = train_dataset._data.edge_attr.squeeze(-1).long() + 1  # 1-indexed bond types
+        if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
+            if hasattr(train_dataset, '_data') and hasattr(train_dataset, 'slices') and 'x' in train_dataset.slices:
+                raw_e = train_dataset._data.edge_attr.squeeze(-1).long() + 1
+                sizes = (train_dataset.slices['x'][1:] - train_dataset.slices['x'][:-1]).long()
+            else:
+                raw_e = torch.cat([d.edge_attr.squeeze(-1) for d in train_dataset]).long() + 1
+                sizes = torch.tensor([d.x.size(0) for d in train_dataset], dtype=torch.long)
             ebinc   = torch.bincount(raw_e, minlength=num_edge_features).float()[:num_edge_features]
             bcnt    = ebinc / 2.0          # undirected: each bond stored twice
             # Number of valid (real×real) upper-triangle pairs across all training molecules
-            sizes   = (train_dataset.slices['x'][1:] - train_dataset.slices['x'][:-1]).long()
             n_pairs = float((sizes * (sizes - 1) // 2).sum().item())
             n_no_bond = max(n_pairs - bcnt[1:].sum().item(), 1.0)
             ew      = torch.ones(num_edge_features)
@@ -471,22 +550,21 @@ def get_dataloaders(config: Config, logger):
 
 def get_smiles_list(dataset_name, split):
     if dataset_name == 'ZINC':
-        # Mirror the PyG ZINC (full) split sizes: 220011 train / 24445 val / 4999 test
-        _ZINC_SPLITS = {'train': (0, 220011), 'val': (220011, 244456), 'test': (244456, None)}
+        # The canonical SMILES files are written by _build_zinc250k_datasets().
+        # Supported splits: 'train' (95 %) and 'val' (5 %) of ZINC250k.
         cache_path = os.path.join('data', 'ZINC', f'smiles_{split}.txt')
         if os.path.exists(cache_path):
             with open(cache_path) as f:
                 return [line.strip() for line in f if line.strip()]
-        from datasets import load_dataset
-        hf_ds = load_dataset('edmanft/zinc250k', split='train')
-        all_smiles = [s.strip() for s in hf_ds['smiles']]
-        # Save all splits to disk on first run
-        os.makedirs(os.path.join('data', 'ZINC'), exist_ok=True)
-        for sp, (start, end) in _ZINC_SPLITS.items():
-            with open(os.path.join('data', 'ZINC', f'smiles_{sp}.txt'), 'w') as f:
-                f.write('\n'.join(all_smiles[start:end]))
-        start, end = _ZINC_SPLITS[split]
-        return all_smiles[start:end]
+        # First call: build/download dataset, which persists the txt files.
+        _build_zinc250k_datasets(seed=42)
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                return [line.strip() for line in f if line.strip()]
+        raise FileNotFoundError(
+            f"ZINC smiles file not found after dataset build: {cache_path}. "
+            f"Supported splits are 'train' and 'val'."
+        )
     else:
         moses_split = 'train' if split == 'train' else 'test'
         cache_path = os.path.join('data', 'MOSES', f'smiles_{moses_split}.txt')

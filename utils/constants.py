@@ -3,17 +3,40 @@ from rdkit import Chem
 
 MOSES_ATOM_DECODER = {0: 6, 1: 7, 2: 8, 3: 9, 4: 16, 5: 17, 6: 35, 7: 1}
 
+# 1-indexed atom class (data stores 0-indexed; gvae_prepare_batch / ar_collate_fn
+# apply +1 before feeding to the model) → atomic number.
+# Classes 1-17 correspond to the 17 unique (atomic_num, formal_charge) pairs
+# in the ZINC250k (aspuru-guzik/chemical_vae 250k_rndm_zinc_drugs_clean_3.csv).
 ZINC_ATOM_DECODER = {
-    0: 6, 1: 8, 2: 7, 3: 9, 4: 6, 5: 16, 6: 17, 7: 8,
-    8: 7, 9: 35, 10: 7, 11: 7, 12: 7, 13: 7, 14: 16, 15: 53,
-    16: 15, 17: 8, 18: 7, 19: 8, 20: 16, 21: 15, 22: 15, 23: 6,
-    24: 15, 25: 16, 26: 6, 27: 15
+    1:  6,   # C
+    2:  7,   # N
+    3:  8,   # O
+    4:  16,  # S
+    5:  9,   # F
+    6:  7,   # N+
+    7:  17,  # Cl
+    8:  8,   # O-
+    9:  35,  # Br
+    10: 7,   # N-
+    11: 53,  # I
+    12: 16,  # S-
+    13: 15,  # P
+    14: 8,   # O+
+    15: 16,  # S+
+    16: 6,   # C-
+    17: 15,  # P+
 }
 
+# Non-zero formal charges only; classes absent here have charge 0.
 ZINC_CHARGE_DECODER = {
-    7: -1, 8: 1, 10: 1, 11: 1, 12: 1, 13: -1, 14: -1,
-    17: 1, 18: -1, 19: 1, 20: 1, 23: -1, 24: 1, 25: 1,
-    26: -1, 27: 1
+    6:  +1,  # N+
+    8:  -1,  # O-
+    10: -1,  # N-
+    12: -1,  # S-
+    14: +1,  # O+
+    15: +1,  # S+
+    16: -1,  # C-
+    17: +1,  # P+
 }
 
 # ---------------------------------------------------------------------------
@@ -35,15 +58,16 @@ MAX_VALENCE = {
     53: 1,   # I
 }
 
-# Valence units consumed per bond-type index.
-# Aromatic bonds are tracked as 1 (integer approximation).
-BOND_ORDER = {0: 0, 1: 1, 2: 2, 3: 3, 4: 1}
+# Valence units consumed per bond-type index (1-indexed after +1 shift in training).
+# Bond index encoding: 0=no-bond, 1=single, 2=aromatic, 3=double, 4=triple.
+# Aromatic bonds are counted as 1 valence unit (integer approximation for valency masking).
+BOND_ORDER = {0: 0, 1: 1, 2: 1, 3: 2, 4: 3}
 
 
 def get_rdkit_bond(bond_idx: int) -> Chem.BondType:
     return {
         1: Chem.BondType.SINGLE,
-        2: Chem.BondType.DOUBLE,
-        3: Chem.BondType.TRIPLE,
-        4: Chem.BondType.AROMATIC,
+        2: Chem.BondType.AROMATIC,
+        3: Chem.BondType.DOUBLE,
+        4: Chem.BondType.TRIPLE,
     }.get(bond_idx, Chem.BondType.SINGLE)

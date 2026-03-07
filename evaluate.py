@@ -427,8 +427,9 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
         ndummys    = metadata['ndummys'].to(device)
         model.set_labels(metadata['uni_fragments'])
 
-        n_correct = 0
-        n_total   = 0
+        n_correct    = 0
+        n_total      = 0
+        sample_pairs = []          # (ref_smi, pred_smi, match) — first 16 for display
         with torch.no_grad():
             for frag_indices, positions, _ in val_loader:
                 B, L    = frag_indices.shape
@@ -454,13 +455,33 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                 for pred, ref in zip(decoded, refs):
                     ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None
                     pred_mol = Chem.MolFromSmiles(pred) if pred else None
+                    match = False
                     if ref_mol and pred_mol:
-                        if (Chem.MolToSmiles(ref_mol, isomericSmiles=False) ==
-                                Chem.MolToSmiles(pred_mol, isomericSmiles=False)):
+                        ref_smi  = Chem.MolToSmiles(ref_mol,  isomericSmiles=False)
+                        pred_smi = Chem.MolToSmiles(pred_mol, isomericSmiles=False)
+                        match    = (ref_smi == pred_smi)
+                        if match:
                             n_correct += 1
+                    else:
+                        ref_smi  = ref  or 'None'
+                        pred_smi = pred or 'None'
+                    if len(sample_pairs) < 16:
+                        sample_pairs.append((ref_smi, pred_smi, match))
                 n_total += B
                 if n_total >= n_recon:
                     break
+
+        w = 52
+        sep = '+' + '-' * (w + 2) + '+' + '-' * (w + 2) + '+-------+'
+        logger.info("--- Sample reconstructions (first 16 from val set) ---")
+        logger.info(sep)
+        logger.info(f"| {'REF':<{w}} | {'PRED':<{w}} | MATCH |")
+        logger.info(sep)
+        for ref_s, pred_s, ok in sample_pairs:
+            tick = '  ✓    ' if ok else '  ✗    '
+            logger.info(f"| {ref_s[:w]:<{w}} | {pred_s[:w]:<{w}} |{tick}|")
+        logger.info(sep)
+
         return n_correct / max(1, n_total)
 
     return None
