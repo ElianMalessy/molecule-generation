@@ -369,12 +369,21 @@ def _compute_recon_rate(model, val_loader, config: Config, device, metadata,
                                               valency_mask=gc.valency_mask,
                                               temperature=recon_T)
 
-                # Ground-truth SMILES from the batch's dense target tensors.
-                # valency_mask=False for the reference: decode the true graph
-                # exactly as stored without imposing valency constraints.
-                ref_smiles_batch = _graph_targets_to_smiles(
-                    target_nodes, target_edges, gc.max_atoms,
-                    atom_decoder, charge_dec, valency_mask=False)
+                # Ground-truth SMILES: prefer data.smiles stored on each PyG Data
+                # object (set during _smiles_to_pyg_data) — this is exact and never
+                # produces None.  Fall back to graph-decoding only for MOSES (which
+                # does not store .smiles).
+                if hasattr(batch, 'smiles') and batch.smiles:
+                    ref_smiles_batch = []
+                    for smi in batch.smiles:
+                        mol = Chem.MolFromSmiles(smi) if smi else None
+                        # Strip isomeric markers so comparison is topology-only
+                        ref_smiles_batch.append(
+                            Chem.MolToSmiles(mol, isomericSmiles=False) if mol else None)
+                else:
+                    ref_smiles_batch = _graph_targets_to_smiles(
+                        target_nodes, target_edges, gc.max_atoms,
+                        atom_decoder, charge_dec, valency_mask=False)
 
                 for pred, ref in zip(decoded, ref_smiles_batch):
                     ref_mol  = Chem.MolFromSmiles(ref)  if ref  else None

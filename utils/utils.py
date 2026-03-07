@@ -45,7 +45,11 @@ class GVAEConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.3
+    kl_weight: float = 1.0           # capacity penalty weight: loss += kl_weight * |KL - C|.
+                                     # Must be ≥1.0 for the flat decoder: at 0.3 the encoder
+                                     # can maintain KL=65 >> C=25 because the reconstruction
+                                     # benefit of extra bits outweighs the 0.3*40=12 nat penalty.
+                                     # At 1.0 the penalty (1.0*40=40 nats) overwhelms it.
     kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
     kl_capacity_max: float = 25.0   # target KL ceiling (nats); ramps from 0
@@ -65,11 +69,8 @@ class GVAENFConfig:
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.3          # same as GVAE: same recon scale (~55-60 nats),
-                                    # so same kl_weight keeps the KL/recon fraction
-                                    # consistent. The IAF log-det already adds to
-                                    # kl_flow, so 0.3 gives slightly more KL pressure
-                                    # than GVAE — no need to raise the weight further.
+    kl_weight: float = 1.0           # same reasoning as GVAEConfig: must be 1.0 to prevent
+                                    # KL >> capacity, especially since the IAF adds log_det.
     kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
     kl_capacity_max: float = 25.0   # NF: same ceiling as GVAE (weak MLP decoder is the bottleneck)
@@ -92,11 +93,12 @@ class GVAEARConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 1.0
-    kl_anneal_steps: int = 60_000    # 0.00025 nats/step; at batch=256 this covers ~70 epochs
-                                     # C_max at ~35 epochs then holds — AR decoder needs less
+    kl_anneal_steps: int = 60_000    # β ramp: 0 → kl_weight over this many steps.
+                                     # At batch=256 this covers ~70 epochs; encoder learns
+                                     # informative posterior before KL penalty is applied.
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
-    kl_capacity_max: float = 15.0    # AR decoder reconstructs at ~3.5 nats; 15 nats gives
-                                     # ~11.5 spare for property-correlated encoding
+    kl_capacity_max: float = 15.0    # UNUSED for AR models (β-annealing replaces capacity hinge);
+                                     # kept for serialisation compatibility.
     valency_mask: bool = False
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
@@ -132,10 +134,11 @@ class GVAEARNFConfig:
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 1.0
-    kl_anneal_steps: int = 57_000    # 0.000351 nats/step; at batch=256 covers ~66 epochs
-                                     # C_max at ~33 epochs — NF improves posterior quality, not qty
+    kl_anneal_steps: int = 57_000    # β ramp: 0 → kl_weight over this many steps.
+                                     # At batch=512 this covers ~60 epochs.
     free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
-    kl_capacity_max: float = 20.0    # NF: 20 nats sufficient; AR context handles local structure
+    kl_capacity_max: float = 20.0    # UNUSED for AR models (β-annealing replaces capacity hinge);
+                                     # kept for serialisation compatibility.
     num_flows: int = 4
     flow_hidden_dim: int = 256
     valency_mask: bool = False

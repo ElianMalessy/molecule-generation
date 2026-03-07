@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from models.gvae_ar import GraphVAEARNF, gvae_ar_loss, gvae_ar_nf_loss
-from utils.utils import Config, kl_capacity
+from utils.utils import Config
 from utils.properties import normalise_props
 
 logger = logging.getLogger(__name__)
@@ -46,8 +46,14 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
         seq_lens      = seq_lens.to(device)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            kl_weight = mc.kl_weight
-            capacity  = kl_capacity(global_step, mc.kl_capacity_max, mc.kl_anneal_steps)
+            # β-annealing: ramp β from 0 → kl_weight over kl_anneal_steps.
+            # This forces the encoder to learn an informative posterior (by minimising
+            # reconstruction at β=0) before the KL penalty regularises it toward N(0,I).
+            # The capacity hinge (β·|KL−C|) is NOT used for AR models because it allows
+            # Mutual Information Collapse: the encoder can satisfy |KL−C|=0 by outputting
+            # a constant μ for every input — zero MI — which is exactly what we observed
+            # (all reconstructions identical despite diverse prior samples).
+            beta = mc.kl_weight * min(1.0, global_step / max(1, mc.kl_anneal_steps))
             if use_nf:
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
@@ -55,16 +61,15 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
                 loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
-                                              kl_weight, free_bits=mc.free_bits_per_dim,
-                                              capacity=capacity)
+                                              beta, free_bits=mc.free_bits_per_dim)
             else:
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens,
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
-                loss, _, kl = gvae_ar_loss(recon, mu, logvar, kl_weight,
-                                           free_bits=mc.free_bits_per_dim, capacity=capacity)
+                loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta,
+                                           free_bits=mc.free_bits_per_dim)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
             if mc.prop_pred and hasattr(pyg_batch, 'props'):
@@ -148,8 +153,7 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
         seq_lens      = seq_lens.to(device)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            beta     = mc.kl_weight
-            capacity = kl_capacity(global_step, mc.kl_capacity_max, mc.kl_anneal_steps)
+            beta = mc.kl_weight * min(1.0, global_step / max(1, mc.kl_anneal_steps))
             if use_nf:
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
@@ -157,8 +161,7 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
                 loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
-                                              beta, free_bits=mc.free_bits_per_dim,
-                                              capacity=capacity)
+                                              beta, free_bits=mc.free_bits_per_dim)
             else:
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
@@ -166,7 +169,7 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
                 loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta,
-                                           free_bits=mc.free_bits_per_dim, capacity=capacity)
+                                           free_bits=mc.free_bits_per_dim)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
             if mc.prop_pred and hasattr(pyg_batch, 'props'):

@@ -198,6 +198,22 @@ def train(config: Config):
 
     logger.info(f"Starting training on {device}...")
     for epoch in range(1, mc.epochs + 1):
+        # Guard against NaN parameters (e.g. GVAE_AR_NF IAF overflow that slips
+        # through the per-batch guard).  If any parameter is non-finite, the
+        # last good checkpoint is restored and Adam moments are wiped before
+        # proceeding — this recovers cleanly instead of training on garbage.
+        if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
+            nan_params = [n for n, p in model.named_parameters()
+                          if not torch.isfinite(p).all()]
+            if nan_params and os.path.exists(checkpoint_path):
+                logger.warning(
+                    f"Epoch {epoch}: NaN/Inf in {len(nan_params)} parameter tensor(s) "
+                    f"({nan_params[:3]}{'...' if len(nan_params) > 3 else ''}) — "
+                    f"reloading last checkpoint and resetting optimizer state.")
+                model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+                for state in optimizer.state.values():
+                    state.clear()   # wipe Adam exp_avg / exp_avg_sq accumulators
+
         ep_kw = dict(epoch=epoch, prop_mean=prop_mean, prop_std=prop_std,
                      node_class_weights=node_class_weights,
                      edge_class_weights=edge_class_weights)

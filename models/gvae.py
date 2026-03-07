@@ -123,10 +123,22 @@ def decode_to_smiles(node_logits_np, edge_logits_np, max_atoms,
 
     try:
         result = Chem.SanitizeMol(mol, catchErrors=True)
-        if result != Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
-            return None
-        smi = Chem.MolToSmiles(mol)
-        return smi if (smi and Chem.MolFromSmiles(smi) is not None) else None
+        if result == Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
+            smi = Chem.MolToSmiles(mol)
+            return smi if (smi and Chem.MolFromSmiles(smi) is not None) else None
+        # Fallback: replace inconsistent AROMATIC bonds with SINGLE and retry.
+        # Common decoder error: aromatic bond predicted outside a ring, or in a
+        # ring that fails Hückel aromaticity (e.g. 5-membered all-carbon).
+        for bond in mol.GetBonds():
+            if bond.GetBondType() == Chem.BondType.AROMATIC:
+                bond.SetBondType(Chem.BondType.SINGLE)
+        for atom in mol.GetAtoms():
+            atom.SetIsAromatic(False)   # must clear; SanitizeMol re-perceives from scratch
+        result2 = Chem.SanitizeMol(mol, catchErrors=True)
+        if result2 == Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
+            smi = Chem.MolToSmiles(mol)
+            return smi if (smi and Chem.MolFromSmiles(smi) is not None) else None
+        return None
     except Exception:
         return None
 

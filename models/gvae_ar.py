@@ -7,7 +7,7 @@ from rdkit import Chem
 from models.encoder import GINEConvEncoder
 from models.flows import InverseAutoregressiveFlow
 from models.gvae import PropertyHead, decode_to_smiles
-from utils.constants import MAX_VALENCE, BOND_ORDER, get_rdkit_bond
+from utils.constants import MAX_VALENCE, BOND_ORDER, get_rdkit_bond, decode_bond_type
 
 def _bfs_order(adj_bin, n: int) -> list:
     """Return atom indices in BFS order starting from the highest-degree atom.
@@ -648,7 +648,15 @@ class ARDecoder(nn.Module):
         return results
 
     def _build_mol(self, atoms: list, bonds: dict):
-        """Build and sanitize an RDKit molecule from decoded atoms and bonds."""
+        """Build and sanitize an RDKit molecule from decoded atoms and bonds.
+
+        Two-step sanitization: first try with explicit AROMATIC bond types (preserves
+        aromaticity for valid ring systems).  If RDKit's aromaticity-perception rejects
+        the annotation (e.g. the decoder placed an aromatic bond outside a ring, or the
+        ring is not a valid Hückel system), convert all AROMATIC bonds to SINGLE in-place
+        and sanitize again.  This fallback handles the most common decoder error (aromatic
+        bonds in non-ring positions) while still returning aromatic SMILES for correct rings.
+        """
         if not atoms:
             return None
         mol = Chem.RWMol()
@@ -662,10 +670,20 @@ class ARDecoder(nn.Module):
                 mol.AddBond(i, j, bond_type)
         try:
             result = Chem.SanitizeMol(mol, catchErrors=True)
-            if result != Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
-                return None
-            smi = Chem.MolToSmiles(mol)
-            return smi if (smi and Chem.MolFromSmiles(smi)) else None
+            if result == Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
+                smi = Chem.MolToSmiles(mol)
+                return smi if (smi and Chem.MolFromSmiles(smi)) else None
+            # Fallback: replace inconsistent AROMATIC bonds with SINGLE and retry.
+            for bond in mol.GetBonds():
+                if bond.GetBondType() == Chem.BondType.AROMATIC:
+                    bond.SetBondType(Chem.BondType.SINGLE)
+            for atom in mol.GetAtoms():
+                atom.SetIsAromatic(False)   # must clear; SanitizeMol re-perceives from scratch
+            result2 = Chem.SanitizeMol(mol, catchErrors=True)
+            if result2 == Chem.rdmolops.SanitizeFlags.SANITIZE_NONE:
+                smi = Chem.MolToSmiles(mol)
+                return smi if (smi and Chem.MolFromSmiles(smi)) else None
+            return None
         except Exception:
             return None
 
@@ -765,15 +783,24 @@ def gvae_ar_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Tenso
                  kl_weight: float, free_bits: float = 0.0, capacity: float = 0.0):
     """Combine AR reconstruction loss with KL divergence.
 
-    free_bits: minimum KL per latent dimension (nats).
-    capacity:  target KL (nats); loss = kl_weight * |KL - capacity|.
+    free_bits : minimum KL per latent dimension (nats); prevents full posterior collapse.
+    kl_weight : β — passed already-annealed from the training loop (0 → kl_weight_max).
+    capacity  : unused (kept for API compatibility); β-annealing replaces the capacity hinge.
+
+    Using a capacity hinge (kl_weight * |KL - C|) causes Mutual Information Collapse:
+    the encoder satisfies the hinge by outputting a constant μ for every input (zero MI)
+    while the decoder learns to decode only from that single point.  Prior sampling looks
+    diverse (decoder is rich) but reconstruction always gives the same molecule.
+    β-annealing fixes this: at β=0 the encoder must encode inputs to minimise recon loss,
+    establishing an informative posterior before the KL penalty is turned on.
+
     Returns (total, recon, kl) where kl is the raw (unweighted) divergence.
     """
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
     kl = kl_per_dim.sum(dim=1).mean()
-    total = recon_loss + kl_weight * (kl - capacity).abs()
+    total = recon_loss + kl_weight * kl   # straight β·KL; β is pre-annealed by caller
     return total, recon_loss, kl
 
 
@@ -885,8 +912,9 @@ def gvae_ar_nf_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Te
                     free_bits: float = 0.0, capacity: float = 0.0):
     """AR + NF combined loss (same KL formulation as gvae_nf_loss).
 
-    free_bits: minimum KL per latent dimension applied to the base q0 term.
-    capacity: target KL (nats); loss = kl_weight * |KL - capacity|.
+    free_bits : minimum KL per latent dimension applied to the base q0 term.
+    kl_weight : β — passed already-annealed from the training loop (0 → kl_weight_max).
+    capacity  : unused (kept for API compatibility); β-annealing replaces the capacity hinge.
     Returns (total, recon, kl_flow) where kl_flow is the raw divergence.
     """
     std = (0.5 * logvar).exp()
@@ -895,5 +923,5 @@ def gvae_ar_nf_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Te
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
     kl_flow = kl_per_dim.sum(dim=1).mean() - sum_log_det.mean()
-    total   = recon_loss + kl_weight * (kl_flow - capacity).abs()
+    total   = recon_loss + kl_weight * kl_flow   # straight β·KL; β is pre-annealed by caller
     return total, recon_loss, kl_flow
