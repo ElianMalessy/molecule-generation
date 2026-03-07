@@ -115,10 +115,12 @@ class GVAEARConfig:
                                      # weight=0.1 is too weak to force the encoder to encode
                                      # property info before collapse. 1.0 provides enough
                                      # gradient to prevent the collapse.
-    context_dropout: float = 0.35   # fraction of input tokens replaced with 0 during training.
+    context_dropout: float = 0.5    # fraction of input tokens replaced with 0 during training.
                                      # At 0.15 the decoder retains 85 % sequential context and
                                      # learns to ignore z — encoder μ collapses to one mode.
-                                     # 0.35 forces the decoder to use z for structural decisions.
+                                     # 0.35 forces the decoder to use z for structural decisions;
+                                     # 0.5 provides stronger forcing now that edge class weights
+                                     # make bond prediction require z for the hidden positions.
 
 
 @dataclass
@@ -150,7 +152,7 @@ class GVAEARNFConfig:
     prop_weight: float = 0.1         # γ: property loss weight (constant).
                                      # IAF keeps effective KL ~5.3 nats → encoder stays
                                      # informative from epoch 1, so 0.1 is sufficient.
-    context_dropout: float = 0.35   # see GVAEARConfig for reasoning; same value applies.
+    context_dropout: float = 0.5    # see GVAEARConfig for reasoning; same value applies.
 
 
 @dataclass
@@ -310,12 +312,15 @@ def get_dataloaders(config: Config, logger):
                         f"C: {w[1]:.3f}  O: {w[2]:.3f}  N: {w[3]:.3f}  "
                         f"max_rare: {w[1:].max():.2f}")
 
-        # Compute edge class weights for GVAE / GVAE_NF (flat decoder only).
+        # Compute edge class weights for all GVAE variants (flat and AR decoder).
         # Within valid atom pairs, ~90 % are no-bond; unweighted CE defaults to
         # predicting no-bond everywhere → disconnected chains instead of ring systems.
+        # For AR models this is especially severe: ~90.6 % of all edge tokens in the
+        # BFS sequence are class-0 (no-bond), so the AR edge head collapses to always
+        # predicting 0, achieving low CE without ever learning actual bond patterns.
         # Identical fix to node weights: anchor no-bond at 1.0, amplify each bond
         # type by sqrt(cnt_no_bond / cnt_bond), capped at 10×.
-        if (config.model in ('GVAE', 'GVAE_NF')
+        if (config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF')
                 and hasattr(train_dataset, '_data')
                 and hasattr(train_dataset, 'slices')
                 and 'x' in train_dataset.slices):
@@ -400,6 +405,38 @@ def get_dataloaders(config: Config, logger):
         train_data = build_frattvae_dataset(train_smiles, cache_dir, split_name='train', **frattvae_kwargs)
         logger.info("Building / loading FRATTVAE validation dataset...")
         val_data = build_frattvae_dataset(val_smiles, cache_dir, split_name=val_split, **frattvae_kwargs)
+
+        # ── Remap val fragment indices to the training vocabulary ────────────────
+        # Each split's build_frattvae_dataset constructs an independent vocabulary
+        # (val has 9 431 frags vs train's 30 893 for ZINC).  Val frag_indices are
+        # offsets into the val vocab, not the train vocab, so using them with the
+        # train frag_ecfps table gives completely wrong ECFP features and wrong
+        # cross-entropy targets.  We remap every val molecule's fragment indices
+        # to training vocab positions via a dict lookup; unknown validation
+        # fragments (not in training vocab) map to slot 0 (= padding / zero-vec).
+        train_vocab     = train_data['uni_fragments']
+        val_vocab       = val_data['uni_fragments']
+        train_frag_idx  = {smi: i for i, smi in enumerate(train_vocab)}
+        val_ds_raw      = val_data['dataset']
+        new_fi, new_pos, new_prop = [], [], []
+        n_unknown_slots = 0
+        for i in range(len(val_ds_raw)):
+            fi, pos, prop = val_ds_raw[i]
+            remapped = torch.tensor(
+                [train_frag_idx.get(val_vocab[idx.item()], 0) for idx in fi],
+                dtype=torch.long,
+            )
+            # Count newly-unknown slots (extra zeros beyond original padding)
+            n_unknown_slots += int((remapped == 0).sum()) - int((fi == 0).sum())
+            new_fi.append(remapped)
+            new_pos.append(pos)
+            new_prop.append(prop)
+        from models.frattvae.dataset import ListDataset as _ListDataset
+        val_data['dataset'] = _ListDataset(new_fi, new_pos, torch.stack(new_prop))
+        logger.info(
+            f"Val vocab remapped to training vocab ({len(train_vocab)} fragments); "
+            f"{n_unknown_slots} fragment slots replaced with padding (unknown fragments)."
+        )
 
         train_loader = TorchDataLoader(
             train_data['dataset'],

@@ -186,8 +186,8 @@ def train(config: Config):
     freq_label = metadata.get('freq_label')
     prop_mean  = metadata.get('prop_mean')   # None when prop_pred=False
     prop_std   = metadata.get('prop_std')
-    node_class_weights = metadata.get('node_class_weights')  # None for AR / FRATTVAE / MOSES
-    edge_class_weights = metadata.get('edge_class_weights')  # None for AR / FRATTVAE / MOSES
+    node_class_weights = metadata.get('node_class_weights')  # None for FRATTVAE / MOSES
+    edge_class_weights = metadata.get('edge_class_weights')  # None for FRATTVAE / MOSES
 
     if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
         logger.info(f"Valency masking: {'ON' if mc.valency_mask else 'OFF'}")

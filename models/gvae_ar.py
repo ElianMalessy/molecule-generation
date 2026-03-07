@@ -185,17 +185,6 @@ class _CausalLayer(nn.Module):
         B, L, _ = t.shape
         return t.reshape(B, L, self.n_heads, self.head_dim).transpose(1, 2)
 
-    def _adaln(self, x: torch.Tensor, z_cond: torch.Tensor,
-               gamma: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
-        """Apply AdaLN-Zero: (1 + γ) ⊙ LN(x) + β.
-
-        x      : (B, L, d_model)
-        gamma  : (B, d_model) — per-sequence scale shift (from adaLN_proj)
-        beta   : (B, d_model) — per-sequence bias   (from adaLN_proj)
-        Returns (B, L, d_model).
-        """
-        return (1 + gamma.unsqueeze(1)) * self.norm1(x) + beta.unsqueeze(1)
-
     def forward(self, x: torch.Tensor, z_cond: torch.Tensor,
                 attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Full-sequence causal forward (teacher-forced training).
@@ -389,7 +378,8 @@ class ARDecoder(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, z, input_tokens, target_tokens, target_types, seq_lens,
-                context_dropout: float = 0.0, node_class_weights=None):
+                context_dropout: float = 0.0, node_class_weights=None,
+                edge_class_weights=None):
         max_L  = target_tokens.size(1)
         device = z.device
 
@@ -432,8 +422,10 @@ class ARDecoder(nn.Module):
                 self.node_head(h_valid[n_mask]), tgt_valid[n_mask],
                 weight=node_w, reduction='sum')
         if e_mask.any():
+            edge_w = (edge_class_weights.to(device) if edge_class_weights is not None else None)
             loss = loss + F.cross_entropy(
-                self.edge_head(h_valid[e_mask]), tgt_valid[e_mask], reduction='sum')
+                self.edge_head(h_valid[e_mask]), tgt_valid[e_mask],
+                weight=edge_w, reduction='sum')
         return loss / total_tokens.float()
 
     # ------------------------------------------------------------------
@@ -736,7 +728,7 @@ class GraphVAEAR(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 input_tokens, target_tokens, target_types, seq_lens,
-                node_class_weights=None):
+                node_class_weights=None, edge_class_weights=None):
         """Teacher-forced training forward pass.
 
         BFS sequences are pre-built by ar_collate_fn in DataLoader workers.
@@ -751,7 +743,8 @@ class GraphVAEAR(nn.Module):
         z = self.reparameterize(mu, logvar)
         recon_loss = self.decoder(z, input_tokens, target_tokens, target_types, seq_lens,
                                   context_dropout=self.context_dropout,
-                                  node_class_weights=node_class_weights)
+                                  node_class_weights=node_class_weights,
+                                  edge_class_weights=edge_class_weights)
         return recon_loss, mu, logvar
 
     def sample_smiles(self, z, atom_decoder_dict=None, charge_decoder=None,
@@ -851,7 +844,7 @@ class GraphVAEARNF(nn.Module):
 
     def forward(self, x, edge_index, edge_attr, batch,
                 input_tokens, target_tokens, target_types, seq_lens,
-                node_class_weights=None):
+                node_class_weights=None, edge_class_weights=None):
         """Teacher-forced training forward pass.
 
         BFS sequences are pre-built by ar_collate_fn in DataLoader workers.
@@ -870,7 +863,8 @@ class GraphVAEARNF(nn.Module):
         zK, sum_log_det = self.flow(z0)
         recon_loss = self.decoder(zK, input_tokens, target_tokens, target_types, seq_lens,
                                   context_dropout=self.context_dropout,
-                                  node_class_weights=node_class_weights)
+                                  node_class_weights=node_class_weights,
+                                  edge_class_weights=edge_class_weights)
         return recon_loss, mu, logvar, z0, zK, sum_log_det
 
     def sample_smiles(self, z, atom_decoder_dict=None, charge_decoder=None,

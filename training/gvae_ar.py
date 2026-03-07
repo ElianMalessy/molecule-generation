@@ -49,7 +49,8 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens,
-                    node_class_weights=node_class_weights)
+                    node_class_weights=node_class_weights,
+                    edge_class_weights=edge_class_weights)
                 loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
                                               kl_weight, free_bits=mc.free_bits_per_dim,
                                               capacity=capacity)
@@ -57,7 +58,8 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens,
-                    node_class_weights=node_class_weights)
+                    node_class_weights=node_class_weights,
+                    edge_class_weights=edge_class_weights)
                 loss, _, kl = gvae_ar_loss(recon, mu, logvar, kl_weight,
                                            free_bits=mc.free_bits_per_dim, capacity=capacity)
 
@@ -135,7 +137,8 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                 recon, mu, logvar, z0, zK, sum_log_det = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens,
-                    node_class_weights=node_class_weights)
+                    node_class_weights=node_class_weights,
+                    edge_class_weights=edge_class_weights)
                 loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
                                               beta, free_bits=mc.free_bits_per_dim,
                                               capacity=capacity)
@@ -143,7 +146,8 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                 recon, mu, logvar = model(
                     x_in, pyg_batch.edge_index, edge_attr_in, pyg_batch.batch,
                     input_tokens, target_tokens, target_types, seq_lens,
-                    node_class_weights=node_class_weights)
+                    node_class_weights=node_class_weights,
+                    edge_class_weights=edge_class_weights)
                 loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta,
                                            free_bits=mc.free_bits_per_dim, capacity=capacity)
 
