@@ -161,7 +161,7 @@ def train(config: Config):
         # Paper uses constant lr throughout — no scheduler
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
     else:
-        # All GVAE variants: AdamW + cosine schedule.
+        # All GVAE variants: Adam + cosine schedule.
         # The prop head gets its own higher LR (3× backbone) to counteract the
         # Adam second-moment asymmetry: the backbone's v_t is built up from strong
         # reconstruction + KL gradients, so the prop-to-encoder signal (rank-3)
@@ -217,7 +217,7 @@ def train(config: Config):
             train_l, train_recon, train_kl, train_true_kl, train_raw_prop, global_step = train_epoch_gvae(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            val_l, val_recon, val_kl, val_true_kl, val_prop, val_raw_prop = val_epoch_gvae(
+            val_l, val_recon, val_kl, val_true_kl, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
             
@@ -235,10 +235,10 @@ def train(config: Config):
                 f"| val:   {val_l:.4f} (recon={val_recon:.4f}, clamped_kl={val_kl:.4f}, true_kl={val_true_kl:.4f})"
                 f"{val_prop_str}")
         elif config.model in ('GVAE_AR', 'GVAE_AR_NF'):
-            train_l, train_recon, train_kl, train_true_kl, train_prop, train_raw_prop, global_step = train_epoch_gvae_ar(
+            train_l, train_recon, train_kl, train_true_kl, train_raw_prop, global_step = train_epoch_gvae_ar(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            val_l, val_recon, val_kl, val_true_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
+            val_l, val_recon, val_kl, val_true_kl, val_raw_prop = val_epoch_gvae_ar(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
 
