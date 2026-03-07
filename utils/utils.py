@@ -41,7 +41,6 @@ class GVAEConfig:
     batch_size: int = 128
     epochs: int = 1000
     lr: float = 1e-3
-    weight_decay: float = 1e-4
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
@@ -65,7 +64,6 @@ class GVAENFConfig:
     batch_size: int = 128
     epochs: int = 1000
     lr: float = 1e-3
-    weight_decay: float = 1e-4
     patience: int = 10
     max_atoms: int = 38
     latent_dim: int = 128
@@ -88,7 +86,6 @@ class GVAEARConfig:
     batch_size: int = 256
     epochs: int = 1000
     lr: float = 2e-3
-    weight_decay: float = 1e-4
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
@@ -123,7 +120,6 @@ class GVAEARNFConfig:
     batch_size: int = 512
     epochs: int = 1000
     lr: float = 4e-3
-    weight_decay: float = 1e-4
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128

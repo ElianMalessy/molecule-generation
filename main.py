@@ -23,7 +23,6 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Train Molecular VAE")
     parser.add_argument('--model',        type=str,   default='GVAE', choices=['GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF', 'FRATTVAE'])
     parser.add_argument('--dataset',      type=str,   default='ZINC', choices=['ZINC', 'MOSES'])
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--valency_mask', action='store_true',
                         help='Enable valency masking during GVAE decoding')
     # Joint property prediction
@@ -32,7 +31,6 @@ def parse_args() -> Config:
     parser.add_argument('--prop_weight', type=float, default=None, help='property loss weight')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
-    config.gvae.weight_decay = args.weight_decay
     if args.valency_mask:
         config.gvae.valency_mask = True
         config.gvae_nf.valency_mask = True
@@ -43,8 +41,8 @@ def parse_args() -> Config:
         config.gvae_nf.prop_pred          = True
         config.gvae_ar.prop_pred          = True
         config.gvae_ar_nf.prop_pred          = True
+
         # Override per-model weight defaults only when the flag is explicitly passed.
-        # GVAE/NF: 5.0  |  GVAE_AR: 1.0  |  GVAE_AR_NF: 0.1
         if args.prop_weight is not None:
             config.gvae.prop_weight        = args.prop_weight
             config.gvae_nf.prop_weight     = args.prop_weight
@@ -177,9 +175,7 @@ def train(config: Config):
         param_groups = [{'params': backbone_params, 'lr': mc.lr}]
         if prop_params:
             param_groups.append({'params': prop_params, 'lr': mc.lr * 3})
-        optimizer = torch.optim.AdamW(param_groups,
-                                      weight_decay=mc.weight_decay,
-                                      fused=device.type == 'cuda')
+        optimizer = torch.optim.Adam(param_groups, fused=device.type == 'cuda')
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=mc.epochs)
 
     frag_ecfps = metadata.get('frag_ecfps')
@@ -218,45 +214,45 @@ def train(config: Config):
                      node_class_weights=node_class_weights,
                      edge_class_weights=edge_class_weights)
         if config.model in ('GVAE', 'GVAE_NF'):
-            train_l, train_recon, train_kl, train_true_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae(
+            train_l, train_recon, train_kl, train_true_kl, train_raw_prop, global_step = train_epoch_gvae(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
             val_l, val_recon, val_kl, val_true_kl, val_prop, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            # ckpt_loss includes prop (gamma is constant, already baked into val_l)
-            ckpt_loss = val_l
-            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}  grad={train_prop_gnorm:.2e}"
+            
+            
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
                               if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}, true_kl={train_true_kl:.4f})"
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, clamped_kl={train_kl:.4f}, true_kl={train_true_kl:.4f})"
                 f"{train_prop_str}")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f}, true_kl={val_true_kl:.4f})"
-                f"{val_prop_str}  [ckpt={ckpt_loss:.4f}]")
+                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, clamped_kl={val_kl:.4f}, true_kl={val_true_kl:.4f})"
+                f"{val_prop_str}")
         elif config.model in ('GVAE_AR', 'GVAE_AR_NF'):
-            train_l, train_recon, train_kl, train_true_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae_ar(
+            train_l, train_recon, train_kl, train_true_kl, train_prop, train_raw_prop, global_step = train_epoch_gvae_ar(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
             val_l, val_recon, val_kl, val_true_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
 
-            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}  grad={train_prop_gnorm:.2e}"
+            train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
                               if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}, true_kl={train_true_kl:.4f})"
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, clamped_kl={train_kl:.4f}, true_kl={train_true_kl:.4f})"
                 f"{train_prop_str}")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f}, true_kl={val_true_kl:.4f})"
+                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, clamped_kl={val_kl:.4f}, true_kl={val_true_kl:.4f})"
                 f"{val_prop_str}")
         else:
             train_l, train_label, train_kl, global_step = train_epoch_frattvae(

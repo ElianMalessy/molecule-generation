@@ -22,7 +22,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                      prop_mean=None, prop_std=None, node_class_weights=None,
                      edge_class_weights=None):
     model.train()
-    total_loss = total_recon = total_kl = total_true_kl = total_prop = total_raw_prop = 0.0
+    total_loss = total_recon = total_kl = total_true_kl = total_raw_prop = 0.0
     total_prop_gnorm = 0.0
     n_batches = 0
     use_nf = isinstance(model, GraphVAENF)
@@ -63,8 +63,8 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                 true_z = normalise_props(data.props.to(device, dtype=torch.float32),
                                          prop_mean, prop_std)
                 raw_prop_loss = F.mse_loss(model.predict_props(mu), true_z)
-                if gamma > 0:
-                    loss = loss + gamma * raw_prop_loss
+                prop_loss = gamma * raw_prop_loss
+                loss += prop_loss
 
         if not torch.isfinite(loss):
             logger.warning(f"Non-finite loss ({loss.item():.4g}) at step {global_step} — skipping batch.")
@@ -87,15 +87,6 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
             global_step += 1
             continue
 
-        # Prop head gradient norm (0.0 during warmup when head not in loss)
-        prop_gnorm = 0.0
-        if mc.prop_pred and gamma > 0 and getattr(model, 'prop_head', None) is not None:
-            sq = [p.grad.detach().norm().item() ** 2
-                  for p in model.prop_head.parameters() if p.grad is not None]
-            prop_gnorm = sum(sq) ** 0.5 if sq else 0.0
-        total_prop_gnorm += prop_gnorm
-        n_batches += 1
-
         optimizer.step()
         global_step += 1
 
@@ -103,13 +94,11 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         total_recon    += recon.item()                   * data.num_graphs
         total_kl       += kl.item()                       * data.num_graphs
         total_true_kl  += true_kl.item()                  * data.num_graphs
-        total_prop     += (gamma * raw_prop_loss).item() * data.num_graphs
-        total_raw_prop += raw_prop_loss.item()           * data.num_graphs
+        total_raw_prop     += raw_prop_loss.item()                * data.num_graphs
 
     n = len(loader.dataset)
-    return (total_loss / n, total_recon / n, total_kl / n, total_true_kl / n,
-            total_prop / n, total_raw_prop / n,
-            total_prop_gnorm / max(1, n_batches), global_step)
+    return total_loss / n, total_recon / n, total_kl / n, total_true_kl / n, total_raw_prop / n, global_step
+
 
 
 @torch.no_grad()
@@ -117,7 +106,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
                    amp_dtype=None, epoch: int = 1, prop_mean=None, prop_std=None,
                    node_class_weights=None, edge_class_weights=None):
     model.eval()
-    total_loss = total_recon = total_kl = total_true_kl = total_prop = total_raw_prop = 0.0
+    total_loss = total_recon = total_kl = total_true_kl = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAENF)
     mc     = config.gvae_nf if use_nf else config.gvae
     gamma  = mc.prop_weight
@@ -133,7 +122,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
             if use_nf:
                 node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det = \
                     model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_nf_loss(
+                loss, recon, kl, true_kl = gvae_nf_loss(
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, z0, zK, sum_log_det, beta,
                     free_bits=mc.free_bits_per_dim, capacity=capacity,
@@ -143,7 +132,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
             else:
                 node_logits, edge_logits, mu, logvar = \
                     model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_loss(
+                loss, recon, kl, true_kl = gvae_loss(
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, beta, free_bits=mc.free_bits_per_dim, capacity=capacity,
                     node_class_weights=node_class_weights,
@@ -155,15 +144,14 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
                 true_z = normalise_props(data.props.to(device, dtype=torch.float32),
                                          prop_mean, prop_std)
                 raw_prop_loss = F.mse_loss(model.predict_props(mu), true_z)
-                if gamma > 0:
-                    loss = loss + gamma * raw_prop_loss
+                prop_loss = gamma * raw_prop_loss
+                loss += prop_loss
 
         total_loss     += loss.item()                    * data.num_graphs
         total_recon    += recon.item()                   * data.num_graphs
         total_kl       += kl.item()                       * data.num_graphs
         total_true_kl  += true_kl.item()                  * data.num_graphs
-        total_prop     += (gamma * raw_prop_loss).item() * data.num_graphs
-        total_raw_prop += raw_prop_loss.item()           * data.num_graphs
+        total_raw_prop     += raw_prop_loss.item()                * data.num_graphs
 
     n = len(loader.dataset)
-    return total_loss / n, total_recon / n, total_kl / n, total_true_kl / n, total_prop / n, total_raw_prop / n
+    return total_loss / n, total_recon / n, total_kl / n, total_true_kl / n, total_raw_prop / n
