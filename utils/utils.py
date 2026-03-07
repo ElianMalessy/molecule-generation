@@ -331,6 +331,10 @@ def _build_zinc250k_datasets(seed: int = 42):
     print("Standardizing SMILES with molvs…")
     from rdkit import Chem as _Chem
     from molvs import Standardizer as _Std
+    # molvs logs every rule application at INFO level; silence it.
+    import logging as _logging
+    for _lg in ('molvs', 'molvs.standardize', 'molvs.normalize', 'molvs.charge'):
+        _logging.getLogger(_lg).setLevel(_logging.ERROR)
     _stand = _Std()
 
     def _std_smi(smi):
