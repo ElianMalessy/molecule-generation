@@ -38,6 +38,15 @@ class GINEConvEncoder(nn.Module):
 
         self.fc_mu     = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        # Zero-init both heads so at epoch 1: mu=0, logvar=0 → q(z|x) = N(0,I),
+        # KL = 0 nats.  Eliminates the epoch-1 KL spike from Kaiming-init weights
+        # driving large mu via global_add_pool (which sums over all atoms).
+        # fc_mu diverges from 0 as recon loss forces the encoder to encode structure;
+        # fc_logvar diverges as the capacity ramp gives the encoder KL budget to use.
+        nn.init.zeros_(self.fc_mu.weight)
+        nn.init.zeros_(self.fc_mu.bias)
+        nn.init.zeros_(self.fc_logvar.weight)
+        nn.init.zeros_(self.fc_logvar.bias)
 
     def forward(self, x, edge_index, edge_attr, batch):
         """Encode a batch of graphs → (mu, logvar) each (B, latent_dim)."""
@@ -50,7 +59,10 @@ class GINEConvEncoder(nn.Module):
         h = F.relu(self.conv4(h,     edge_index, e_emb))
 
         h_graph = global_add_pool(h, batch)
-        return self.fc_mu(h_graph), self.fc_logvar(h_graph)
+        # Clamp logvar so std = exp(0.5*logvar) stays in [exp(-2.5), exp(2.5)] ≈ [0.08, 12].
+        # Combined with zero-init above this is only a safety bound; prevents IAF
+        # MADE overflow on bfloat16 if activations ever drift large mid-training.
+        return self.fc_mu(h_graph), self.fc_logvar(h_graph).clamp(-5, 5)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:

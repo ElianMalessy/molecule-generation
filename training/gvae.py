@@ -5,6 +5,7 @@ A single pair of train/val functions handles both variants by dispatching
 on isinstance(model, GraphVAENF).  The correct config section (config.gvae
 or config.gvae_nf) is selected automatically.
 """
+import logging
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -12,6 +13,8 @@ from tqdm import tqdm
 from models.gvae import GraphVAENF, gvae_loss, gvae_nf_loss, gvae_prepare_batch
 from utils.utils import Config, kl_capacity
 from utils.properties import normalise_props
+
+logger = logging.getLogger(__name__)
 
 
 def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
@@ -63,7 +66,26 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                 if gamma > 0:
                     loss = loss + gamma * raw_prop_loss
 
+        if not torch.isfinite(loss):
+            logger.warning(f"Non-finite loss ({loss.item():.4g}) at step {global_step} — skipping batch.")
+            optimizer.zero_grad()
+            global_step += 1
+            continue
+
         loss.backward()
+
+        prop_param_ids = ({id(p) for p in model.prop_head.parameters()}
+                         if mc.prop_pred and getattr(model, 'prop_head', None) else set())
+        main_params = [p for p in model.parameters() if id(p) not in prop_param_ids]
+        grad_norm = torch.nn.utils.clip_grad_norm_(main_params, 5.0)
+
+        # Guard against NaN/inf gradients.  Adam moment corruption from a single
+        # NaN step would permanently poison all future updates.
+        if not torch.isfinite(grad_norm):
+            logger.warning(f"Non-finite grad norm at step {global_step} — skipping optimizer step.")
+            optimizer.zero_grad()
+            global_step += 1
+            continue
 
         # Prop head gradient norm (0.0 during warmup when head not in loss)
         prop_gnorm = 0.0
@@ -73,11 +95,6 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
             prop_gnorm = sum(sq) ** 0.5 if sq else 0.0
         total_prop_gnorm += prop_gnorm
         n_batches += 1
-
-        prop_param_ids = ({id(p) for p in model.prop_head.parameters()}
-                         if mc.prop_pred and getattr(model, 'prop_head', None) else set())
-        main_params = [p for p in model.parameters() if id(p) not in prop_param_ids]
-        torch.nn.utils.clip_grad_norm_(main_params, 5.0)
 
         optimizer.step()
         global_step += 1

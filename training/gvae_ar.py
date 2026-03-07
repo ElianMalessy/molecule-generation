@@ -9,6 +9,7 @@ runs in worker processes.  Each iteration yields:
     (pyg_batch, input_tokens, target_tokens, target_types, seq_lens)
 all as CPU tensors; we move them to device here.
 """
+import logging
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -16,6 +17,8 @@ from tqdm import tqdm
 from models.gvae_ar import GraphVAEARNF, gvae_ar_loss, gvae_ar_nf_loss
 from utils.utils import Config, kl_capacity
 from utils.properties import normalise_props
+
+logger = logging.getLogger(__name__)
 
 
 def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: int,
@@ -71,6 +74,12 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                 if gamma > 0:
                     loss = loss + gamma * raw_prop_loss
 
+        if not torch.isfinite(loss):
+            logger.warning(f"Non-finite loss ({loss.item():.4g}) at step {global_step} — skipping batch.")
+            optimizer.zero_grad()
+            global_step += 1
+            continue
+
         loss.backward()
         # Clip encoder+decoder only.  The prop head has a tiny gradient norm relative
         # to the AR Transformer decoder (many more tokens → much larger total norm).
@@ -82,7 +91,15 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
             else set()
         )
         main_params = [p for p in model.parameters() if id(p) not in prop_param_ids]
-        torch.nn.utils.clip_grad_norm_(main_params, 5.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(main_params, 5.0)
+
+        # Guard against NaN/inf gradients.  Adam moment corruption from a single
+        # NaN step would permanently poison all future updates.
+        if not torch.isfinite(grad_norm):
+            logger.warning(f"Non-finite grad norm at step {global_step} — skipping optimizer step.")
+            optimizer.zero_grad()
+            global_step += 1
+            continue
 
         # Prop head gradient norm (0.0 during warmup when head not in loss)
         prop_gnorm = 0.0
