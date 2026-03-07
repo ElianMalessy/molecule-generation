@@ -26,7 +26,7 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                         prop_mean=None, prop_std=None, node_class_weights=None,
                         edge_class_weights=None):  # edge weights not used by AR (sequential decoder)
     model.train()
-    total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
+    total_loss = total_recon = total_kl = total_true_kl = total_prop = total_raw_prop = 0.0
     total_prop_gnorm = 0.0
     n_batches = 0
     use_nf = isinstance(model, GraphVAEARNF)
@@ -60,7 +60,7 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                     input_tokens, target_tokens, target_types, seq_lens,
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
-                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
+                loss, _, kl, true_kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
                                               beta, free_bits=mc.free_bits_per_dim)
             else:
                 recon, mu, logvar = model(
@@ -68,7 +68,7 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
                     input_tokens, target_tokens, target_types, seq_lens,
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
-                loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta,
+                loss, _, kl, true_kl = gvae_ar_loss(recon, mu, logvar, beta,
                                            free_bits=mc.free_bits_per_dim)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
@@ -121,11 +121,12 @@ def train_epoch_gvae_ar(model, optimizer, loader, config: Config, global_step: i
         total_loss     += loss.item()                    * pyg_batch.num_graphs
         total_recon    += recon.item()                   * pyg_batch.num_graphs
         total_kl       += kl.item()                       * pyg_batch.num_graphs
+        total_true_kl  += true_kl.item()                  * pyg_batch.num_graphs
         total_prop     += (gamma * raw_prop_loss).item() * pyg_batch.num_graphs
         total_raw_prop += raw_prop_loss.item()           * pyg_batch.num_graphs
 
     n = len(loader.dataset)
-    return (total_loss / n, total_recon / n, total_kl / n,
+    return (total_loss / n, total_recon / n, total_kl / n, total_true_kl / n,
             total_prop / n, total_raw_prop / n,
             total_prop_gnorm / max(1, n_batches), global_step)
 
@@ -136,7 +137,7 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                       prop_mean=None, prop_std=None, node_class_weights=None,
                       edge_class_weights=None):  # edge weights not used by AR (sequential decoder)
     model.eval()
-    total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
+    total_loss = total_recon = total_kl = total_true_kl = total_prop = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAEARNF)
     mc     = config.gvae_ar_nf if use_nf else config.gvae_ar
     gamma  = mc.prop_weight
@@ -160,7 +161,7 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                     input_tokens, target_tokens, target_types, seq_lens,
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
-                loss, _, kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
+                loss, _, kl, true_kl = gvae_ar_nf_loss(recon, mu, logvar, z0, zK, sum_log_det,
                                               beta, free_bits=mc.free_bits_per_dim)
             else:
                 recon, mu, logvar = model(
@@ -168,7 +169,7 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
                     input_tokens, target_tokens, target_types, seq_lens,
                     node_class_weights=node_class_weights,
                     edge_class_weights=edge_class_weights)
-                loss, _, kl = gvae_ar_loss(recon, mu, logvar, beta,
+                loss, _, kl, true_kl = gvae_ar_loss(recon, mu, logvar, beta,
                                            free_bits=mc.free_bits_per_dim)
 
             raw_prop_loss = torch.tensor(0.0, device=device)
@@ -182,9 +183,10 @@ def val_epoch_gvae_ar(model, loader, config: Config, global_step: int,
         total_loss     += loss.item()                    * pyg_batch.num_graphs
         total_recon    += recon.item()                   * pyg_batch.num_graphs
         total_kl       += kl.item()                       * pyg_batch.num_graphs
+        total_true_kl  += true_kl.item()                  * pyg_batch.num_graphs
         total_prop     += (gamma * raw_prop_loss).item() * pyg_batch.num_graphs
         total_raw_prop += raw_prop_loss.item()           * pyg_batch.num_graphs
 
     n = len(loader.dataset)
-    return (total_loss / n, total_recon / n, total_kl / n,
+    return (total_loss / n, total_recon / n, total_kl / n, total_true_kl / n,
             total_prop / n, total_raw_prop / n)

@@ -22,7 +22,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                      prop_mean=None, prop_std=None, node_class_weights=None,
                      edge_class_weights=None):
     model.train()
-    total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
+    total_loss = total_recon = total_kl = total_true_kl = total_prop = total_raw_prop = 0.0
     total_prop_gnorm = 0.0
     n_batches = 0
     use_nf = isinstance(model, GraphVAENF)
@@ -41,7 +41,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
             if use_nf:
                 node_logits, edge_logits, mu, logvar, z0, zK, sum_log_det = \
                     model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_nf_loss(
+                loss, recon, kl, true_kl = gvae_nf_loss(
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, z0, zK, sum_log_det, kl_weight,
                     free_bits=mc.free_bits_per_dim, capacity=capacity,
@@ -51,7 +51,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
             else:
                 node_logits, edge_logits, mu, logvar = \
                     model(x_in, edge_index, edge_attr_in, batch)
-                loss, recon, kl = gvae_loss(
+                loss, recon, kl, true_kl = gvae_loss(
                     node_logits, edge_logits, target_nodes, target_edges,
                     mu, logvar, kl_weight, free_bits=mc.free_bits_per_dim, capacity=capacity,
                     node_class_weights=node_class_weights,
@@ -102,11 +102,12 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         total_loss     += loss.item()                    * data.num_graphs
         total_recon    += recon.item()                   * data.num_graphs
         total_kl       += kl.item()                       * data.num_graphs
+        total_true_kl  += true_kl.item()                  * data.num_graphs
         total_prop     += (gamma * raw_prop_loss).item() * data.num_graphs
         total_raw_prop += raw_prop_loss.item()           * data.num_graphs
 
     n = len(loader.dataset)
-    return (total_loss / n, total_recon / n, total_kl / n,
+    return (total_loss / n, total_recon / n, total_kl / n, total_true_kl / n,
             total_prop / n, total_raw_prop / n,
             total_prop_gnorm / max(1, n_batches), global_step)
 
@@ -116,7 +117,7 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
                    amp_dtype=None, epoch: int = 1, prop_mean=None, prop_std=None,
                    node_class_weights=None, edge_class_weights=None):
     model.eval()
-    total_loss = total_recon = total_kl = total_prop = total_raw_prop = 0.0
+    total_loss = total_recon = total_kl = total_true_kl = total_prop = total_raw_prop = 0.0
     use_nf = isinstance(model, GraphVAENF)
     mc     = config.gvae_nf if use_nf else config.gvae
     gamma  = mc.prop_weight
@@ -160,8 +161,9 @@ def val_epoch_gvae(model, loader, config: Config, global_step: int, device,
         total_loss     += loss.item()                    * data.num_graphs
         total_recon    += recon.item()                   * data.num_graphs
         total_kl       += kl.item()                       * data.num_graphs
+        total_true_kl  += true_kl.item()                  * data.num_graphs
         total_prop     += (gamma * raw_prop_loss).item() * data.num_graphs
         total_raw_prop += raw_prop_loss.item()           * data.num_graphs
 
     n = len(loader.dataset)
-    return total_loss / n, total_recon / n, total_kl / n, total_prop / n, total_raw_prop / n
+    return total_loss / n, total_recon / n, total_kl / n, total_true_kl / n, total_prop / n, total_raw_prop / n

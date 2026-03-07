@@ -797,11 +797,12 @@ def gvae_ar_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Tenso
     Returns (total, recon, kl) where kl is the raw (unweighted) divergence.
     """
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
+    true_kl = kl_per_dim.sum(dim=1).mean().detach()  # for logging only; not used in backprop
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
     kl = kl_per_dim.sum(dim=1).mean()
     total = recon_loss + kl_weight * kl   # straight β·KL; β is pre-annealed by caller
-    return total, recon_loss, kl
+    return total, recon_loss, kl, true_kl
 
 
 # ---------------------------------------------------------------------------
@@ -920,8 +921,9 @@ def gvae_ar_nf_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Te
     std = (0.5 * logvar).exp()
     # Per-dim contribution: log q_0(z_0) - log p(z_K) before the flow correction
     kl_per_dim = -0.5 * (logvar + ((z0 - mu) / (std + 1e-8)).pow(2)) + 0.5 * zK.pow(2)  # (B, D)
+    true_kl = kl_per_dim.sum(dim=1).mean().detach()  # for logging only; not used in backprop
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
     kl_flow = kl_per_dim.sum(dim=1).mean() - sum_log_det.mean()
     total   = recon_loss + kl_weight * kl_flow   # straight β·KL; β is pre-annealed by caller
-    return total, recon_loss, kl_flow
+    return total, recon_loss, kl_flow, true_kl

@@ -56,7 +56,7 @@ class GVAEConfig:
     valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
-    prop_weight: float = 1.0         # γ: property loss weight (constant)
+    prop_weight: float = 1.5         # γ: property loss weight (constant)
 
 
 @dataclass
@@ -79,7 +79,7 @@ class GVAENFConfig:
     valency_mask: bool = False
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.6         # γ: property loss weight (constant)
+    prop_weight: float = 1.0
 
 
 @dataclass
@@ -92,7 +92,7 @@ class GVAEARConfig:
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 1.0
+    kl_weight: float = 0.1
     kl_anneal_steps: int = 60_000    # β ramp: 0 → kl_weight over this many steps.
                                      # At batch=256 this covers ~70 epochs; encoder learns
                                      # informative posterior before KL penalty is applied.
@@ -103,19 +103,13 @@ class GVAEARConfig:
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
     ar_n_heads: int = 8              # attention heads
-    ar_n_layers: int = 4             # Transformer layers
+    ar_n_layers: int = 2             # Transformer layers
     ar_d_ff: int = 512               # feed-forward dim
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 1.0         # γ: property loss weight (constant).
-                                     # GVAE_AR collapses to the free_bits floor (KL=2.56)
-                                     # by epoch 2; the IAF in GVAE_AR_NF prevents this by
-                                     # keeping effective KL ~5.3 nats. Without the flow,
-                                     # weight=0.1 is too weak to force the encoder to encode
-                                     # property info before collapse. 1.0 provides enough
-                                     # gradient to prevent the collapse.
-    context_dropout: float = 0.5    # fraction of input tokens replaced with 0 during training.
+    prop_weight: float = 0.8
+    context_dropout: float = 0.35    # fraction of input tokens replaced with 0 during training.
                                      # At 0.15 the decoder retains 85 % sequential context and
                                      # learns to ignore z — encoder μ collapses to one mode.
                                      # 0.35 forces the decoder to use z for structural decisions;
@@ -133,7 +127,7 @@ class GVAEARNFConfig:
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 1.0
+    kl_weight: float = 0.2
     kl_anneal_steps: int = 57_000    # β ramp: 0 → kl_weight over this many steps.
                                      # At batch=512 this covers ~60 epochs.
     free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
@@ -145,15 +139,13 @@ class GVAEARNFConfig:
     # --- AR Transformer decoder ---
     ar_d_model: int = 256
     ar_n_heads: int = 8
-    ar_n_layers: int = 4
+    ar_n_layers: int = 2
     ar_d_ff: int = 512
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.1         # γ: property loss weight (constant).
-                                     # IAF keeps effective KL ~5.3 nats → encoder stays
-                                     # informative from epoch 1, so 0.1 is sufficient.
-    context_dropout: float = 0.5    # see GVAEARConfig for reasoning; same value applies.
+    prop_weight: float = 0.6
+    context_dropout: float = 0.35
 
 
 @dataclass

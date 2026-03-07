@@ -247,12 +247,26 @@ class GraphVAENF(nn.Module):
         self.prop_head = PropertyHead(latent_dim) if prop_pred else None
 
         self.decoder_nodes = nn.Sequential(
-            nn.Linear(latent_dim, 256), nn.ReLU(),
-            nn.Linear(256, max_atoms * num_node_features),
+            nn.Linear(latent_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, max_atoms * num_node_features),
         )
         self.decoder_edges = nn.Sequential(
-            nn.Linear(latent_dim, 512), nn.ReLU(),
-            nn.Linear(512, max_atoms * max_atoms * num_edge_features),
+            nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Dropout(0.1), # Mild regularization for the dense edge space
+            nn.Linear(1024, 2048),
+            nn.LayerNorm(2048),
+            nn.ReLU(),
+            nn.Linear(2048, max_atoms * max_atoms * num_edge_features),
         )
 
     def encode(self, x, edge_index, edge_attr, batch):
@@ -382,10 +396,11 @@ def gvae_loss(node_logits, edge_logits, target_nodes, target_edges,
                              node_class_weights=node_class_weights,
                              edge_class_weights=edge_class_weights)
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())  # (B, D)
+    true_kl = kl_per_dim.sum(dim=1).mean().detach()  # for logging only; not used in backprop
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
     kl = kl_per_dim.sum(dim=1).mean()
-    return recon + kl_weight * (kl - capacity).abs(), recon, kl
+    return recon + kl_weight * (kl - capacity).abs(), recon, kl, true_kl
 
 
 def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
@@ -402,17 +417,18 @@ def gvae_nf_loss(node_logits, edge_logits, target_nodes, target_edges,
     node_class_weights: passed through to _flat_recon_loss (see docstring there).
     edge_class_weights: passed through to _flat_recon_loss (see docstring there).
 
-    Returns (total, recon, kl_flow).
+    Returns (total, recon, kl_flow, true_kl).
     """
     recon      = _flat_recon_loss(node_logits, edge_logits, target_nodes, target_edges,
                                   node_class_weights=node_class_weights,
                                   edge_class_weights=edge_class_weights)
     std        = (0.5 * logvar).exp()
     kl_per_dim = -0.5 * (logvar + ((z0 - mu) / (std + 1e-8)).pow(2)) + 0.5 * zK.pow(2)  # (B, D)
+    true_kl = kl_per_dim.sum(dim=1).mean().detach()  # for logging only; not used in backprop
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
     kl_flow = kl_per_dim.sum(dim=1).mean() - sum_log_det.mean()
-    return recon + kl_weight * (kl_flow - capacity).abs(), recon, kl_flow
+    return recon + kl_weight * (kl_flow - capacity).abs(), recon, kl_flow, true_kl
 
 
 # ---------------------------------------------------------------------------

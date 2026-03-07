@@ -218,10 +218,10 @@ def train(config: Config):
                      node_class_weights=node_class_weights,
                      edge_class_weights=edge_class_weights)
         if config.model in ('GVAE', 'GVAE_NF'):
-            train_l, train_recon, train_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae(
+            train_l, train_recon, train_kl, train_true_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae(
+            val_l, val_recon, val_kl, val_true_kl, val_prop, val_raw_prop = val_epoch_gvae(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
             # ckpt_loss includes prop (gamma is constant, already baked into val_l)
@@ -232,33 +232,32 @@ def train(config: Config):
                               if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f})"
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}, true_kl={train_true_kl:.4f})"
                 f"{train_prop_str}")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
+                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f}, true_kl={val_true_kl:.4f})"
                 f"{val_prop_str}  [ckpt={ckpt_loss:.4f}]")
         elif config.model in ('GVAE_AR', 'GVAE_AR_NF'):
-            train_l, train_recon, train_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae_ar(
+            train_l, train_recon, train_kl, train_true_kl, train_prop, train_raw_prop, train_prop_gnorm, global_step = train_epoch_gvae_ar(
                 model, optimizer, train_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            val_l, val_recon, val_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
+            val_l, val_recon, val_kl, val_true_kl, val_prop, val_raw_prop = val_epoch_gvae_ar(
                 model, val_loader, config, global_step, device,
                 amp_dtype=amp_dtype, **ep_kw)
-            # ckpt_loss includes prop (gamma is constant, already baked into val_l)
-            ckpt_loss = val_l
+
             train_prop_str = (f" | prop: mse={train_raw_prop:.4f}  r\u00b2={max(0.0, 1 - train_raw_prop):.4f}  grad={train_prop_gnorm:.2e}"
                               if mc.prop_pred else "")
             val_prop_str   = (f" | prop: mse={val_raw_prop:.4f}  r\u00b2={max(0.0, 1 - val_raw_prop):.4f}"
                               if mc.prop_pred else "")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f})"
+                f"| train: {train_l:.4f} (recon={train_recon:.4f}, kl={train_kl:.4f}, true_kl={train_true_kl:.4f})"
                 f"{train_prop_str}")
             logger.info(
                 f"Epoch {epoch:03d} "
-                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f})"
-                f"{val_prop_str}  [ckpt={ckpt_loss:.4f}]")
+                f"| val:   {val_l:.4f} (recon={val_recon:.4f}, kl={val_kl:.4f}, true_kl={val_true_kl:.4f})"
+                f"{val_prop_str}")
         else:
             train_l, train_label, train_kl, global_step = train_epoch_frattvae(
                 model, optimizer, train_loader, config, global_step, device,
@@ -266,7 +265,6 @@ def train(config: Config):
             val_l, val_label, val_kl = val_epoch_frattvae(
                 model, val_loader, config, global_step, device,
                 frag_ecfps, freq_label, amp_dtype=amp_dtype)
-            ckpt_loss = val_l
             logger.info(f"Epoch {epoch:03d} | Train: {train_l:.4f} | Val: {val_l:.4f} "
                         f"| Label: {val_label:.4f} | KL: {val_kl:.4f}")
 
@@ -280,17 +278,18 @@ def train(config: Config):
         else:
             annealing_done = True
 
-        if ckpt_loss < best_val_loss:
-            best_val_loss = ckpt_loss
-            counter = 0
-            torch.save(model.state_dict(), checkpoint_path)
-            logger.info("New best model saved.")
-        else:
-            if annealing_done:
+        if annealing_done:
+            if val_l < best_val_loss:
+                best_val_loss = val_l
+                counter = 0
+                torch.save(model.state_dict(), checkpoint_path)
+                logger.info("New best model saved.")
+
+            else:
                 counter += 1
-            if annealing_done and counter >= mc.patience:
-                logger.info(f"Early stopping triggered at epoch {epoch}")
-                break
+                if counter >= mc.patience:
+                    logger.info(f"Early stopping triggered at epoch {epoch}")
+                    break
 
     model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
     evaluate_model(model, config, device, metadata, val_loader=val_loader)
