@@ -117,7 +117,7 @@ class GVAEARNFConfig:
     batch_size: int = 256
     epochs: int = 1000
     lr: float = 1e-3
-    patience: int = 15
+    patience: int = 20
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.01
