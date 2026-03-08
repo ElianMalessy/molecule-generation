@@ -12,6 +12,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 
 from moses_dataset import MosesPyGDataset
+from utils.constants import ZINC_ATOM_VOCAB
 from utils.properties import build_props_cache, compute_normalisation_stats
 from models.frattvae import build_frattvae_dataset, collate_pad_fn
 
@@ -85,60 +86,61 @@ class GVAEARConfig:
     """GVAE with autoregressive Transformer decoder."""
     batch_size: int = 256
     epochs: int = 1000
-    lr: float = 2e-3
+    lr: float = 1.5e-3              # reduced from 2e-3: 6-layer decoder has ~50% more parameters
+                                     # → larger gradient norm per step; smaller lr prevents
+                                     # early-epoch overshoot that can trigger a KL spike.
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.005
-    kl_anneal_steps: int = 60_000    # β ramp: 0 → kl_weight over this many steps.
-                                     # At batch=256 this covers ~70 epochs; encoder learns
-                                     # informative posterior before KL penalty is applied.
+    kl_anneal_steps: int = 75_000    # β ramp: 0 → kl_weight over this many steps.
+                                     # At batch=256 this covers ~87 epochs; extended from 60k
+                                     # to give the 6-layer decoder more time at β=0 before the
+                                     # KL penalty ramps up (deeper decoder front-loads recon
+                                     # learning faster, making the KL spike sharper at ramp-on).
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
-    kl_capacity_max: float = 15.0    # UNUSED for AR models (β-annealing replaces capacity hinge);
-                                     # kept for serialisation compatibility.
     valency_mask: bool = False
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
     ar_n_heads: int = 8              # attention heads
-    ar_n_layers: int = 4
+    ar_n_layers: int = 6             # 6 layers (up from 4) for better long-range BFS dependency
     ar_d_ff: int = 512               # feed-forward dim
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.4
-    context_dropout: float = 0.35    # fraction of input tokens replaced with 0 during training.
-                                     # At 0.15 the decoder retains 85 % sequential context and
-                                     # learns to ignore z — encoder μ collapses to one mode.
-                                     # 0.35 forces the decoder to use z for structural decisions.
+    prop_weight: float = 0.1
+    context_dropout: float = 0.40    # raised from 0.35: the 6-layer decoder is more capable of
+                                     # learning from local context alone, so a higher masking rate
+                                     # is needed to prevent it from shortcutting z conditioning.
 
 @dataclass
 class GVAEARNFConfig:
     """GVAE_AR with IAF normalizing flow encoder."""
     batch_size: int = 512
     epochs: int = 1000
-    lr: float = 4e-3
+    lr: float = 3e-3                # reduced from 4e-3; same reasoning as GVAEARConfig.
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.01
-    kl_anneal_steps: int = 57_000    # β ramp: 0 → kl_weight over this many steps.
-                                     # At batch=512 this covers ~60 epochs.
+    kl_anneal_steps: int = 70_000    # β ramp: 0 → kl_weight over this many steps.
+                                     # At batch=512 this covers ~74 epochs; extended from 57k
+                                     # for the same reason as GVAEARConfig: deeper decoder
+                                     # front-loads recon learning faster.
     free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
-    kl_capacity_max: float = 20.0    # UNUSED for AR models (β-annealing replaces capacity hinge);
-                                     # kept for serialisation compatibility.
     num_flows: int = 4
     flow_hidden_dim: int = 256
     valency_mask: bool = False
     # --- AR Transformer decoder ---
     ar_d_model: int = 256
     ar_n_heads: int = 8
-    ar_n_layers: int = 4
+    ar_n_layers: int = 6             # 6 layers (up from 4)
     ar_d_ff: int = 512
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 0.6
-    context_dropout: float = 0.35
+    context_dropout: float = 0.40    # raised from 0.35; see GVAEARConfig rationale
 
 
 @dataclass
@@ -200,28 +202,6 @@ class PropsDataset(torch.utils.data.Dataset):
 # ZINC250k dataset helpers
 # ---------------------------------------------------------------------------
 
-# (atomic_num, formal_charge) → 0-indexed atom class (0=C, …, 16=P+).
-# gvae_prepare_batch / ar_collate_fn apply +1 so the model sees classes 1-17.
-_ZINC_ATOM_VOCAB: dict = {
-    (6,   0):  0,  # C
-    (7,   0):  1,  # N
-    (8,   0):  2,  # O
-    (16,  0):  3,  # S
-    (9,   0):  4,  # F
-    (7,  +1):  5,  # N+
-    (17,  0):  6,  # Cl
-    (8,  -1):  7,  # O-
-    (35,  0):  8,  # Br
-    (7,  -1):  9,  # N-
-    (53,  0): 10,  # I
-    (16, -1): 11,  # S-
-    (15,  0): 12,  # P
-    (8,  +1): 13,  # O+
-    (16, +1): 14,  # S+
-    (6,  -1): 15,  # C-
-    (15, +1): 16,  # P+
-}
-
 
 def _smiles_to_pyg_data(smi: str):
     """Convert a SMILES string to a PyG Data object.
@@ -247,7 +227,7 @@ def _smiles_to_pyg_data(smi: str):
     if mol is None:
         return None
 
-    xs = [_ZINC_ATOM_VOCAB.get((a.GetAtomicNum(), a.GetFormalCharge()), 0)
+    xs = [ZINC_ATOM_VOCAB.get((a.GetAtomicNum(), a.GetFormalCharge()), 0)
           for a in mol.GetAtoms()]
     x = torch.tensor(xs, dtype=torch.long).unsqueeze(1)  # (N, 1)
 

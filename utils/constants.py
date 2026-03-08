@@ -3,7 +3,7 @@ from rdkit import Chem
 
 MOSES_ATOM_DECODER = {0: 6, 1: 7, 2: 8, 3: 9, 4: 16, 5: 17, 6: 35, 7: 1}
 
-# 0-indexed atom class (matching _ZINC_ATOM_VOCAB in utils.py; data.x stores these
+# 0-indexed atom class (inverse of ZINC_ATOM_VOCAB; data.x stores these
 # 0-indexed values directly).  decode_to_smiles and mol_from_data both look up
 # cls = atom_idx - 1 (after the +1 shift applied in training) → key range 0-16.
 # Classes 0-16 correspond to the 17 unique (atomic_num, formal_charge) pairs
@@ -39,6 +39,29 @@ ZINC_CHARGE_DECODER = {
     14: +1,  # S+
     15: -1,  # C-
     16: +1,  # P+
+}
+
+# Encoding vocab: (atomic_num, formal_charge) → 0-indexed atom class.
+# Inverse of ZINC_ATOM_DECODER + ZINC_CHARGE_DECODER.
+# gvae_prepare_batch / ar_collate_fn apply +1 so the model sees classes 1-17.
+ZINC_ATOM_VOCAB: dict = {
+    (6,   0):  0,  # C
+    (7,   0):  1,  # N
+    (8,   0):  2,  # O
+    (16,  0):  3,  # S
+    (9,   0):  4,  # F
+    (7,  +1):  5,  # N+
+    (17,  0):  6,  # Cl
+    (8,  -1):  7,  # O-
+    (35,  0):  8,  # Br
+    (7,  -1):  9,  # N-
+    (53,  0): 10,  # I
+    (16, -1): 11,  # S-
+    (15,  0): 12,  # P
+    (8,  +1): 13,  # O+
+    (16, +1): 14,  # S+
+    (6,  -1): 15,  # C-
+    (15, +1): 16,  # P+
 }
 
 # ---------------------------------------------------------------------------

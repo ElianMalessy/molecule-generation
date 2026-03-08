@@ -59,10 +59,13 @@ class GINEConvEncoder(nn.Module):
         h = F.relu(self.conv4(h,     edge_index, e_emb))
 
         h_graph = global_add_pool(h, batch)
-        # Clamp logvar so std = exp(0.5*logvar) stays in [exp(-2.5), exp(2.5)] ≈ [0.08, 12].
-        # Combined with zero-init above this is only a safety bound; prevents IAF
-        # MADE overflow on bfloat16 if activations ever drift large mid-training.
-        return self.fc_mu(h_graph), self.fc_logvar(h_graph).clamp(-5, 5)
+        # Clamp both mu and logvar to prevent bfloat16 overflow in downstream code:
+        #   - mu clamped to [-10, 10]: KL per dim ≤ 0.5*100 = 50 nats/dim max, preventing
+        #     KL explosions in val batches (observed: val_kl=6401 from ~3 outlier molecules).
+        #     Also prevents z_proj(mu) from producing large z_vec that overflow AdaLN γ.
+        #   - logvar clamped to [-5, 5]: std in [0.08, 12], prevents IAF/reparameterize
+        #     overflow on bfloat16.
+        return self.fc_mu(h_graph).clamp(-10, 10), self.fc_logvar(h_graph).clamp(-5, 5)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:

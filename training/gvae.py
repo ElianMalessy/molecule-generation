@@ -23,8 +23,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                      edge_class_weights=None):
     model.train()
     total_loss = total_recon = total_kl = total_true_kl = total_raw_prop = 0.0
-    total_prop_gnorm = 0.0
-    n_batches = 0
+    n_skipped = 0
     use_nf = isinstance(model, GraphVAENF)
     mc     = config.gvae_nf if use_nf else config.gvae
     gamma  = mc.prop_weight
@@ -67,7 +66,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
                 loss += prop_loss
 
         if not torch.isfinite(loss):
-            logger.warning(f"Non-finite loss ({loss.item():.4g}) at step {global_step} — skipping batch.")
+            n_skipped += 1
             optimizer.zero_grad()
             global_step += 1
             continue
@@ -86,7 +85,7 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         )
 
         if not torch.isfinite(grad_norm) or has_nan_grad:
-            logger.warning(f"Non-finite gradients at step {global_step} — skipping.")
+            n_skipped += 1
             optimizer.zero_grad()
             global_step += 1
             continue
@@ -100,6 +99,8 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         total_true_kl  += true_kl.item()                  * data.num_graphs
         total_raw_prop     += raw_prop_loss.item()                * data.num_graphs
 
+    if n_skipped > 0:
+        logger.warning(f"Skipped {n_skipped}/{len(loader)} batches due to non-finite loss/gradients.")
     n = len(loader.dataset)
     return total_loss / n, total_recon / n, total_kl / n, total_true_kl / n, total_raw_prop / n, global_step
 

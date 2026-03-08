@@ -195,6 +195,8 @@ def train(config: Config):
         logger.info(f"Joint property prediction: γ={mc.prop_weight} (constant, plogP / QED / SA)")
 
     global_step, best_val_loss, counter = 0, float('inf'), 0
+    # Tracks previous epoch's train metrics to detect fully-skipped epochs.
+    _prev_train_l = _prev_train_recon = 1.0
 
     logger.info(f"Starting training on {device}...")
     for epoch in range(1, mc.epochs + 1):
@@ -213,6 +215,22 @@ def train(config: Config):
                 model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
                 for state in optimizer.state.values():
                     state.clear()   # wipe Adam exp_avg / exp_avg_sq accumulators
+            # Second guard: detect epochs where every batch was skipped (all-NaN
+            # cascade).  Parameters stay finite (optimizer.step() was never called)
+            # so the above check misses this state.  train_l=0 AND train_recon=0
+            # is impossible under normal training (recon ≫ 0), so it uniquely
+            # identifies a fully-skipped epoch.  Reload the last good checkpoint
+            # and wipe Adam state so the next epoch starts clean.
+            # (Checked at the TOP of the epoch so it fires on the FOLLOWING epoch.)
+            if epoch > 1 and os.path.exists(checkpoint_path):
+                if _prev_train_l == 0.0 and _prev_train_recon == 0.0:
+                    logger.warning(
+                        f"Epoch {epoch}: previous epoch was fully skipped (all batches had "
+                        f"non-finite loss/grads) — reloading best checkpoint and resetting "
+                        f"optimizer state.")
+                    model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+                    for state in optimizer.state.values():
+                        state.clear()
 
         ep_kw = dict(epoch=epoch, prop_mean=prop_mean, prop_std=prop_std,
                      node_class_weights=node_class_weights,
@@ -269,6 +287,11 @@ def train(config: Config):
                         f"| Label: {val_label:.4f} | KL: {val_kl:.4f}")
 
         scheduler.step()
+
+        # Record this epoch's train metrics for next epoch's all-skip detection.
+        if config.model in ('GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF'):
+            _prev_train_l     = train_l
+            _prev_train_recon = train_recon
 
         # Only count patience and allow early stopping after KL annealing ends.
         # During the ramp the model is still under-regularised and val_loss
