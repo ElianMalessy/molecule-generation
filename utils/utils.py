@@ -55,7 +55,7 @@ class GVAEConfig:
     valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
-    prop_weight: float = 1.5         # γ: property loss weight (constant)
+    prop_weight: float = 2.0         # γ: property loss weight (constant)
 
 
 @dataclass
@@ -77,7 +77,7 @@ class GVAENFConfig:
     valency_mask: bool = False
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 1.0
+    prop_weight: float = 1.75
 
 
 @dataclass
@@ -89,7 +89,7 @@ class GVAEARConfig:
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.05
+    kl_weight: float = 0.005
     kl_anneal_steps: int = 60_000    # β ramp: 0 → kl_weight over this many steps.
                                      # At batch=256 this covers ~70 epochs; encoder learns
                                      # informative posterior before KL penalty is applied.
@@ -105,7 +105,7 @@ class GVAEARConfig:
     ar_dropout: float = 0.1
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 0.6
+    prop_weight: float = 0.4
     context_dropout: float = 0.35    # fraction of input tokens replaced with 0 during training.
                                      # At 0.15 the decoder retains 85 % sequential context and
                                      # learns to ignore z — encoder μ collapses to one mode.
@@ -123,7 +123,7 @@ class GVAEARNFConfig:
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.1
+    kl_weight: float = 0.01
     kl_anneal_steps: int = 57_000    # β ramp: 0 → kl_weight over this many steps.
                                      # At batch=512 this covers ~60 epochs.
     free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
