@@ -176,6 +176,12 @@ class GraphVAE(nn.Module):
             nn.Linear(latent_dim, 512), nn.ReLU(),
             nn.Linear(512, max_atoms * max_atoms * num_edge_features),
         )
+        # Compile the flat decoders: both are pure dense Sequential modules with
+        # static-per-batch shapes, the ideal torch.compile target.  dynamic=True
+        # handles varying batch sizes (last batch may be smaller).
+        if hasattr(torch, 'compile'):
+            self.decoder_nodes = torch.compile(self.decoder_nodes, dynamic=True)
+            self.decoder_edges = torch.compile(self.decoder_edges, dynamic=True)
 
     def encode(self, x, edge_index, edge_attr, batch):
         return self.encoder(x, edge_index, edge_attr, batch)
@@ -243,6 +249,10 @@ class GraphVAENF(nn.Module):
                                        hidden_dim=256, latent_dim=latent_dim)
         self.flow    = InverseAutoregressiveFlow(latent_dim, num_flows=num_flows,
                                                 hidden_dim=flow_hidden_dim)
+        # Compile the IAF flow: all MADE operations are dense masked linear layers
+        # with no scatter ops, making them a clean compile target.
+        if hasattr(torch, 'compile'):
+            self.flow = torch.compile(self.flow, dynamic=True)
 
         self.prop_head = PropertyHead(latent_dim) if prop_pred else None
 
@@ -268,6 +278,10 @@ class GraphVAENF(nn.Module):
             nn.ReLU(),
             nn.Linear(2048, max_atoms * max_atoms * num_edge_features),
         )
+        # Compile the NF decoders: same rationale as GraphVAE — pure dense ops.
+        if hasattr(torch, 'compile'):
+            self.decoder_nodes = torch.compile(self.decoder_nodes, dynamic=True)
+            self.decoder_edges = torch.compile(self.decoder_edges, dynamic=True)
 
     def encode(self, x, edge_index, edge_attr, batch):
         return self.encoder(x, edge_index, edge_attr, batch)

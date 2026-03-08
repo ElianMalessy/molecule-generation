@@ -851,6 +851,10 @@ class GraphVAEARNF(nn.Module):
         # ---- IAF flow ----
         self.flow = InverseAutoregressiveFlow(latent_dim, num_flows=num_flows,
                                               hidden_dim=flow_hidden_dim)
+        # Compile the IAF flow: MADE operations are dense masked linear layers,
+        # no scatter ops — clean compile target (same rationale as GraphVAENF).
+        if hasattr(torch, 'compile'):
+            self.flow = torch.compile(self.flow, dynamic=True)
 
         # ---- Autoregressive decoder ----
         self.decoder = ARDecoder(

@@ -120,12 +120,12 @@ class GVAEARNFConfig:
     patience: int = 20
     max_atoms: int = 38
     latent_dim: int = 128
-    kl_weight: float = 0.01
-    kl_anneal_steps: int = 70_000    # β ramp: 0 → kl_weight over this many steps.
-                                     # At batch=512 this covers ~74 epochs; extended from 57k
-                                     # for the same reason as GVAEARConfig: deeper decoder
-                                     # front-loads recon learning faster.
-    free_bits_per_dim: float = 0.01  # min KL per latent dim (nats); 0.01×128=1.28 nats floor
+    kl_weight: float = 0.005         # must match GVAEARConfig exactly so the only
+                                     # difference between the two models is the IAF flow.
+    kl_anneal_steps: int = 75_000    # β ramp: same as GVAEARConfig (75k steps) so the KL
+                                     # schedule is identical across the within-class comparison.
+    free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
+                                     # (matched to GVAEARConfig for a controlled comparison)
     num_flows: int = 4
     flow_hidden_dim: int = 256
     valency_mask: bool = False
@@ -479,15 +479,23 @@ def get_dataloaders(config: Config, logger):
             max_seq_len = gc.max_atoms * (gc.max_atoms + 1) // 2 + 1
             collate_fn = partial(ar_collate_fn, max_atoms=gc.max_atoms,
                                  eos_id=num_node_features, max_seq_len=max_seq_len)
+            # pin_memory is intentionally omitted for AR loaders: the custom
+            # collate returns a PyG Batch inside a plain tuple, and the standard
+            # DataLoader pin_memory thread's recursive .pin_memory() call on a
+            # nested Batch object has version-dependent behaviour.  Avoid silently.
             train_loader = TorchDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True,
-                                           num_workers=config.num_workers, collate_fn=collate_fn)
+                                           num_workers=config.num_workers, collate_fn=collate_fn,
+                                           persistent_workers=config.num_workers > 0)
             val_loader   = TorchDataLoader(val_dataset,   batch_size=gc.batch_size, shuffle=False,
-                                           num_workers=config.num_workers, collate_fn=collate_fn)
+                                           num_workers=config.num_workers, collate_fn=collate_fn,
+                                           persistent_workers=config.num_workers > 0)
         else:
             train_loader = PyGDataLoader(train_dataset, batch_size=gc.batch_size, shuffle=True,
-                                         num_workers=config.num_workers)
+                                         num_workers=config.num_workers, pin_memory=True,
+                                         persistent_workers=config.num_workers > 0)
             val_loader   = PyGDataLoader(val_dataset,   batch_size=gc.batch_size, shuffle=False,
-                                         num_workers=config.num_workers)
+                                         num_workers=config.num_workers, pin_memory=True,
+                                         persistent_workers=config.num_workers > 0)
 
         return train_loader, val_loader, metadata
 

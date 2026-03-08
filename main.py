@@ -71,6 +71,9 @@ def train(config: Config):
         config.gvae_ar_nf.max_atoms = 30
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # TF32 matmuls on Ampere+: no change to bfloat16 AMP paths, only affects
+    # float32 fallback ops (e.g. optimizer state, loss scalar).  Free speedup.
+    torch.set_float32_matmul_precision('high')
     ckpt_dir = f'checkpoints/{config.dataset}/{config.model}/{_variant_name(config)}'
     os.makedirs(ckpt_dir, exist_ok=True)
     checkpoint_path = f'{ckpt_dir}/best.pth'
