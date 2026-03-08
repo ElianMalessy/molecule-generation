@@ -79,10 +79,14 @@ def train_epoch_gvae(model, optimizer, loader, config: Config, global_step: int,
         main_params = [p for p in model.parameters() if id(p) not in prop_param_ids]
         grad_norm = torch.nn.utils.clip_grad_norm_(main_params, 5.0)
 
-        # Guard against NaN/inf gradients.  Adam moment corruption from a single
-        # NaN step would permanently poison all future updates.
-        if not torch.isfinite(grad_norm):
-            logger.warning(f"Non-finite grad norm at step {global_step} — skipping optimizer step.")
+        # Check if ANY parameter has a non-finite gradient
+        has_nan_grad = any(
+            p.grad is not None and not torch.isfinite(p.grad).all() 
+            for p in model.parameters()
+        )
+
+        if not torch.isfinite(grad_norm) or has_nan_grad:
+            logger.warning(f"Non-finite gradients at step {global_step} — skipping.")
             optimizer.zero_grad()
             global_step += 1
             continue

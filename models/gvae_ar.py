@@ -271,10 +271,13 @@ class _CausalTransformer(nn.Module):
 class ARDecoder(nn.Module):
     """Latent-conditioned causal Transformer for sequential graph generation.
 
-    The latent vector z is projected to d_model and prepended as a "prefix
-    token" at position 0.  All subsequent positions attend to it through the
-    standard lower-triangular causal mask — achieving full z-conditioning
-    without cross-attention.
+    The latent vector z conditions the decoder in two complementary ways:
+      1. Embedding-level broadcast: z_proj(z) is added to every input position
+         so the token stream is globally shifted by the latent code.
+      2. AdaLN at every layer: z_proj(z) is passed as z_cond to each
+         _CausalLayer, which predicts per-sublayer (γ, β) shifts via adaLN_proj.
+    Together these give z an O(1)-path gradient through every sublayer without
+    any cross-attention overhead.
     """
 
     def __init__(self, latent_dim: int, num_node_features: int, num_edge_features: int,

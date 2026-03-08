@@ -84,9 +84,13 @@ def train(config: Config):
         kl_anneal_epoch = -(-mc.kl_anneal_steps // steps_per_epoch)  # ceil
         fb_info  = (f", free_bits_per_dim={mc.free_bits_per_dim}"
                     if getattr(mc, 'free_bits_per_dim', 0.0) > 0 else "")
-        logger.info(f"KL: β={mc.kl_weight} (constant), capacity 0→{mc.kl_capacity_max} "
-                    f"over {mc.kl_anneal_steps} steps ({kl_anneal_epoch} epochs)"
-                    f"{fb_info} | patience = {mc.patience} epochs after ramp")
+        if config.model in ('GVAE_AR', 'GVAE_AR_NF'):
+            logger.info(f"KL: β ramp 0→{mc.kl_weight} over {mc.kl_anneal_steps} steps "
+                        f"({kl_anneal_epoch} epochs){fb_info} | patience = {mc.patience} epochs after ramp")
+        else:
+            logger.info(f"KL: β={mc.kl_weight} (constant), capacity 0→{mc.kl_capacity_max} "
+                        f"over {mc.kl_anneal_steps} steps ({kl_anneal_epoch} epochs)"
+                        f"{fb_info} | patience = {mc.patience} epochs after ramp")
     else:
         mc = config.frattvae
 
@@ -273,6 +277,12 @@ def train(config: Config):
             annealing_done = global_step >= mc.kl_anneal_steps
         else:
             annealing_done = True
+
+
+        if not annealing_done and epoch % 5 == 0:
+            torch.save(model.state_dict(), checkpoint_path)
+            logger.info("KL annealing in progress — intermediate checkpoint saved.")
+
 
         if annealing_done:
             if val_l < best_val_loss:

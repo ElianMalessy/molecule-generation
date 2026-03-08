@@ -55,7 +55,7 @@ class GVAEConfig:
     valency_mask: bool = False       # apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
-    prop_weight: float = 2.0         # γ: property loss weight (constant)
+    prop_weight: float = 2.5         # γ: property loss weight (constant)
 
 
 @dataclass
@@ -77,7 +77,7 @@ class GVAENFConfig:
     valency_mask: bool = False
     # --- joint property prediction ---
     prop_pred: bool = False
-    prop_weight: float = 1.75
+    prop_weight: float = 2.25
 
 
 @dataclass
@@ -100,7 +100,7 @@ class GVAEARConfig:
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
     ar_n_heads: int = 8              # attention heads
-    ar_n_layers: int = 2             # Transformer layers
+    ar_n_layers: int = 4
     ar_d_ff: int = 512               # feed-forward dim
     ar_dropout: float = 0.1
     # --- joint property prediction ---
@@ -109,10 +109,7 @@ class GVAEARConfig:
     context_dropout: float = 0.35    # fraction of input tokens replaced with 0 during training.
                                      # At 0.15 the decoder retains 85 % sequential context and
                                      # learns to ignore z — encoder μ collapses to one mode.
-                                     # 0.35 forces the decoder to use z for structural decisions;
-                                     # 0.5 provides stronger forcing now that edge class weights
-                                     # make bond prediction require z for the hidden positions.
-
+                                     # 0.35 forces the decoder to use z for structural decisions.
 
 @dataclass
 class GVAEARNFConfig:
@@ -135,7 +132,7 @@ class GVAEARNFConfig:
     # --- AR Transformer decoder ---
     ar_d_model: int = 256
     ar_n_heads: int = 8
-    ar_n_layers: int = 2
+    ar_n_layers: int = 4
     ar_d_ff: int = 512
     ar_dropout: float = 0.1
     # --- joint property prediction ---
