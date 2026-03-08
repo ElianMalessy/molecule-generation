@@ -86,10 +86,8 @@ class GVAEARConfig:
     """GVAE with autoregressive Transformer decoder."""
     batch_size: int = 256
     epochs: int = 1000
-    lr: float = 1.5e-3              # reduced from 2e-3: 6-layer decoder has ~50% more parameters
-                                     # → larger gradient norm per step; smaller lr prevents
-                                     # early-epoch overshoot that can trigger a KL spike.
-    patience: int = 15
+    lr: float = 1e-3
+    patience: int = 20
     max_atoms: int = 38
     latent_dim: int = 128
     kl_weight: float = 0.005
@@ -116,9 +114,9 @@ class GVAEARConfig:
 @dataclass
 class GVAEARNFConfig:
     """GVAE_AR with IAF normalizing flow encoder."""
-    batch_size: int = 512
+    batch_size: int = 256
     epochs: int = 1000
-    lr: float = 3e-3                # reduced from 4e-3; same reasoning as GVAEARConfig.
+    lr: float = 1e-3
     patience: int = 15
     max_atoms: int = 38
     latent_dim: int = 128

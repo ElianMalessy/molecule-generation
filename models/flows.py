@@ -45,10 +45,16 @@ class IAFStep(nn.Module):
 
     def forward(self, z):
         m, s = self.made(z)
-        s = s.clamp(-5.0, 5.0)  # prevent log_det collapse / explosion
-        gate = torch.sigmoid(s)
-        z_new = gate * z + (1.0 - gate) * m
-        log_det = torch.log(gate + 1e-8).sum(dim=-1)
+        # Standard IAF affine step: z_new = exp(s) * z + m
+        # Jacobian is lower-triangular with diagonal exp(s_i) > 0, so
+        # log|det J| = sum(s), which can be positive (flow improves the
+        # variational bound) or negative.
+        # The previous sigmoid-gating formulation (gate = sigmoid(s) ∈ (0,1))
+        # had log|det J| = sum(log gate) < 0 unconditionally, meaning the flow
+        # always added ~200 nats of artificial KL penalty and could never help.
+        log_scale = s.clamp(-5.0, 5.0)   # exp range: (0.0067, 148.4) — stable in bfloat16
+        z_new = log_scale.exp() * z + m
+        log_det = log_scale.sum(dim=-1)
         return z_new, log_det
 
 
