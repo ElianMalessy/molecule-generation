@@ -341,11 +341,14 @@ class ARDecoder(nn.Module):
 
     def _embed(self, z: torch.Tensor, input_tokens: torch.Tensor,
                input_types: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build full embedding sequence [BOS | graph_tokens] with z-broadcast.
+        """Build full embedding sequence [BOS | graph_tokens].
 
-        Every position is uniformly: E_token + E_type + E_pos + z_proj(z).
-        Position 0 uses a learned BOS embedding (self.bos_emb) instead of a
-        graph token, so z is added exactly once at every position — never doubled.
+        Every position is: E_token + E_type + E_pos.  z is NOT added here;
+        it conditions the transformer exclusively through AdaLN-Zero at every
+        layer (Peebles & Xie 2023).  Adding z to the raw token embeddings is
+        redundant and counterproductive: the z_vec offset shifts the mean that
+        LayerNorm subtracts and inflates the std it divides by, compressing the
+        token-distinguishing signal before AdaLN can act on it.
 
         node_emb / edge_emb are kept in the computation graph via weighted sum.
         The previous scatter-write approach (tok_emb[mask] = emb(...)) severed
@@ -373,8 +376,9 @@ class ARDecoder(nn.Module):
         full  = torch.cat([bos, tok_emb], dim=1)                      # (B, L, d)
         full  = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
         z_vec = self.z_proj(z)                                         # (B, d_model)
-        full  = full + z_vec.unsqueeze(1)  # z-broadcast: +1× z at every position
-        return full, z_vec  # z_vec returned for AdaLN conditioning in transformer layers
+        # z_vec is NOT added to the token embeddings; it reaches the network
+        # solely through AdaLN at every transformer layer.
+        return full, z_vec  # z_vec passed to AdaLN in every _CausalLayer
 
     # ------------------------------------------------------------------
     # Training forward (teacher-forced, fully parallel)
@@ -519,14 +523,13 @@ class ARDecoder(nn.Module):
         K_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
         V_bufs = [torch.zeros(B, self.max_tf_len, d, device=device) for _ in range(n_layers)]
 
-        # ── Position 0: BOS + z ──────────────────────────────────────────
-        # Mirrors _embed exactly: bos_emb + type_emb[0] + pos_emb[0] + z_proj(z).
-        # z is added exactly once — no doubling artifact.
+        # ── Position 0: BOS ───────────────────────────────────────────────
+        # Mirrors _embed exactly: bos_emb + type_emb[0] + pos_emb[0].
+        # z conditions every transformer step via AdaLN only — no input injection.
         z_vec   = self.z_proj(z)                                       # (B, d_model)
         z_emb   = (self.bos_emb.expand(B, 1, -1)
                    + self.type_emb.weight[0]                           # type 0 = BOS
-                   + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device))
-                   + z_vec.unsqueeze(1))                               # (B, 1, d_model)
+                   + self.pos_emb(torch.zeros(1, 1, dtype=torch.long, device=device)))
         last_h = self.transformer.step(z_emb, z_vec, K_bufs, V_bufs, t=0)  # (B, d)
 
         for step in range(self.max_seq_len - 1):
@@ -628,7 +631,7 @@ class ARDecoder(nn.Module):
                 + e_w * self.edge_emb(tok_safe.clamp(0, self.edge_vocab - 1))
                 + self.type_emb(type_safe)
                 + self.pos_emb(torch.full((B,), pos, dtype=torch.long, device=device))
-                + z_vec                                              # z-broadcast at every step
+                # z omitted: AdaLN in each _CausalLayer supplies the z conditioning
             ).unsqueeze(1)
             last_h = self.transformer.step(tok_emb, z_vec, K_bufs, V_bufs, t=pos)
 
