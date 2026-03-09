@@ -40,7 +40,7 @@ def kl_capacity(step: int, capacity_max: float, anneal_steps: int) -> float:
 @dataclass
 class GVAEConfig:
     batch_size: int = 128
-    epochs: int = 1000
+    epochs: int = 300
     lr: float = 1e-3
     patience: int = 10
     max_atoms: int = 38
@@ -53,7 +53,7 @@ class GVAEConfig:
     kl_anneal_steps: int = 100000    # steps over which both β=kl_weight and capacity ramp
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
     kl_capacity_max: float = 25.0   # target KL ceiling (nats); ramps from 0
-    valency_mask: bool = False       # apply valency masking during decoding
+    valency_mask: bool = True       # always apply valency masking during decoding
     # --- joint property prediction ---
     prop_pred: bool = False          # attach property prediction head
     prop_weight: float = 2.5         # γ: property loss weight (constant)
@@ -63,7 +63,7 @@ class GVAEConfig:
 class GVAENFConfig:
     """Same architecture as GVAEConfig plus a planar flow stack."""
     batch_size: int = 128
-    epochs: int = 1000
+    epochs: int = 300
     lr: float = 1e-3
     patience: int = 10
     max_atoms: int = 38
@@ -75,7 +75,7 @@ class GVAENFConfig:
     kl_capacity_max: float = 25.0   # NF: same ceiling as GVAE (weak MLP decoder is the bottleneck)
     num_flows: int = 4               # number of IAF steps
     flow_hidden_dim: int = 256       # hidden dim of each MADE inside IAF
-    valency_mask: bool = False
+    valency_mask: bool = True
     # --- joint property prediction ---
     prop_pred: bool = False
     prop_weight: float = 2.25
@@ -85,7 +85,7 @@ class GVAENFConfig:
 class GVAEARConfig:
     """GVAE with autoregressive Transformer decoder."""
     batch_size: int = 256
-    epochs: int = 1000
+    epochs: int = 300
     lr: float = 1e-3
     patience: int = 20
     max_atoms: int = 38
@@ -97,7 +97,7 @@ class GVAEARConfig:
                                      # KL penalty ramps up (deeper decoder front-loads recon
                                      # learning faster, making the KL spike sharper at ramp-on).
     free_bits_per_dim: float = 0.02  # min KL per latent dim (nats); 0.02×128=2.56 nats floor
-    valency_mask: bool = False
+    valency_mask: bool = True
     # --- AR Transformer decoder ---
     ar_d_model: int = 256            # Transformer hidden dim
     ar_n_heads: int = 8              # attention heads
@@ -115,7 +115,7 @@ class GVAEARConfig:
 class GVAEARNFConfig:
     """GVAE_AR with IAF normalizing flow encoder."""
     batch_size: int = 256
-    epochs: int = 1000
+    epochs: int = 300
     lr: float = 1e-3
     patience: int = 20
     max_atoms: int = 38
@@ -128,7 +128,7 @@ class GVAEARNFConfig:
                                      # (matched to GVAEARConfig for a controlled comparison)
     num_flows: int = 4
     flow_hidden_dim: int = 256
-    valency_mask: bool = False
+    valency_mask: bool = True
     # --- AR Transformer decoder ---
     ar_d_model: int = 256
     ar_n_heads: int = 8
@@ -144,7 +144,7 @@ class GVAEARNFConfig:
 @dataclass
 class FRATTVAEConfig:
     batch_size: int = 2048           # paper: 2048
-    epochs: int = 1000
+    epochs: int = 300
     lr: float = 1e-4                 # paper: 1e-4
     patience: int = 20
     latent_dim: int = 256            # paper: d_latent=256

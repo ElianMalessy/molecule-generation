@@ -1,10 +1,3 @@
-"""
-Training epoch functions for GraphVAE and GraphVAENF.
-
-A single pair of train/val functions handles both variants by dispatching
-on isinstance(model, GraphVAENF).  The correct config section (config.gvae
-or config.gvae_nf) is selected automatically.
-"""
 import logging
 import torch
 import torch.nn.functional as F

@@ -1,14 +1,3 @@
-"""
-GraphVAE and GraphVAENF model variants with flat MLP decoders.
-
-Both variants share the GINEConvEncoder.  GraphVAENF additionally wraps it
-with an Inverse Autoregressive Flow to make the variational posterior more
-expressive.
-
-Shared utilities (PropertyHead, decode_to_smiles, valency tables,
-gvae_prepare_batch) are kept here because they are also imported by
-models/gvae_ar.py and the training code.
-"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

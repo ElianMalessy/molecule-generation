@@ -23,19 +23,16 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Train Molecular VAE")
     parser.add_argument('--model',        type=str,   default='GVAE', choices=['GVAE', 'GVAE_NF', 'GVAE_AR', 'GVAE_AR_NF', 'FRATTVAE'])
     parser.add_argument('--dataset',      type=str,   default='ZINC', choices=['ZINC', 'MOSES'])
-    parser.add_argument('--valency_mask', action='store_true',
-                        help='Enable valency masking during GVAE decoding')
     # Joint property prediction
     parser.add_argument('--prop_pred', action='store_true',
                         help='Attach a property prediction head (plogP, QED, SA) to GVAE/GVAE_NF')
     parser.add_argument('--prop_weight', type=float, default=None, help='property loss weight')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
-    if args.valency_mask:
-        config.gvae.valency_mask = True
-        config.gvae_nf.valency_mask = True
-        config.gvae_ar.valency_mask = True
-        config.gvae_ar_nf.valency_mask = True
+    config.gvae.valency_mask = True
+    config.gvae_nf.valency_mask = True
+    config.gvae_ar.valency_mask = True
+    config.gvae_ar_nf.valency_mask = True
     if args.prop_pred:
         config.gvae.prop_pred          = True
         config.gvae_nf.prop_pred          = True
@@ -58,8 +55,7 @@ def _variant_name(config: Config) -> str:
     if gc is None:
         return 'default'
     parts = ['prop' if gc.prop_pred else 'no_prop']
-    if gc.valency_mask:
-        parts.append('valency')
+    # valency_mask is always True, do not add to variant name
     return '+'.join(parts)
 
 
@@ -305,23 +301,13 @@ def train(config: Config):
             annealing_done = True
 
 
-        if not annealing_done and epoch % 5 == 0:
-            torch.save(model.state_dict(), checkpoint_path)
-            logger.info("KL annealing in progress — intermediate checkpoint saved.")
 
-
+        # Save best model by validation loss, but do not early stop
         if annealing_done:
             if val_l < best_val_loss:
                 best_val_loss = val_l
-                counter = 0
                 torch.save(model.state_dict(), checkpoint_path)
                 logger.info("New best model saved.")
-
-            else:
-                counter += 1
-                if counter >= mc.patience:
-                    logger.info(f"Early stopping triggered at epoch {epoch}")
-                    break
 
     model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
     evaluate_model(model, config, device, metadata, val_loader=val_loader)

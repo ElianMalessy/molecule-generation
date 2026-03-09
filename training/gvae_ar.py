@@ -1,14 +1,3 @@
-"""Training epoch functions for GraphVAEAR and GraphVAEARNF.
-
-A single pair of train/val functions handles both AR variants by dispatching
-on isinstance(model, GraphVAEARNF).  The correct config section (config.gvae_ar
-or config.gvae_ar_nf) is selected automatically.
-
-The DataLoader uses ar_collate_fn (see utils/utils.py) so BFS serialization
-runs in worker processes.  Each iteration yields:
-    (pyg_batch, input_tokens, target_tokens, target_types, seq_lens)
-all as CPU tensors; we move them to device here.
-"""
 import logging
 import torch
 import torch.nn.functional as F
