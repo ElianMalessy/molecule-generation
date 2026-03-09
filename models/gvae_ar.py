@@ -376,12 +376,6 @@ class ARDecoder(nn.Module):
         full  = torch.cat([bos, tok_emb], dim=1)                      # (B, L, d)
         full  = full + self.pos_emb(torch.arange(full.size(1), device=device).unsqueeze(0))
         z_vec = self.z_proj(z)                                         # (B, d_model)
-        full  = full + z_vec.unsqueeze(1)  # z-broadcast: global shift at every position
-        # z_vec is also passed to AdaLN at every transformer layer (dual conditioning).
-        # Empirically: z-broadcast + AdaLN gives FCD=3.94 vs AdaLN-only FCD=4.23, and
-        # provides a direct reconstruction→z gradient path that stabilises training
-        # (AdaLN-zero init gives near-zero reconstruction gradient through AdaLN at
-        # the start of training, so the embedding path is critical early on).
         return full, z_vec  # z_vec passed to AdaLN in every _CausalLayer
 
     # ------------------------------------------------------------------
@@ -930,10 +924,17 @@ def gvae_ar_nf_loss(recon_loss: torch.Tensor, mu: torch.Tensor, logvar: torch.Te
     kl_weight : β — passed already-annealed from the training loop (0 → kl_weight_max).
     Returns (total, recon, kl_flow) where kl_flow is the raw divergence.
     """
+    # true_kl: closed-form KL of the base Gaussian q(z0|x) || p(z0) = N(0,I).
+    # Identical formula to gvae_ar_loss so that the logged values are directly
+    # comparable across GVAE_AR and GVAE_AR_NF.  Logging the stochastic estimate
+    # -0.5*(logvar + eps²) + 0.5*||zK||² instead (the ELBO term pre-flow-correction)
+    # is misleading: it grows as the IAF expands zK, making a working flow look
+    # pathological.
+    true_kl = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()))  \
+                .sum(dim=1).mean().detach()  # for logging only
     std = (0.5 * logvar).exp()
-    # Per-dim contribution: log q_0(z_0) - log p(z_K) before the flow correction
+    # Per-dim ELBO KL contribution before summing across dims and subtracting log|det J|.
     kl_per_dim = -0.5 * (logvar + ((z0 - mu) / (std + 1e-8)).pow(2)) + 0.5 * zK.pow(2)  # (B, D)
-    true_kl = kl_per_dim.sum(dim=1).mean().detach()  # for logging only; not used in backprop
     if free_bits > 0:
         kl_per_dim = kl_per_dim.clamp(min=free_bits)
     kl_flow = kl_per_dim.sum(dim=1).mean() - sum_log_det.mean()
