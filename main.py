@@ -29,33 +29,29 @@ def parse_args() -> Config:
     parser.add_argument('--prop_weight', type=float, default=None, help='property loss weight')
     args = parser.parse_args()
     config = Config(model=args.model, dataset=args.dataset)
-    config.gvae.valency_mask = True
-    config.gvae_nf.valency_mask = True
-    config.gvae_ar.valency_mask = True
-    config.gvae_ar_nf.valency_mask = True
+
     if args.prop_pred:
-        config.gvae.prop_pred          = True
-        config.gvae_nf.prop_pred          = True
-        config.gvae_ar.prop_pred          = True
-        config.gvae_ar_nf.prop_pred          = True
+        config.gvae.prop_pred = True
+        config.gvae_nf.prop_pred = True
+        config.gvae_ar.prop_pred = True
+        config.gvae_ar_nf.prop_pred = True
 
         # Override per-model weight defaults only when the flag is explicitly passed.
         if args.prop_weight is not None:
-            config.gvae.prop_weight        = args.prop_weight
-            config.gvae_nf.prop_weight     = args.prop_weight
-            config.gvae_ar.prop_weight     = args.prop_weight
-            config.gvae_ar_nf.prop_weight  = args.prop_weight
+            config.gvae.prop_weight = args.prop_weight
+            config.gvae_nf.prop_weight = args.prop_weight
+            config.gvae_ar.prop_weight = args.prop_weight
+            config.gvae_ar_nf.prop_weight = args.prop_weight
     return config
 
 
 def _variant_name(config: Config) -> str:
-    """Unique subdirectory name for a run, e.g. 'prop+no_valency' or 'no_prop'.
+    """Unique subdirectory name for a run, e.g. 'prop' or 'no_prop'.
     Keeps checkpoints from different flag combinations from clobbering each other."""
     gc = config.gvae if config.model == 'GVAE' else config.gvae_nf if config.model == 'GVAE_NF' else config.gvae_ar if config.model == 'GVAE_AR' else config.gvae_ar_nf if config.model == 'GVAE_AR_NF' else None
     if gc is None:
         return 'default'
     parts = ['prop' if gc.prop_pred else 'no_prop']
-    # valency_mask is always True, do not add to variant name
     return '+'.join(parts)
 
 
@@ -300,7 +296,10 @@ def train(config: Config):
         else:
             annealing_done = True
 
-
+        if not annealing_done and epoch % 5 == 0:
+            torch.save(model.state_dict(), f'{ckpt_dir}/epoch_{epoch}.pth')
+            logger.info(f"KL annealing in progress (epoch {epoch}, step {global_step}) — "
+                        f"saved intermediate checkpoint.")
 
         # Save best model by validation loss, but do not early stop
         if annealing_done:

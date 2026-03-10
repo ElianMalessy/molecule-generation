@@ -3,6 +3,7 @@ checkpoints/
 logs/
 _diag_ar.py
 _diag.py
+print_param_count.py
 *.sh
 __pycache__
 *.pyc
